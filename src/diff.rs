@@ -227,7 +227,9 @@ impl DiffEngine {
         let mut opts = DiffOptions::new();
         opts.context_lines(self.context_lines);
         for path in paths {
-            opts.pathspec(path);
+            if !path.is_empty() {
+                opts.pathspec(path);
+            }
         }
 
         let diff = repo
@@ -247,7 +249,9 @@ impl DiffEngine {
         let mut opts = DiffOptions::new();
         opts.context_lines(self.context_lines);
         for path in paths {
-            opts.pathspec(path);
+            if !path.is_empty() {
+                opts.pathspec(path);
+            }
         }
 
         let diff = repo
@@ -267,7 +271,9 @@ impl DiffEngine {
         let mut opts = DiffOptions::new();
         opts.context_lines(self.context_lines);
         for path in paths {
-            opts.pathspec(path);
+            if !path.is_empty() {
+                opts.pathspec(path);
+            }
         }
 
         let diff = repo
@@ -288,7 +294,9 @@ impl DiffEngine {
         let mut opts = DiffOptions::new();
         opts.context_lines(self.context_lines);
         for path in paths {
-            opts.pathspec(path);
+            if !path.is_empty() {
+                opts.pathspec(path);
+            }
         }
 
         let mut diff = repo
@@ -349,86 +357,72 @@ impl DiffEngine {
 
     /// Process a git2::Diff into our DiffFile format
     fn process_diff(&self, diff: &git2::Diff) -> Result<Vec<DiffFile>> {
-        use std::cell::RefCell;
-        let files: RefCell<Vec<DiffFile>> = RefCell::new(Vec::new());
-        let current_hunk: RefCell<Option<DiffHunk>> = RefCell::new(None);
+        let mut files = Vec::new();
 
-        diff.foreach(
-            &mut |delta, _| {
-                // Save previous file's last hunk if any
-                if let Some(h) = current_hunk.borrow_mut().take() {
-                    if let Some(file) = files.borrow_mut().last_mut() {
-                        file.hunks.push(h);
+        // Iterate over deltas directly (avoids regex issues with foreach/print)
+        for delta in diff.deltas() {
+            let status = match delta.status() {
+                git2::Delta::Added => FileStatus::Added,
+                git2::Delta::Deleted => FileStatus::Deleted,
+                git2::Delta::Modified => FileStatus::Modified,
+                git2::Delta::Renamed => FileStatus::Renamed,
+                _ => continue,
+            };
+
+            let old_path = delta.old_file().path().map(PathBuf::from);
+            let new_path = delta.new_file().path().map(PathBuf::from);
+
+            files.push(DiffFile {
+                old_path,
+                new_path,
+                status,
+                hunks: Vec::new(),
+            });
+        }
+
+        // Get patches for hunks
+        for (i, file) in files.iter_mut().enumerate() {
+            if let Ok(Some(patch)) = git2::Patch::from_diff(diff, i) {
+                for hunk_idx in 0..patch.num_hunks() {
+                    if let Ok((hunk, num_lines)) = patch.hunk(hunk_idx) {
+                        let mut lines = Vec::new();
+
+                        for line_idx in 0..num_lines {
+                            if let Ok(line) = patch.line_in_hunk(hunk_idx, line_idx) {
+                                let kind = match line.origin() {
+                                    '+' => LineKind::Addition,
+                                    '-' => LineKind::Deletion,
+                                    _ => LineKind::Context,
+                                };
+
+                                let content = String::from_utf8_lossy(line.content()).to_string();
+
+                                lines.push(DiffLine {
+                                    kind,
+                                    old_line_no: line.old_lineno(),
+                                    new_line_no: line.new_lineno(),
+                                    content,
+                                    highlights: Vec::new(),
+                                });
+                            }
+                        }
+
+                        file.hunks.push(DiffHunk {
+                            old_start: hunk.old_start(),
+                            old_lines: hunk.old_lines(),
+                            new_start: hunk.new_start(),
+                            new_lines: hunk.new_lines(),
+                            lines,
+                        });
                     }
                 }
-
-                let status = match delta.status() {
-                    git2::Delta::Added => FileStatus::Added,
-                    git2::Delta::Deleted => FileStatus::Deleted,
-                    git2::Delta::Modified => FileStatus::Modified,
-                    git2::Delta::Renamed => FileStatus::Renamed,
-                    _ => return true,
-                };
-
-                let old_path = delta.old_file().path().map(PathBuf::from);
-                let new_path = delta.new_file().path().map(PathBuf::from);
-
-                files.borrow_mut().push(DiffFile {
-                    old_path,
-                    new_path,
-                    status,
-                    hunks: Vec::new(),
-                });
-
-                true
-            },
-            None,
-            Some(&mut |_delta, hunk| {
-                // Save previous hunk
-                if let Some(h) = current_hunk.borrow_mut().take() {
-                    if let Some(file) = files.borrow_mut().last_mut() {
-                        file.hunks.push(h);
-                    }
-                }
-                *current_hunk.borrow_mut() = Some(DiffHunk {
-                    old_start: hunk.old_start(),
-                    old_lines: hunk.old_lines(),
-                    new_start: hunk.new_start(),
-                    new_lines: hunk.new_lines(),
-                    lines: Vec::new(),
-                });
-                true
-            }),
-            Some(&mut |_delta, _hunk, line| {
-                if let Some(ref mut h) = *current_hunk.borrow_mut() {
-                    let kind = match line.origin() {
-                        '+' => LineKind::Addition,
-                        '-' => LineKind::Deletion,
-                        _ => LineKind::Context,
-                    };
-
-                    let content = String::from_utf8_lossy(line.content()).to_string();
-
-                    h.lines.push(DiffLine {
-                        kind,
-                        old_line_no: line.old_lineno(),
-                        new_line_no: line.new_lineno(),
-                        content,
-                        highlights: Vec::new(),
-                    });
-                }
-                true
-            }),
-        )?;
-
-        // Don't forget the last hunk
-        if let Some(h) = current_hunk.into_inner() {
-            if let Some(file) = files.borrow_mut().last_mut() {
-                file.hunks.push(h);
             }
         }
 
-        Ok(files.into_inner())
+        // Filter out files with no hunks (binary files, permission-only changes, etc.)
+        files.retain(|f| !f.hunks.is_empty());
+
+        Ok(files)
     }
 
     fn resolve_tree<'a>(
