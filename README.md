@@ -13,6 +13,8 @@ A TUI diff viewer with persistent annotations. Drop-in replacement for `git diff
 
 ## Installation
 
+Requires [Rust](https://rustup.rs/). Then:
+
 ```bash
 ./install.sh
 ```
