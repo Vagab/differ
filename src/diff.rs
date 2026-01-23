@@ -1,11 +1,9 @@
-//! Diff engine with difftastic integration and git fallback
+//! Diff engine using git diff command
 //!
-//! Primary: difftastic subprocess with JSON output
-//! Fallback: git diff if difftastic is not available
+//! Uses `git diff` command directly to handle custom diff drivers properly.
 
 use anyhow::{Context, Result};
-use git2::{DiffOptions, Repository};
-use serde::Deserialize;
+use git2::Repository;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -81,33 +79,15 @@ pub struct HighlightRange {
     pub end: usize,
 }
 
-/// Check if difftastic is available
-pub fn difftastic_available() -> bool {
-    Command::new("difft")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Diff engine that can use difftastic or fall back to git
+/// Diff engine using git diff command
 pub struct DiffEngine {
-    use_difftastic: bool,
     repo_path: PathBuf,
     context_lines: u32,
 }
 
 impl DiffEngine {
     pub fn new(repo_path: PathBuf, context_lines: u32) -> Self {
-        let use_difftastic = difftastic_available();
-        if !use_difftastic {
-            eprintln!(
-                "Warning: difftastic not found. Using basic git diff. \
-                 Install with: cargo install difftastic"
-            );
-        }
         Self {
-            use_difftastic,
             repo_path,
             context_lines,
         }
@@ -116,22 +96,158 @@ impl DiffEngine {
     /// Main diff method - handles all diff modes
     pub fn diff(&self, mode: &DiffMode, paths: &[String]) -> Result<Vec<DiffFile>> {
         match mode {
-            DiffMode::Unstaged => self.diff_unstaged(paths),
-            DiffMode::Staged => self.diff_staged(paths),
-            DiffMode::WorkingTree { base } => self.diff_working_tree_filtered(base, paths),
-            DiffMode::Commits { from, to } => self.get_changed_files_filtered(from, to, paths),
+            DiffMode::Unstaged => self.diff_via_git_cmd(&[], paths),
+            DiffMode::Staged => self.diff_via_git_cmd(&["--staged"], paths),
+            DiffMode::WorkingTree { base } => self.diff_via_git_cmd(&[base.as_str()], paths),
+            DiffMode::Commits { from, to } => {
+                let range = format!("{}..{}", from, to);
+                self.diff_via_git_cmd(&[&range], paths)
+            }
             DiffMode::MergeBase { from, to } => {
-                let repo = Repository::open(&self.repo_path)?;
-                let from_obj = repo.revparse_single(from)?;
-                let to_obj = repo.revparse_single(to)?;
-                let base = repo.merge_base(from_obj.id(), to_obj.id())?;
-                let base_str = base.to_string();
-                self.get_changed_files_filtered(&base_str, to, paths)
+                let range = format!("{}...{}", from, to);
+                self.diff_via_git_cmd(&[&range], paths)
             }
             DiffMode::ExternalDiff { path, old_file, new_file } => {
                 self.diff_external_files(path, old_file, new_file)
             }
         }
+    }
+
+    /// Use git diff command directly - handles custom diff drivers properly
+    fn diff_via_git_cmd(&self, args: &[&str], paths: &[String]) -> Result<Vec<DiffFile>> {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.repo_path)
+            .arg("diff")
+            .arg("--no-color")
+            .arg(format!("-U{}", self.context_lines))
+            .arg("--find-renames")
+            .arg("--find-copies");
+
+        for arg in args {
+            cmd.arg(arg);
+        }
+
+        if !paths.is_empty() {
+            cmd.arg("--");
+            for path in paths {
+                if !path.is_empty() {
+                    cmd.arg(path);
+                }
+            }
+        }
+
+        let output = cmd.output().context("Failed to run git diff")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git diff failed: {}", stderr);
+        }
+
+        self.parse_full_diff(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// Parse full unified diff output into DiffFile structs
+    fn parse_full_diff(&self, diff_output: &str) -> Result<Vec<DiffFile>> {
+        let mut files = Vec::new();
+        let mut current_file: Option<DiffFile> = None;
+        let mut current_hunk: Option<DiffHunk> = None;
+        let mut old_line = 0u32;
+        let mut new_line = 0u32;
+
+        for line in diff_output.lines() {
+            if line.starts_with("diff --git") {
+                // Save previous file
+                if let Some(mut f) = current_file.take() {
+                    if let Some(h) = current_hunk.take() {
+                        f.hunks.push(h);
+                    }
+                    files.push(f);
+                }
+                // Parse file paths from "diff --git a/path b/path"
+                let paths = parse_diff_git_line(line);
+                current_file = Some(DiffFile {
+                    old_path: paths.0.map(PathBuf::from),
+                    new_path: paths.1.map(PathBuf::from),
+                    status: FileStatus::Modified, // Will be updated by index line
+                    hunks: Vec::new(),
+                });
+            } else if line.starts_with("new file") {
+                if let Some(ref mut f) = current_file {
+                    f.status = FileStatus::Added;
+                }
+            } else if line.starts_with("deleted file") {
+                if let Some(ref mut f) = current_file {
+                    f.status = FileStatus::Deleted;
+                }
+            } else if line.starts_with("rename from") || line.starts_with("similarity index") {
+                if let Some(ref mut f) = current_file {
+                    f.status = FileStatus::Renamed;
+                }
+            } else if line.starts_with("@@") {
+                // Save previous hunk
+                if let Some(h) = current_hunk.take() {
+                    if let Some(ref mut f) = current_file {
+                        f.hunks.push(h);
+                    }
+                }
+
+                if let Some(header) = parse_hunk_header(line) {
+                    old_line = header.0;
+                    new_line = header.2;
+                    current_hunk = Some(DiffHunk {
+                        old_start: header.0,
+                        old_lines: header.1,
+                        new_start: header.2,
+                        new_lines: header.3,
+                        lines: Vec::new(),
+                    });
+                }
+            } else if let Some(ref mut hunk) = current_hunk {
+                let (kind, old_no, new_no) = if line.starts_with('+') {
+                    let no = new_line;
+                    new_line += 1;
+                    (LineKind::Addition, None, Some(no))
+                } else if line.starts_with('-') {
+                    let no = old_line;
+                    old_line += 1;
+                    (LineKind::Deletion, Some(no), None)
+                } else if line.starts_with(' ') {
+                    let old_no = old_line;
+                    let new_no = new_line;
+                    old_line += 1;
+                    new_line += 1;
+                    (LineKind::Context, Some(old_no), Some(new_no))
+                } else if line.starts_with('\\') {
+                    // "\ No newline at end of file"
+                    continue;
+                } else {
+                    continue;
+                };
+
+                let content = if line.len() > 1 { &line[1..] } else { "" };
+                hunk.lines.push(DiffLine {
+                    kind,
+                    old_line_no: old_no,
+                    new_line_no: new_no,
+                    content: content.to_string(),
+                    highlights: Vec::new(),
+                });
+            }
+        }
+
+        // Don't forget the last file/hunk
+        if let Some(mut f) = current_file {
+            if let Some(h) = current_hunk {
+                f.hunks.push(h);
+            }
+            files.push(f);
+        }
+
+        // Filter out files with no hunks
+        files.retain(|f| !f.hunks.is_empty());
+
+        Ok(files)
     }
 
     /// Diff two files directly (for git external diff mode)
@@ -219,461 +335,43 @@ impl DiffEngine {
         Ok(hunks)
     }
 
-    /// Diff working tree vs index (unstaged changes)
-    fn diff_unstaged(&self, paths: &[String]) -> Result<Vec<DiffFile>> {
-        let repo = Repository::open(&self.repo_path)
-            .context("Failed to open git repository")?;
+}
 
-        let mut opts = DiffOptions::new();
-        opts.context_lines(self.context_lines);
-        for path in paths {
-            if !path.is_empty() {
-                opts.pathspec(path);
-            }
-        }
+/// Parse "diff --git a/path b/path" line
+fn parse_diff_git_line(line: &str) -> (Option<String>, Option<String>) {
+    // "diff --git a/old/path b/new/path"
+    let line = line.strip_prefix("diff --git ").unwrap_or(line);
+    let parts: Vec<&str> = line.splitn(2, " b/").collect();
 
-        let diff = repo
-            .diff_index_to_workdir(None, Some(&mut opts))
-            .context("Failed to create diff")?;
+    let old_path = parts.first().and_then(|p| p.strip_prefix("a/")).map(String::from);
+    let new_path = parts.get(1).map(|p| p.to_string());
 
-        self.process_diff(&diff)
+    (old_path, new_path)
+}
+
+/// Parse a unified diff hunk header: @@ -old_start,old_count +new_start,new_count @@
+fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
+    // @@ -1,5 +1,7 @@
+    let line = line.trim_start_matches('@').trim();
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
     }
 
-    /// Diff index vs HEAD (staged changes)
-    fn diff_staged(&self, paths: &[String]) -> Result<Vec<DiffFile>> {
-        let repo = Repository::open(&self.repo_path)
-            .context("Failed to open git repository")?;
-
-        let head_tree = self.resolve_tree(&repo, "HEAD")?;
-
-        let mut opts = DiffOptions::new();
-        opts.context_lines(self.context_lines);
-        for path in paths {
-            if !path.is_empty() {
-                opts.pathspec(path);
-            }
-        }
-
-        let diff = repo
-            .diff_tree_to_index(Some(&head_tree), None, Some(&mut opts))
-            .context("Failed to create diff")?;
-
-        self.process_diff(&diff)
-    }
-
-    /// Diff working tree against a revision with path filtering
-    fn diff_working_tree_filtered(&self, base: &str, paths: &[String]) -> Result<Vec<DiffFile>> {
-        let repo = Repository::open(&self.repo_path)
-            .context("Failed to open git repository")?;
-
-        let base_tree = self.resolve_tree(&repo, base)?;
-
-        let mut opts = DiffOptions::new();
-        opts.context_lines(self.context_lines);
-        for path in paths {
-            if !path.is_empty() {
-                opts.pathspec(path);
-            }
-        }
-
-        let diff = repo
-            .diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut opts))
-            .context("Failed to create diff")?;
-
-        self.process_diff(&diff)
-    }
-
-    /// Gets the list of changed files between two revisions with path filtering
-    fn get_changed_files_filtered(&self, from: &str, to: &str, paths: &[String]) -> Result<Vec<DiffFile>> {
-        let repo = Repository::open(&self.repo_path)
-            .context("Failed to open git repository")?;
-
-        let from_tree = self.resolve_tree(&repo, from)?;
-        let to_tree = self.resolve_tree(&repo, to)?;
-
-        let mut opts = DiffOptions::new();
-        opts.context_lines(self.context_lines);
-        for path in paths {
-            if !path.is_empty() {
-                opts.pathspec(path);
-            }
-        }
-
-        let mut diff = repo
-            .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))
-            .context("Failed to create diff")?;
-
-        // Enable rename detection
-        let mut find_opts = git2::DiffFindOptions::new();
-        find_opts.renames(true);
-        find_opts.copies(true);
-        diff.find_similar(Some(&mut find_opts))?;
-
-        let mut files = Vec::new();
-
-        diff.foreach(
-            &mut |delta, _| {
-                let status = match delta.status() {
-                    git2::Delta::Added => FileStatus::Added,
-                    git2::Delta::Deleted => FileStatus::Deleted,
-                    git2::Delta::Modified => FileStatus::Modified,
-                    git2::Delta::Renamed => FileStatus::Renamed,
-                    _ => return true, // Skip other statuses
-                };
-
-                let old_path = delta.old_file().path().map(PathBuf::from);
-                let new_path = delta.new_file().path().map(PathBuf::from);
-
-                files.push(DiffFile {
-                    old_path,
-                    new_path,
-                    status,
-                    hunks: Vec::new(), // Will be populated later
-                });
-
-                true
-            },
-            None,
-            None,
-            None,
-        )?;
-
-        // Populate hunks for each file
-        for file in &mut files {
-            if let Some(ref new_path) = file.new_path {
-                if self.use_difftastic {
-                    if let Ok(hunks) = self.get_difftastic_hunks(&repo, from, to, new_path) {
-                        file.hunks = hunks;
-                        continue;
-                    }
-                }
-                // Fallback to git diff
-                file.hunks = self.get_git_hunks(&repo, from, to, file)?;
-            }
-        }
-
-        Ok(files)
-    }
-
-    /// Process a git2::Diff into our DiffFile format
-    fn process_diff(&self, diff: &git2::Diff) -> Result<Vec<DiffFile>> {
-        let mut files = Vec::new();
-
-        // Iterate over deltas directly (avoids regex issues with foreach/print)
-        for delta in diff.deltas() {
-            let status = match delta.status() {
-                git2::Delta::Added => FileStatus::Added,
-                git2::Delta::Deleted => FileStatus::Deleted,
-                git2::Delta::Modified => FileStatus::Modified,
-                git2::Delta::Renamed => FileStatus::Renamed,
-                _ => continue,
-            };
-
-            let old_path = delta.old_file().path().map(PathBuf::from);
-            let new_path = delta.new_file().path().map(PathBuf::from);
-
-            files.push(DiffFile {
-                old_path,
-                new_path,
-                status,
-                hunks: Vec::new(),
-            });
-        }
-
-        // Get patches for hunks
-        for (i, file) in files.iter_mut().enumerate() {
-            if let Ok(Some(patch)) = git2::Patch::from_diff(diff, i) {
-                for hunk_idx in 0..patch.num_hunks() {
-                    if let Ok((hunk, num_lines)) = patch.hunk(hunk_idx) {
-                        let mut lines = Vec::new();
-
-                        for line_idx in 0..num_lines {
-                            if let Ok(line) = patch.line_in_hunk(hunk_idx, line_idx) {
-                                let kind = match line.origin() {
-                                    '+' => LineKind::Addition,
-                                    '-' => LineKind::Deletion,
-                                    _ => LineKind::Context,
-                                };
-
-                                let content = String::from_utf8_lossy(line.content()).to_string();
-
-                                lines.push(DiffLine {
-                                    kind,
-                                    old_line_no: line.old_lineno(),
-                                    new_line_no: line.new_lineno(),
-                                    content,
-                                    highlights: Vec::new(),
-                                });
-                            }
-                        }
-
-                        file.hunks.push(DiffHunk {
-                            old_start: hunk.old_start(),
-                            old_lines: hunk.old_lines(),
-                            new_start: hunk.new_start(),
-                            new_lines: hunk.new_lines(),
-                            lines,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Filter out files with no hunks (binary files, permission-only changes, etc.)
-        files.retain(|f| !f.hunks.is_empty());
-
-        Ok(files)
-    }
-
-    fn resolve_tree<'a>(
-        &self,
-        repo: &'a Repository,
-        rev: &str,
-    ) -> Result<git2::Tree<'a>> {
-        let obj = repo
-            .revparse_single(rev)
-            .with_context(|| format!("Failed to resolve revision: {}", rev))?;
-
-        let commit = obj
-            .peel_to_commit()
-            .with_context(|| format!("Failed to get commit for: {}", rev))?;
-
-        commit
-            .tree()
-            .context("Failed to get tree from commit")
-    }
-
-    fn get_difftastic_hunks(
-        &self,
-        repo: &Repository,
-        from: &str,
-        to: &str,
-        file_path: &Path,
-    ) -> Result<Vec<DiffHunk>> {
-        // Get the file contents at both revisions
-        let old_content = self.get_file_at_rev(repo, from, file_path)?;
-        let new_content = self.get_file_at_rev(repo, to, file_path)?;
-
-        // Write to temp files for difftastic
-        let temp_dir = std::env::temp_dir();
-        let old_file = temp_dir.join("differ_old");
-        let new_file = temp_dir.join("differ_new");
-
-        std::fs::write(&old_file, &old_content)?;
-        std::fs::write(&new_file, &new_content)?;
-
-        // Run difftastic with JSON output
-        // SECURITY: Using arg() for each argument to avoid shell injection
-        let output = Command::new("difft")
-            .arg("--display")
-            .arg("json")
-            .arg(&old_file)
-            .arg(&new_file)
-            .output()
-            .context("Failed to execute difftastic")?;
-
-        // Clean up temp files
-        let _ = std::fs::remove_file(&old_file);
-        let _ = std::fs::remove_file(&new_file);
-
-        if !output.status.success() {
-            anyhow::bail!("difftastic failed");
-        }
-
-        // Parse difftastic JSON output
-        self.parse_difftastic_json(&output.stdout, &old_content, &new_content)
-    }
-
-    fn get_file_at_rev(&self, repo: &Repository, rev: &str, path: &Path) -> Result<String> {
-        let obj = repo.revparse_single(rev)?;
-        let commit = obj.peel_to_commit()?;
-        let tree = commit.tree()?;
-
-        let entry = tree.get_path(path)?;
-        let blob = repo.find_blob(entry.id())?;
-
-        String::from_utf8(blob.content().to_vec())
-            .context("File content is not valid UTF-8")
-    }
-
-    fn parse_difftastic_json(
-        &self,
-        json_bytes: &[u8],
-        old_content: &str,
-        new_content: &str,
-    ) -> Result<Vec<DiffHunk>> {
-        // Difftastic JSON output structure (simplified)
-        #[derive(Deserialize)]
-        struct DifftOutput {
-            #[serde(default)]
-            hunks: Vec<DifftHunk>,
-        }
-
-        #[derive(Deserialize)]
-        struct DifftHunk {
-            #[serde(default)]
-            old_start: u32,
-            #[serde(default)]
-            new_start: u32,
-            #[serde(default)]
-            changes: Vec<DifftChange>,
-        }
-
-        #[derive(Deserialize)]
-        struct DifftChange {
-            #[serde(default)]
-            kind: String,
-            #[serde(default)]
-            old_line: Option<u32>,
-            #[serde(default)]
-            new_line: Option<u32>,
-            #[serde(default)]
-            content: String,
-        }
-
-        // Try to parse as difftastic JSON
-        if let Ok(output) = serde_json::from_slice::<DifftOutput>(json_bytes) {
-            return Ok(output
-                .hunks
-                .into_iter()
-                .map(|h| DiffHunk {
-                    old_start: h.old_start,
-                    old_lines: 0, // Will calculate
-                    new_start: h.new_start,
-                    new_lines: 0,
-                    lines: h
-                        .changes
-                        .into_iter()
-                        .map(|c| DiffLine {
-                            kind: match c.kind.as_str() {
-                                "add" | "addition" => LineKind::Addition,
-                                "del" | "deletion" => LineKind::Deletion,
-                                _ => LineKind::Context,
-                            },
-                            old_line_no: c.old_line,
-                            new_line_no: c.new_line,
-                            content: c.content,
-                            highlights: Vec::new(),
-                        })
-                        .collect(),
-                })
-                .collect());
-        }
-
-        // If JSON parsing fails, fall back to creating hunks from raw content
-        self.create_unified_hunks(old_content, new_content)
-    }
-
-    fn create_unified_hunks(&self, old: &str, new: &str) -> Result<Vec<DiffHunk>> {
-        // Simple line-by-line diff as fallback
-        let old_lines: Vec<&str> = old.lines().collect();
-        let new_lines: Vec<&str> = new.lines().collect();
-
-        let mut lines = Vec::new();
-
-        // Very basic diff - just show all lines
-        // In practice, we'd use a proper diff algorithm here
-        for (i, line) in new_lines.iter().enumerate() {
-            lines.push(DiffLine {
-                kind: if old_lines.get(i) == Some(line) {
-                    LineKind::Context
-                } else if i >= old_lines.len() {
-                    LineKind::Addition
-                } else {
-                    LineKind::Context
-                },
-                old_line_no: if i < old_lines.len() {
-                    Some(i as u32 + 1)
-                } else {
-                    None
-                },
-                new_line_no: Some(i as u32 + 1),
-                content: line.to_string(),
-                highlights: Vec::new(),
-            });
-        }
-
-        if lines.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        Ok(vec![DiffHunk {
-            old_start: 1,
-            old_lines: old_lines.len() as u32,
-            new_start: 1,
-            new_lines: new_lines.len() as u32,
-            lines,
-        }])
-    }
-
-    fn get_git_hunks(
-        &self,
-        repo: &Repository,
-        from: &str,
-        to: &str,
-        file: &DiffFile,
-    ) -> Result<Vec<DiffHunk>> {
-        let from_tree = self.resolve_tree(repo, from)?;
-        let to_tree = self.resolve_tree(repo, to)?;
-
-        let mut opts = DiffOptions::new();
-        opts.context_lines(self.context_lines);
-        if let Some(ref path) = file.new_path {
-            opts.pathspec(path);
-        } else if let Some(ref path) = file.old_path {
-            opts.pathspec(path);
-        }
-
-        let diff = repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
-
-        // Use RefCell to allow interior mutability in closures
-        use std::cell::RefCell;
-        let hunks = RefCell::new(Vec::new());
-        let current_hunk: RefCell<Option<DiffHunk>> = RefCell::new(None);
-
-        diff.foreach(
-            &mut |_, _| true,
-            None,
-            Some(&mut |_delta, hunk| {
-                if let Some(h) = current_hunk.borrow_mut().take() {
-                    hunks.borrow_mut().push(h);
-                }
-                *current_hunk.borrow_mut() = Some(DiffHunk {
-                    old_start: hunk.old_start(),
-                    old_lines: hunk.old_lines(),
-                    new_start: hunk.new_start(),
-                    new_lines: hunk.new_lines(),
-                    lines: Vec::new(),
-                });
-                true
-            }),
-            Some(&mut |_delta, _hunk, line| {
-                if let Some(ref mut h) = *current_hunk.borrow_mut() {
-                    let kind = match line.origin() {
-                        '+' => LineKind::Addition,
-                        '-' => LineKind::Deletion,
-                        _ => LineKind::Context,
-                    };
-
-                    let content = String::from_utf8_lossy(line.content()).to_string();
-
-                    h.lines.push(DiffLine {
-                        kind,
-                        old_line_no: line.old_lineno(),
-                        new_line_no: line.new_lineno(),
-                        content,
-                        highlights: Vec::new(),
-                    });
-                }
-                true
-            }),
-        )?;
-
-        if let Some(h) = current_hunk.into_inner() {
-            hunks.borrow_mut().push(h);
-        }
-
-        Ok(hunks.into_inner())
+    let old_part = parts[0].trim_start_matches('-');
+    let new_part = parts[1].trim_start_matches('+');
+
+    let (old_start, old_count) = parse_range(old_part)?;
+    let (new_start, new_count) = parse_range(new_part)?;
+
+    Some((old_start, old_count, new_start, new_count))
+}
+
+fn parse_range(s: &str) -> Option<(u32, u32)> {
+    if let Some((start, count)) = s.split_once(',') {
+        Some((start.parse().ok()?, count.parse().ok()?))
+    } else {
+        Some((s.parse().ok()?, 1))
     }
 }
 

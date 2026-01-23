@@ -86,6 +86,9 @@ pub struct App {
     expanded_file: Option<usize>, // When Some, only show this file
     // Position to restore when collapsing expanded view
     pre_expand_position: Option<(usize, usize)>, // (line_idx, scroll_offset)
+
+    // Search state
+    search: Option<SearchState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +96,22 @@ enum Mode {
     Normal,
     AddAnnotation,
     EditAnnotation(i64), // annotation id
+    SearchFile,          // searching by filename
+    SearchContent,       // searching within content
+}
+
+#[derive(Debug, Clone)]
+struct SearchState {
+    query: String,
+    matches: Vec<usize>,      // indices into display_lines
+    current_match: usize,     // index into matches
+    search_type: SearchType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchType {
+    File,
+    Content,
 }
 
 impl App {
@@ -128,6 +147,7 @@ impl App {
             visible_height: 20, // Will be updated on first render
             expanded_file: None,
             pre_expand_position: None,
+            search: None,
         }
     }
 
@@ -374,6 +394,50 @@ impl App {
         None
     }
 
+    /// Find the index of the current file's header in display_lines
+    fn find_current_file_header_idx(&self) -> Option<usize> {
+        for i in (0..=self.current_line_idx).rev() {
+            if matches!(self.display_lines.get(i), Some(DisplayLine::FileHeader { .. })) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Check if a file is a search match (for file search)
+    fn is_file_search_match(&self, file_idx: usize) -> bool {
+        let Some(ref search) = self.search else {
+            return false;
+        };
+
+        // Only highlight for file search type
+        if search.search_type != SearchType::File {
+            return false;
+        }
+
+        // Check if any match corresponds to this file's header
+        for &match_idx in &search.matches {
+            if let Some(DisplayLine::FileHeader { file_idx: idx, .. }) = self.display_lines.get(match_idx) {
+                if *idx == file_idx {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if a display line index is a search match
+    fn is_search_match(&self, idx: usize) -> bool {
+        self.search.as_ref().map(|s| s.matches.contains(&idx)).unwrap_or(false)
+    }
+
+    /// Check if a display line index is the current search match
+    fn is_current_search_match(&self, idx: usize) -> bool {
+        self.search.as_ref().map(|s| {
+            s.matches.get(s.current_match) == Some(&idx)
+        }).unwrap_or(false)
+    }
+
     /// Get annotation for the current diff line
     fn get_annotation_for_current_line(&self) -> Option<&Annotation> {
         if let Some(DisplayLine::Diff { line, file_path, .. }) = self.current_display_line() {
@@ -563,6 +627,7 @@ impl App {
         match &self.mode {
             Mode::Normal => self.handle_normal_input(key),
             Mode::AddAnnotation | Mode::EditAnnotation(_) => self.handle_annotation_input(key),
+            Mode::SearchFile | Mode::SearchContent => self.handle_search_input(key),
         }
     }
 
@@ -589,20 +654,46 @@ impl App {
             // Navigation
             KeyCode::Char('j') | KeyCode::Down => self.navigate_down(),
             KeyCode::Char('k') | KeyCode::Up => self.navigate_up(),
-            // n/N: next/prev file in normal mode, next/prev change chunk in expanded mode
+            // n/N: next/prev search match if searching, otherwise next/prev chunk
             KeyCode::Char('n') => {
-                if self.expanded_file.is_some() {
-                    self.next_change_chunk();
+                if self.search.is_some() {
+                    self.next_search_match();
                 } else {
-                    self.next_file();
+                    self.next_change_chunk();
                 }
             }
             KeyCode::Char('N') => {
-                if self.expanded_file.is_some() {
-                    self.prev_change_chunk();
+                if self.search.is_some() {
+                    self.prev_search_match();
                 } else {
-                    self.prev_file();
+                    self.prev_change_chunk();
                 }
+            }
+            // Tab/Shift+Tab: next/prev file
+            KeyCode::Tab => self.next_file(),
+            KeyCode::BackTab => self.prev_file(),
+            // Search
+            KeyCode::Char('f') => {
+                self.mode = Mode::SearchFile;
+                self.search = Some(SearchState {
+                    query: String::new(),
+                    matches: Vec::new(),
+                    current_match: 0,
+                    search_type: SearchType::File,
+                });
+            }
+            KeyCode::Char('/') => {
+                self.mode = Mode::SearchContent;
+                self.search = Some(SearchState {
+                    query: String::new(),
+                    matches: Vec::new(),
+                    current_match: 0,
+                    search_type: SearchType::Content,
+                });
+            }
+            // Clear search
+            KeyCode::Esc => {
+                self.search = None;
             }
             KeyCode::Char('g') => {
                 self.current_line_idx = 0;
@@ -624,9 +715,6 @@ impl App {
                 self.adjust_scroll();
             }
 
-            // Change navigation (especially useful in expanded mode)
-            KeyCode::Char(']') => self.next_change(),
-            KeyCode::Char('[') => self.prev_change(),
 
             // Toggle views
             KeyCode::Char('c') => {
@@ -770,6 +858,149 @@ impl App {
         Ok(false)
     }
 
+    fn handle_search_input(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.search = None;
+            }
+            KeyCode::Enter => {
+                // Execute search and go to first match
+                self.execute_search();
+                self.mode = Mode::Normal;
+                if let Some(ref search) = self.search {
+                    if search.matches.is_empty() {
+                        self.message = Some("No matches found".to_string());
+                    } else {
+                        self.message = Some(format!(
+                            "Found {} match{}",
+                            search.matches.len(),
+                            if search.matches.len() == 1 { "" } else { "es" }
+                        ));
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(ref mut search) = self.search {
+                    search.query.pop();
+                    // Live search as you type
+                    self.execute_search();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(ref mut search) = self.search {
+                    search.query.push(c);
+                    // Live search as you type
+                    self.execute_search();
+                }
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
+    fn execute_search(&mut self) {
+        let Some(ref mut search) = self.search else {
+            return;
+        };
+
+        if search.query.is_empty() {
+            search.matches.clear();
+            return;
+        }
+
+        // Try to compile as case-insensitive regex, fall back to literal match
+        let pattern = regex::RegexBuilder::new(&search.query)
+            .case_insensitive(true)
+            .build()
+            .unwrap_or_else(|_| {
+                regex::RegexBuilder::new(&regex::escape(&search.query))
+                    .case_insensitive(true)
+                    .build()
+                    .unwrap()
+            });
+
+        search.matches.clear();
+
+        for (idx, line) in self.display_lines.iter().enumerate() {
+            let matches = match search.search_type {
+                SearchType::File => {
+                    // Match on file headers
+                    if let DisplayLine::FileHeader { path, .. } = line {
+                        pattern.is_match(path)
+                    } else {
+                        false
+                    }
+                }
+                SearchType::Content => {
+                    // Match on diff line content
+                    if let DisplayLine::Diff { line: diff_line, .. } = line {
+                        pattern.is_match(&diff_line.content)
+                    } else if let DisplayLine::FileHeader { path, .. } = line {
+                        // Also match file headers in content search
+                        pattern.is_match(path)
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if matches {
+                search.matches.push(idx);
+            }
+        }
+
+        // Jump to first match
+        search.current_match = 0;
+        if let Some(&idx) = search.matches.first() {
+            self.current_line_idx = idx;
+            self.adjust_scroll();
+        }
+    }
+
+    fn next_search_match(&mut self) {
+        let (new_idx, current, total) = {
+            let Some(ref mut search) = self.search else {
+                return;
+            };
+
+            if search.matches.is_empty() {
+                return;
+            }
+
+            search.current_match = (search.current_match + 1) % search.matches.len();
+            (search.matches[search.current_match], search.current_match + 1, search.matches.len())
+        };
+
+        self.current_line_idx = new_idx;
+        self.adjust_scroll();
+        self.message = Some(format!("Match {}/{}", current, total));
+    }
+
+    fn prev_search_match(&mut self) {
+        let (new_idx, current, total) = {
+            let Some(ref mut search) = self.search else {
+                return;
+            };
+
+            if search.matches.is_empty() {
+                return;
+            }
+
+            search.current_match = if search.current_match == 0 {
+                search.matches.len() - 1
+            } else {
+                search.current_match - 1
+            };
+            (search.matches[search.current_match], search.current_match + 1, search.matches.len())
+        };
+
+        self.current_line_idx = new_idx;
+        self.adjust_scroll();
+        self.message = Some(format!("Match {}/{}", current, total));
+    }
+
     /// Check if a display line is a change (addition or deletion)
     fn is_change_line(&self, idx: usize) -> bool {
         matches!(
@@ -853,46 +1084,6 @@ impl App {
         if self.is_change_line(idx) {
             self.current_line_idx = idx;
             self.adjust_scroll();
-        }
-    }
-
-    /// Jump to next change (addition or deletion) - single line
-    fn next_change(&mut self) {
-        let total = self.display_lines.len();
-        for idx in (self.current_line_idx + 1)..total {
-            if self.is_change_line(idx) {
-                self.current_line_idx = idx;
-                self.adjust_scroll();
-                return;
-            }
-        }
-        // Wrap around to beginning
-        for idx in 0..self.current_line_idx {
-            if self.is_change_line(idx) {
-                self.current_line_idx = idx;
-                self.adjust_scroll();
-                return;
-            }
-        }
-    }
-
-    /// Jump to previous change (addition or deletion) - single line
-    fn prev_change(&mut self) {
-        for idx in (0..self.current_line_idx).rev() {
-            if self.is_change_line(idx) {
-                self.current_line_idx = idx;
-                self.adjust_scroll();
-                return;
-            }
-        }
-        // Wrap around to end
-        let total = self.display_lines.len();
-        for idx in (self.current_line_idx..total).rev() {
-            if self.is_change_line(idx) {
-                self.current_line_idx = idx;
-                self.adjust_scroll();
-                return;
-            }
         }
     }
 
@@ -1004,6 +1195,25 @@ fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect) {
+    // Find the current file's header index
+    let current_file_header_idx = app.find_current_file_header_idx();
+
+    // Check if the file header is visible on screen (use app.visible_height, not area.height)
+    let visible_start = app.scroll_offset;
+    let visible_end = app.scroll_offset + app.visible_height;
+    let header_is_visible = current_file_header_idx
+        .map(|idx| idx >= visible_start && idx < visible_end)
+        .unwrap_or(false);
+
+    // If the header is visible on screen, don't show the sticky header
+    if header_is_visible {
+        // Render an empty line or minimal separator
+        let paragraph = Paragraph::new("")
+            .style(Style::default().bg(Color::Rgb(30, 30, 30)));
+        f.render_widget(paragraph, area);
+        return;
+    }
+
     let (file_path, file_idx) = app.current_file_info().unwrap_or(("<none>".to_string(), 0));
 
     // Calculate file stats
@@ -1014,7 +1224,13 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect) {
         (adds, dels)
     }).unwrap_or((0, 0));
 
-    // Different style when expanded
+    // Check if this file is a search match and if it's the current match
+    let is_current_match = current_file_header_idx
+        .map(|idx| app.is_current_search_match(idx))
+        .unwrap_or(false);
+    let is_search_match = app.is_file_search_match(file_idx);
+
+    // Different style when expanded or search match
     let (style, expanded_indicator) = if app.expanded_file.is_some() {
         (
             Style::default()
@@ -1022,6 +1238,22 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect) {
                 .bg(Color::Rgb(80, 60, 40)) // Orange-ish when expanded
                 .add_modifier(Modifier::BOLD),
             " [FULL FILE - x to collapse]"
+        )
+    } else if is_current_match {
+        (
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow) // Bright yellow for current match
+                .add_modifier(Modifier::BOLD),
+            ""
+        )
+    } else if is_search_match {
+        (
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(180, 180, 100)) // Dimmer for other matches
+                .add_modifier(Modifier::BOLD),
+            ""
         )
     } else {
         (
@@ -1074,15 +1306,42 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect) {
                         (a, d)
                     }).unwrap_or((0, 0));
 
-                    let style = Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Rgb(40, 40, 60))
-                        .add_modifier(Modifier::BOLD);
+                    // Check if this is the current search match or just a match
+                    let is_current_match = app.is_current_search_match(idx);
+                    let is_match = app.is_search_match(idx);
+
+                    let (style, stats_bg) = if is_current_match {
+                        // Current match: bright yellow background
+                        (
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                            Color::Yellow
+                        )
+                    } else if is_match {
+                        // Other matches: dimmer highlight
+                        (
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Rgb(180, 180, 100))
+                                .add_modifier(Modifier::BOLD),
+                            Color::Rgb(180, 180, 100)
+                        )
+                    } else {
+                        (
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Rgb(40, 40, 60))
+                                .add_modifier(Modifier::BOLD),
+                            Color::Rgb(40, 40, 60)
+                        )
+                    };
 
                     ListItem::new(Line::from(vec![
                         Span::styled(format!(" Δ {}  ", path), style),
-                        Span::styled(format!("+{} ", adds), Style::default().fg(Color::Green).bg(Color::Rgb(40, 40, 60))),
-                        Span::styled(format!("-{} ", dels), Style::default().fg(Color::Red).bg(Color::Rgb(40, 40, 60))),
+                        Span::styled(format!("+{} ", adds), Style::default().fg(Color::Green).bg(stats_bg)),
+                        Span::styled(format!("-{} ", dels), Style::default().fg(Color::Red).bg(stats_bg)),
                     ]))
                 }
                 DisplayLine::HunkHeader { line_no, additions, deletions, .. } => {
@@ -1225,15 +1484,42 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
                     (a, d)
                 }).unwrap_or((0, 0));
 
-                let style = Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(40, 40, 60))
-                    .add_modifier(Modifier::BOLD);
+                // Check if this is the current search match or just a match
+                let is_current_match = app.is_current_search_match(idx);
+                let is_match = app.is_search_match(idx);
+
+                let (style, stats_bg) = if is_current_match {
+                    // Current match: bright yellow background
+                    (
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                        Color::Yellow
+                    )
+                } else if is_match {
+                    // Other matches: dimmer highlight
+                    (
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Rgb(180, 180, 100))
+                            .add_modifier(Modifier::BOLD),
+                        Color::Rgb(180, 180, 100)
+                    )
+                } else {
+                    (
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::Rgb(40, 40, 60))
+                            .add_modifier(Modifier::BOLD),
+                        Color::Rgb(40, 40, 60)
+                    )
+                };
 
                 let header = Line::from(vec![
                     Span::styled(format!(" Δ {} ", path), style),
-                    Span::styled(format!("+{} ", adds), Style::default().fg(Color::Green).bg(Color::Rgb(40, 40, 60))),
-                    Span::styled(format!("-{} ", dels), Style::default().fg(Color::Red).bg(Color::Rgb(40, 40, 60))),
+                    Span::styled(format!("+{} ", adds), Style::default().fg(Color::Green).bg(stats_bg)),
+                    Span::styled(format!("-{} ", dels), Style::default().fg(Color::Red).bg(stats_bg)),
                 ]);
                 left_items.push(ListItem::new(header));
                 right_items.push(ListItem::new(Line::from("")));
@@ -1372,8 +1658,10 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 msg.clone()
             } else if app.expanded_file.is_some() {
                 " j/k:line  n/N:chunk  ^d/^u:page  x:collapse  a:annotate  ?:help  q:quit".to_string()
+            } else if app.search.is_some() {
+                " n/N:match  Esc:clear  j/k:nav  Tab:file  x:expand  a:annotate  ?:help  q:quit".to_string()
             } else {
-                " j/k:nav  ^d/^u:page  n/N:file  x:expand  a:annotate  s:side  ?:help  q:quit".to_string()
+                " j/k:nav  n/N:chunk  Tab:file  f:find  /:search  x:expand  a:annotate  ?:help  q:quit".to_string()
             };
             let status = Paragraph::new(content)
                 .style(Style::default().fg(Color::DarkGray).bg(Color::Rgb(30, 30, 30)));
@@ -1398,6 +1686,34 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
 
             f.render_widget(input, area);
         }
+        Mode::SearchFile | Mode::SearchContent => {
+            let search_type = match &app.mode {
+                Mode::SearchFile => "file",
+                Mode::SearchContent => "content",
+                _ => "",
+            };
+
+            let match_info = if let Some(ref search) = app.search {
+                if search.matches.is_empty() {
+                    if search.query.is_empty() {
+                        String::new()
+                    } else {
+                        " (no matches)".to_string()
+                    }
+                } else {
+                    format!(" ({} match{})", search.matches.len(), if search.matches.len() == 1 { "" } else { "es" })
+                }
+            } else {
+                String::new()
+            };
+
+            let query = app.search.as_ref().map(|s| s.query.as_str()).unwrap_or("");
+            let content = format!(" Search {}: {}_{}  (Enter: confirm, Esc: cancel)", search_type, query, match_info);
+
+            let status = Paragraph::new(content)
+                .style(Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 40, 50)));
+            f.render_widget(status, area);
+        }
     }
 }
 
@@ -1409,14 +1725,19 @@ fn render_help(f: &mut Frame) {
         "  Navigation:",
         "    j / Down  Move down line by line",
         "    k / Up    Move up line by line",
-        "    n         Next file / next chunk (expanded)",
-        "    N         Previous file / prev chunk (expanded)",
-        "    ]         Next change (addition/deletion)",
-        "    [         Previous change",
+        "    n / N     Next / previous chunk",
+        "    Tab       Next file",
+        "    Shift+Tab Previous file",
         "    Ctrl+d    Half page down",
         "    Ctrl+u    Half page up",
         "    g         Go to start",
         "    G         Go to end",
+        "",
+        "  Search:",
+        "    f         Search by filename (regex)",
+        "    /         Search in content (regex)",
+        "    n / N     Next / previous match (when searching)",
+        "    Esc       Clear search",
         "",
         "  View:",
         "    x         Expand/collapse current file (full view)",

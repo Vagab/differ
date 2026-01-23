@@ -180,6 +180,9 @@ enum Commands {
 
     /// Clear all annotations for the current repository
     Clear,
+
+    /// Open config file in $EDITOR
+    Config,
 }
 
 fn main() -> Result<()> {
@@ -241,6 +244,9 @@ fn main() -> Result<()> {
         }
         Commands::Clear => {
             cmd_clear(&storage, repo_id)?;
+        }
+        Commands::Config => {
+            cmd_config()?;
         }
     }
 
@@ -381,5 +387,25 @@ fn cmd_export(
 fn cmd_clear(storage: &Storage, repo_id: i64) -> Result<()> {
     let count = storage.clear_all(repo_id)?;
     println!("Cleared {} annotations", count);
+    Ok(())
+}
+
+fn cmd_config() -> Result<()> {
+    let config_path = Config::default_path();
+
+    // Create default config if it doesn't exist
+    if !config_path.exists() {
+        Config::create_default()?;
+    }
+
+    // Get editor from $EDITOR, fall back to vi
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+    // Open in editor
+    std::process::Command::new(&editor)
+        .arg(&config_path)
+        .status()
+        .with_context(|| format!("Failed to open editor: {}", editor))?;
+
     Ok(())
 }

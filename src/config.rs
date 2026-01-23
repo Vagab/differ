@@ -2,17 +2,17 @@
 //!
 //! Loads user configuration from ~/.config/differ/config.toml
 
-use anyhow::Result;
-use serde::Deserialize;
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Application configuration
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     /// Enable side-by-side diff view
     pub side_by_side: bool,
-    /// Number of context lines around changes (default 7)
+    /// Number of context lines around changes (default 3)
     pub context_lines: u32,
     /// Show annotation content inline (default true)
     pub show_annotations: bool,
@@ -44,9 +44,9 @@ impl Config {
 
     /// Get the default config file path
     pub fn default_path() -> PathBuf {
-        dirs::config_dir()
+        dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("differ")
+            .join(".differ")
             .join("config.toml")
     }
 
@@ -59,5 +59,25 @@ impl Config {
             self.context_lines = ctx;
         }
         self
+    }
+
+    /// Create a default config file
+    pub fn create_default() -> Result<()> {
+        let config_path = Self::default_path();
+        let config = Config::default();
+
+        // Create parent directory if needed
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+        }
+
+        let contents = toml::to_string_pretty(&config)
+            .context("Failed to serialize config")?;
+
+        std::fs::write(&config_path, contents)
+            .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
+
+        Ok(())
     }
 }
