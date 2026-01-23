@@ -118,6 +118,101 @@ enum SearchType {
     Content,
 }
 
+#[derive(Clone, Copy)]
+struct Theme {
+    bg: Color,
+    surface: Color,
+    surface_alt: Color,
+    current_line_bg: Color,
+    header_bg: Color,
+    header_fg: Color,
+    header_match_bg: Color,
+    header_match_fg: Color,
+    header_dim_bg: Color,
+    header_dim_fg: Color,
+    expanded_bg: Color,
+    expanded_fg: Color,
+    hunk_bg: Color,
+    hunk_fg: Color,
+    hunk_border: Color,
+    added_bg: Color,
+    added_fg: Color,
+    deleted_bg: Color,
+    deleted_fg: Color,
+    context_fg: Color,
+    line_num: Color,
+    annotation_bg: Color,
+    annotation_fg: Color,
+    annotation_marker: Color,
+    status_bg: Color,
+    status_fg: Color,
+    search_bg: Color,
+    search_fg: Color,
+    help_bg: Color,
+    help_fg: Color,
+    border: Color,
+    token_keyword: Color,
+    token_string: Color,
+    token_comment: Color,
+    token_function: Color,
+    token_type: Color,
+    token_number: Color,
+    token_operator: Color,
+    token_variable: Color,
+    token_atom: Color,
+    token_module: Color,
+    token_default: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            bg: Color::Rgb(18, 20, 24),
+            surface: Color::Rgb(26, 30, 36),
+            surface_alt: Color::Rgb(34, 38, 46),
+            current_line_bg: Color::Rgb(48, 54, 62),
+            header_bg: Color::Rgb(38, 44, 60),
+            header_fg: Color::Rgb(235, 238, 242),
+            header_match_bg: Color::Rgb(220, 190, 90),
+            header_match_fg: Color::Rgb(18, 18, 18),
+            header_dim_bg: Color::Rgb(120, 120, 70),
+            header_dim_fg: Color::Rgb(20, 20, 20),
+            expanded_bg: Color::Rgb(96, 72, 40),
+            expanded_fg: Color::Rgb(255, 245, 230),
+            hunk_bg: Color::Rgb(140, 130, 78),
+            hunk_fg: Color::Rgb(20, 20, 20),
+            hunk_border: Color::Rgb(80, 88, 72),
+            added_bg: Color::Rgb(18, 44, 26),
+            added_fg: Color::Rgb(150, 230, 185),
+            deleted_bg: Color::Rgb(52, 24, 26),
+            deleted_fg: Color::Rgb(240, 160, 160),
+            context_fg: Color::Rgb(220, 224, 230),
+            line_num: Color::Rgb(120, 130, 140),
+            annotation_bg: Color::Rgb(40, 76, 78),
+            annotation_fg: Color::Rgb(230, 245, 245),
+            annotation_marker: Color::Rgb(255, 208, 96),
+            status_bg: Color::Rgb(22, 24, 28),
+            status_fg: Color::Rgb(150, 160, 170),
+            search_bg: Color::Rgb(40, 44, 56),
+            search_fg: Color::Rgb(255, 225, 140),
+            help_bg: Color::Rgb(30, 34, 42),
+            help_fg: Color::Rgb(220, 230, 240),
+            border: Color::Rgb(210, 175, 90),
+            token_keyword: Color::Rgb(205, 140, 255),
+            token_string: Color::Rgb(255, 206, 120),
+            token_comment: Color::Rgb(120, 130, 140),
+            token_function: Color::Rgb(120, 190, 255),
+            token_type: Color::Rgb(120, 220, 210),
+            token_number: Color::Rgb(240, 170, 170),
+            token_operator: Color::Rgb(220, 224, 230),
+            token_variable: Color::Rgb(150, 210, 255),
+            token_atom: Color::Rgb(130, 220, 210),
+            token_module: Color::Rgb(240, 215, 140),
+            token_default: Color::Rgb(220, 224, 230),
+        }
+    }
+}
+
 impl App {
     pub fn new(
         storage: Storage,
@@ -1181,6 +1276,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
+    let theme = Theme::default();
+
     // Expand input area when in annotation mode
     let input_height = match app.mode {
         Mode::Normal => 1,
@@ -1204,25 +1301,25 @@ fn ui(f: &mut Frame, app: &mut App) {
     app.visible_height = chunks[1].height as usize;
 
     // Sticky file header
-    render_sticky_file_header(f, app, chunks[0]);
+    render_sticky_file_header(f, app, chunks[0], theme);
 
     // Diff content
     if app.side_by_side {
-        render_diff_side_by_side(f, app, chunks[1]);
+        render_diff_side_by_side(f, app, chunks[1], theme);
     } else {
-        render_diff_unified(f, app, chunks[1]);
+        render_diff_unified(f, app, chunks[1], theme);
     }
 
     // Status bar / input
-    render_status(f, app, chunks[2]);
+    render_status(f, app, chunks[2], theme);
 
     // Help overlay
     if app.show_help {
-        render_help(f);
+        render_help(f, theme);
     }
 }
 
-fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect) {
+fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
     // Find the current file's header index
     let current_file_header_idx = app.find_current_file_header_idx();
 
@@ -1237,7 +1334,7 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect) {
     if header_is_visible {
         // Render an empty line or minimal separator
         let paragraph = Paragraph::new("")
-            .style(Style::default().bg(Color::Rgb(30, 30, 30)));
+            .style(Style::default().bg(theme.status_bg));
         f.render_widget(paragraph, area);
         return;
     }
@@ -1262,32 +1359,32 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect) {
     let (style, expanded_indicator) = if app.expanded_file.is_some() {
         (
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(80, 60, 40)) // Orange-ish when expanded
+                .fg(theme.expanded_fg)
+                .bg(theme.expanded_bg)
                 .add_modifier(Modifier::BOLD),
             " [FULL FILE - x to collapse]"
         )
     } else if is_current_match {
         (
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow) // Bright yellow for current match
+                .fg(theme.header_match_fg)
+                .bg(theme.header_match_bg)
                 .add_modifier(Modifier::BOLD),
             ""
         )
     } else if is_search_match {
         (
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(180, 180, 100)) // Dimmer for other matches
+                .fg(theme.header_dim_fg)
+                .bg(theme.header_dim_bg)
                 .add_modifier(Modifier::BOLD),
             ""
         )
     } else {
         (
             Style::default()
-                .fg(Color::White)
-                .bg(Color::Rgb(40, 40, 60))
+                .fg(theme.header_fg)
+                .bg(theme.header_bg)
                 .add_modifier(Modifier::BOLD),
             ""
         )
@@ -1308,7 +1405,7 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 
-fn render_diff_unified(f: &mut Frame, app: &App, area: Rect) {
+fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
     let visible_height = area.height as usize;
     let scroll_offset = app.scroll_offset;
 
@@ -1342,44 +1439,44 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect) {
                         // Current match: bright yellow background
                         (
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Yellow)
+                                .fg(theme.header_match_fg)
+                                .bg(theme.header_match_bg)
                                 .add_modifier(Modifier::BOLD),
-                            Color::Yellow
+                            theme.header_match_bg
                         )
                     } else if is_match {
                         // Other matches: dimmer highlight
                         (
                             Style::default()
-                                .fg(Color::Black)
-                                .bg(Color::Rgb(180, 180, 100))
+                                .fg(theme.header_dim_fg)
+                                .bg(theme.header_dim_bg)
                                 .add_modifier(Modifier::BOLD),
-                            Color::Rgb(180, 180, 100)
+                            theme.header_dim_bg
                         )
                     } else {
                         (
                             Style::default()
-                                .fg(Color::White)
-                                .bg(Color::Rgb(40, 40, 60))
+                                .fg(theme.header_fg)
+                                .bg(theme.header_bg)
                                 .add_modifier(Modifier::BOLD),
-                            Color::Rgb(40, 40, 60)
+                            theme.header_bg
                         )
                     };
 
                     ListItem::new(Line::from(vec![
                         Span::styled(format!(" Δ {}  ", path), style),
-                        Span::styled(format!("+{} ", adds), Style::default().fg(Color::Green).bg(stats_bg)),
-                        Span::styled(format!("-{} ", dels), Style::default().fg(Color::Red).bg(stats_bg)),
+                        Span::styled(format!("+{} ", adds), Style::default().fg(theme.added_fg).bg(stats_bg)),
+                        Span::styled(format!("-{} ", dels), Style::default().fg(theme.deleted_fg).bg(stats_bg)),
                     ]))
                 }
                 DisplayLine::HunkHeader { line_no, additions, deletions, .. } => {
                     // Hunk header - prominent with stats
                     let style = Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Rgb(180, 180, 100));
+                        .fg(theme.hunk_fg)
+                        .bg(theme.hunk_bg);
                     let stats_style = Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Rgb(180, 180, 100))
+                        .fg(theme.hunk_fg)
+                        .bg(theme.hunk_bg)
                         .add_modifier(Modifier::BOLD);
                     ListItem::new(Line::from(vec![
                         Span::styled(format!(" +{} -{} ", additions, deletions), stats_style),
@@ -1388,7 +1485,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect) {
                 }
                 DisplayLine::HunkEnd => {
                     // End of hunk - subtle bottom border
-                    let style = Style::default().fg(Color::Rgb(60, 60, 40));
+                    let style = Style::default().fg(theme.hunk_border);
                     ListItem::new(Line::from(Span::styled("╰".to_string() + &"─".repeat(30), style)))
                 }
                 DisplayLine::Diff { line, file_path, .. } => {
@@ -1408,27 +1505,39 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect) {
                     });
                     let annotation_marker = if has_annotation { "●" } else { " " };
 
-                    let line_num_style = Style::default().fg(Color::DarkGray);
+                    let line_num_style = if is_current {
+                        Style::default().fg(theme.line_num).bg(theme.current_line_bg)
+                    } else {
+                        Style::default().fg(theme.line_num)
+                    };
                     let line_num = format!("{:>4}", line_no);
 
                     let (prefix, content_style) = match line.kind {
                         LineKind::Addition => (
                             "+",
-                            Style::default().fg(Color::Green).bg(Color::Rgb(0, 40, 0)),
+                            Style::default().fg(theme.added_fg).bg(theme.added_bg),
                         ),
                         LineKind::Deletion => (
                             "-",
-                            Style::default().fg(Color::Red).bg(Color::Rgb(40, 0, 0)),
+                            Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg),
                         ),
                         LineKind::Context => (
                             " ",
-                            Style::default().fg(Color::White),
+                            Style::default().fg(theme.context_fg),
                         ),
                     };
 
                     // Build spans with syntax highlighting
+                    let marker_style = if is_current {
+                        Style::default()
+                            .fg(theme.annotation_marker)
+                            .bg(theme.current_line_bg)
+                    } else {
+                        Style::default().fg(theme.annotation_marker)
+                    };
+
                     let mut spans = vec![
-                        Span::styled(annotation_marker, Style::default().fg(Color::Yellow)),
+                        Span::styled(annotation_marker, marker_style),
                         Span::styled(line_num, line_num_style),
                         Span::raw(" "),
                     ];
@@ -1439,6 +1548,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect) {
                         &line.highlights,
                         content_style,
                         is_current,
+                        theme,
                     );
                     spans.extend(content_spans);
 
@@ -1451,8 +1561,8 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect) {
                         AnnotationType::Todo => "📋",
                     };
                     let style = Style::default()
-                        .fg(Color::White)
-                        .bg(Color::Rgb(50, 80, 80));
+                        .fg(theme.annotation_fg)
+                        .bg(theme.annotation_bg);
 
                     // Split content by newlines and create multiple lines
                     let lines: Vec<Line> = annotation.content
@@ -1480,7 +1590,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(diff_list, area);
 }
 
-fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
+fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
     // Split the area into two columns with a small gap
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -1493,8 +1603,6 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
 
     let visible_height = area.height as usize;
     let scroll_offset = app.scroll_offset;
-
-    let line_num_style = Style::default().fg(Color::DarkGray);
 
     // Build left (old) and right (new) items
     let mut left_items: Vec<ListItem> = Vec::new();
@@ -1525,34 +1633,34 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
                     // Current match: bright yellow background
                     (
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
+                            .fg(theme.header_match_fg)
+                            .bg(theme.header_match_bg)
                             .add_modifier(Modifier::BOLD),
-                        Color::Yellow
+                        theme.header_match_bg
                     )
                 } else if is_match {
                     // Other matches: dimmer highlight
                     (
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Rgb(180, 180, 100))
+                            .fg(theme.header_dim_fg)
+                            .bg(theme.header_dim_bg)
                             .add_modifier(Modifier::BOLD),
-                        Color::Rgb(180, 180, 100)
+                        theme.header_dim_bg
                     )
                 } else {
                     (
                         Style::default()
-                            .fg(Color::White)
-                            .bg(Color::Rgb(40, 40, 60))
+                            .fg(theme.header_fg)
+                            .bg(theme.header_bg)
                             .add_modifier(Modifier::BOLD),
-                        Color::Rgb(40, 40, 60)
+                        theme.header_bg
                     )
                 };
 
                 let header = Line::from(vec![
                     Span::styled(format!(" Δ {} ", path), style),
-                    Span::styled(format!("+{} ", adds), Style::default().fg(Color::Green).bg(stats_bg)),
-                    Span::styled(format!("-{} ", dels), Style::default().fg(Color::Red).bg(stats_bg)),
+                    Span::styled(format!("+{} ", adds), Style::default().fg(theme.added_fg).bg(stats_bg)),
+                    Span::styled(format!("-{} ", dels), Style::default().fg(theme.deleted_fg).bg(stats_bg)),
                 ]);
                 left_items.push(ListItem::new(header));
                 right_items.push(ListItem::new(Line::from("")));
@@ -1560,11 +1668,11 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
             DisplayLine::HunkHeader { line_no, additions, deletions, .. } => {
                 // Hunk header - prominent with stats
                 let style = Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Rgb(180, 180, 100));
+                    .fg(theme.hunk_fg)
+                    .bg(theme.hunk_bg);
                 let stats_style = Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Rgb(180, 180, 100))
+                    .fg(theme.hunk_fg)
+                    .bg(theme.hunk_bg)
                     .add_modifier(Modifier::BOLD);
                 left_items.push(ListItem::new(Line::from(vec![
                     Span::styled(format!(" +{} -{} ", additions, deletions), stats_style),
@@ -1574,7 +1682,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
             }
             DisplayLine::HunkEnd => {
                 // End of hunk - subtle bottom border
-                let style = Style::default().fg(Color::Rgb(60, 60, 40));
+                let style = Style::default().fg(theme.hunk_border);
                 left_items.push(ListItem::new(Line::from(Span::styled("╰".to_string() + &"─".repeat(20), style))));
                 right_items.push(ListItem::new(Line::from(Span::styled("╰".to_string() + &"─".repeat(20), style))));
             }
@@ -1593,48 +1701,59 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
                         && a.start_line <= line_no
                         && a.end_line.map_or(a.start_line == line_no, |e| e >= line_no)
                 });
-                let marker_style = Style::default().fg(Color::Yellow);
+                let line_num_style = if is_current {
+                    Style::default().fg(theme.line_num).bg(theme.current_line_bg)
+                } else {
+                    Style::default().fg(theme.line_num)
+                };
+                let marker_style = if is_current {
+                    Style::default()
+                        .fg(theme.annotation_marker)
+                        .bg(theme.current_line_bg)
+                } else {
+                    Style::default().fg(theme.annotation_marker)
+                };
                 let marker = if has_annotation { "●" } else { " " };
 
                 match line.kind {
                     LineKind::Deletion => {
                         let old_no = line.old_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
-                        let content_style = Style::default().fg(Color::Red).bg(Color::Rgb(40, 0, 0));
+                        let content_style = Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg);
                         let mut left_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(old_no, line_num_style),
                         ];
-                        left_spans.extend(build_highlighted_spans("-", &line.content, &line.highlights, content_style, is_current));
+                        left_spans.extend(build_highlighted_spans("-", &line.content, &line.highlights, content_style, is_current, theme));
                         left_items.push(ListItem::new(Line::from(left_spans)));
                         right_items.push(ListItem::new(Line::from("")));
                     }
                     LineKind::Addition => {
                         let new_no = line.new_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
-                        let content_style = Style::default().fg(Color::Green).bg(Color::Rgb(0, 40, 0));
+                        let content_style = Style::default().fg(theme.added_fg).bg(theme.added_bg);
                         left_items.push(ListItem::new(Line::from("")));
                         let mut right_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(new_no, line_num_style),
                         ];
-                        right_spans.extend(build_highlighted_spans("+", &line.content, &line.highlights, content_style, is_current));
+                        right_spans.extend(build_highlighted_spans("+", &line.content, &line.highlights, content_style, is_current, theme));
                         right_items.push(ListItem::new(Line::from(right_spans)));
                     }
                     LineKind::Context => {
                         let old_no = line.old_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let new_no = line.new_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
-                        let content_style = Style::default().fg(Color::White);
+                        let content_style = Style::default().fg(theme.context_fg);
                         let mut left_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(old_no, line_num_style),
                         ];
-                        left_spans.extend(build_highlighted_spans(" ", &line.content, &line.highlights, content_style, is_current));
+                        left_spans.extend(build_highlighted_spans(" ", &line.content, &line.highlights, content_style, is_current, theme));
                         left_items.push(ListItem::new(Line::from(left_spans)));
 
                         let mut right_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(new_no, line_num_style),
                         ];
-                        right_spans.extend(build_highlighted_spans(" ", &line.content, &line.highlights, content_style, is_current));
+                        right_spans.extend(build_highlighted_spans(" ", &line.content, &line.highlights, content_style, is_current, theme));
                         right_items.push(ListItem::new(Line::from(right_spans)));
                     }
                 }
@@ -1646,8 +1765,8 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
                     AnnotationType::Todo => "📋",
                 };
                 let style = Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(50, 80, 80));
+                    .fg(theme.annotation_fg)
+                    .bg(theme.annotation_bg);
 
                 // Split content by newlines and create multiple lines
                 let lines: Vec<Line> = annotation.content
@@ -1686,7 +1805,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(right_list, columns[2]);
 }
 
-fn render_status(f: &mut Frame, app: &App, area: Rect) {
+fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
     match &app.mode {
         Mode::Normal => {
             let content = if let Some(msg) = &app.message {
@@ -1699,7 +1818,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 " j/k:nav  n/N:chunk  Tab:file  f:find  /:search  x:expand  a:annotate  ?:help  q:quit".to_string()
             };
             let status = Paragraph::new(content)
-                .style(Style::default().fg(Color::DarkGray).bg(Color::Rgb(30, 30, 30)));
+                .style(Style::default().fg(theme.status_fg).bg(theme.status_bg));
             f.render_widget(status, area);
         }
         Mode::AddAnnotation | Mode::EditAnnotation(_) => {
@@ -1713,10 +1832,10 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             let input_with_cursor = format!("{}_", app.annotation_input);
 
             let input = Paragraph::new(input_with_cursor)
-                .style(Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 50)))
+                .style(Style::default().fg(theme.header_fg).bg(theme.surface_alt))
                 .block(Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow))
+                    .border_style(Style::default().fg(theme.border))
                     .title(title));
 
             f.render_widget(input, area);
@@ -1746,13 +1865,13 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             let content = format!(" Search {}: {}_{}  (Enter: confirm, Esc: cancel)", search_type, query, match_info);
 
             let status = Paragraph::new(content)
-                .style(Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 40, 50)));
+                .style(Style::default().fg(theme.search_fg).bg(theme.search_bg));
             f.render_widget(status, area);
         }
     }
 }
 
-fn render_help(f: &mut Frame) {
+fn render_help(f: &mut Frame, theme: Theme) {
     let area = centered_rect(60, 80, f.area());
 
     let help_text = vec![
@@ -1797,12 +1916,13 @@ fn render_help(f: &mut Frame) {
     ];
 
     let help = Paragraph::new(help_text.join("\n"))
-        .style(Style::default())
+        .style(Style::default().fg(theme.help_fg).bg(theme.help_bg))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Help ")
-                .style(Style::default().bg(Color::DarkGray)),
+                .style(Style::default().bg(theme.help_bg))
+                .border_style(Style::default().fg(theme.border)),
         )
         .wrap(Wrap { trim: false });
 
@@ -1831,19 +1951,19 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 /// Get the color for a syntax token type
-fn token_color(token_type: TokenType) -> Color {
+fn token_color(token_type: TokenType, theme: Theme) -> Color {
     match token_type {
-        TokenType::Keyword => Color::Magenta,
-        TokenType::String => Color::Yellow,
-        TokenType::Comment => Color::DarkGray,
-        TokenType::Function => Color::Blue,
-        TokenType::Type => Color::Cyan,
-        TokenType::Number => Color::LightRed,
-        TokenType::Operator => Color::White,
-        TokenType::Variable => Color::LightCyan,
-        TokenType::Atom => Color::Cyan,
-        TokenType::Module => Color::LightYellow,
-        TokenType::Default => Color::White,
+        TokenType::Keyword => theme.token_keyword,
+        TokenType::String => theme.token_string,
+        TokenType::Comment => theme.token_comment,
+        TokenType::Function => theme.token_function,
+        TokenType::Type => theme.token_type,
+        TokenType::Number => theme.token_number,
+        TokenType::Operator => theme.token_operator,
+        TokenType::Variable => theme.token_variable,
+        TokenType::Atom => theme.token_atom,
+        TokenType::Module => theme.token_module,
+        TokenType::Default => theme.token_default,
     }
 }
 
@@ -1854,9 +1974,12 @@ fn build_highlighted_spans<'a>(
     highlights: &[HighlightRange],
     base_style: Style,
     is_current: bool,
+    theme: Theme,
 ) -> Vec<Span<'a>> {
     let base_style = if is_current {
-        base_style.add_modifier(Modifier::REVERSED)
+        base_style
+            .bg(theme.current_line_bg)
+            .add_modifier(Modifier::BOLD)
     } else {
         base_style
     };
@@ -1886,9 +2009,10 @@ fn build_highlighted_spans<'a>(
         if end > start {
             // Add highlighted segment
             if let Ok(segment) = std::str::from_utf8(&content_bytes[start..end]) {
-                let color = token_color(highlight.token_type);
+                let color = token_color(highlight.token_type, theme);
                 let style = if is_current {
-                    Style::default().fg(color).add_modifier(Modifier::REVERSED)
+                    // Keep diff background, just increase emphasis
+                    base_style.fg(color).add_modifier(Modifier::BOLD)
                 } else {
                     // Preserve background from base_style
                     base_style.fg(color)
