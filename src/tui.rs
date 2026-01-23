@@ -3,8 +3,9 @@
 //! Provides interactive diff viewing with annotation support.
 
 use crate::config::Config;
-use crate::diff::{DiffEngine, DiffFile, DiffLine, LineKind};
+use crate::diff::{DiffEngine, DiffFile, DiffLine, HighlightRange, LineKind};
 use crate::storage::{Annotation, AnnotationType, Side, Storage};
+use crate::syntax::{SyntaxHighlighter, TokenType};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -74,6 +75,9 @@ pub struct App {
     // All annotations keyed by (file_path, side, line_no)
     all_annotations: Vec<Annotation>,
 
+    // Syntax highlighting
+    syntax_highlighter: SyntaxHighlighter,
+
     // UI state
     mode: Mode,
     annotation_input: String,
@@ -137,6 +141,7 @@ impl App {
             current_line_idx: 0,
             scroll_offset: 0,
             all_annotations: Vec::new(),
+            syntax_highlighter: SyntaxHighlighter::new(),
             mode: Mode::Normal,
             annotation_input: String::new(),
             annotation_type: AnnotationType::Comment,
@@ -234,13 +239,16 @@ impl App {
             });
 
             for line in &hunk.lines {
+                let mut highlighted_line = line.clone();
+                self.highlight_line(&mut highlighted_line, file_path);
+
                 self.display_lines.push(DisplayLine::Diff {
-                    line: line.clone(),
+                    line: highlighted_line.clone(),
                     file_idx,
                     file_path: file_path.to_string(),
                 });
 
-                self.add_annotations_for_line(file_idx, file_path, line);
+                self.add_annotations_for_line(file_idx, file_path, &highlighted_line);
             }
 
             // Add hunk end marker
@@ -291,13 +299,14 @@ impl App {
             // First, show any deletions that come before this line
             for (insert_after, del_content) in &deletions {
                 if *insert_after == line_no.saturating_sub(1) {
-                    let del_line = DiffLine {
+                    let mut del_line = DiffLine {
                         kind: LineKind::Deletion,
                         old_line_no: None,
                         new_line_no: None,
                         content: del_content.clone(),
                         highlights: Vec::new(),
                     };
+                    self.highlight_line(&mut del_line, file_path);
                     self.display_lines.push(DisplayLine::Diff {
                         line: del_line,
                         file_idx,
@@ -313,13 +322,14 @@ impl App {
                 LineKind::Context
             };
 
-            let diff_line = DiffLine {
+            let mut diff_line = DiffLine {
                 kind,
                 old_line_no: Some(line_no),
                 new_line_no: Some(line_no),
                 content: content.to_string(),
                 highlights: Vec::new(),
             };
+            self.highlight_line(&mut diff_line, file_path);
 
             self.display_lines.push(DisplayLine::Diff {
                 line: diff_line.clone(),
@@ -334,13 +344,14 @@ impl App {
         let last_line = file_lines.len() as u32;
         for (insert_after, del_content) in &deletions {
             if *insert_after >= last_line {
-                let del_line = DiffLine {
+                let mut del_line = DiffLine {
                     kind: LineKind::Deletion,
                     old_line_no: None,
                     new_line_no: None,
                     content: del_content.clone(),
                     highlights: Vec::new(),
                 };
+                self.highlight_line(&mut del_line, file_path);
                 self.display_lines.push(DisplayLine::Diff {
                     line: del_line,
                     file_idx,
@@ -377,6 +388,23 @@ impl App {
         }
     }
 
+    /// Add syntax highlighting to a diff line
+    fn highlight_line(&mut self, line: &mut DiffLine, file_path: &str) {
+        if !self.config.syntax_highlighting {
+            return;
+        }
+
+        let syntax_highlights = self.syntax_highlighter.highlight_for_file(&line.content, file_path);
+
+        line.highlights = syntax_highlights
+            .into_iter()
+            .map(|h| HighlightRange {
+                start: h.start,
+                end: h.end,
+                token_type: h.token_type,
+            })
+            .collect();
+    }
 
     /// Get the current display line
     fn current_display_line(&self) -> Option<&DisplayLine> {
@@ -1398,18 +1426,23 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect) {
                         ),
                     };
 
-                    let content_style = if is_current {
-                        content_style.add_modifier(Modifier::REVERSED)
-                    } else {
-                        content_style
-                    };
-
-                    ListItem::new(Line::from(vec![
+                    // Build spans with syntax highlighting
+                    let mut spans = vec![
                         Span::styled(annotation_marker, Style::default().fg(Color::Yellow)),
                         Span::styled(line_num, line_num_style),
                         Span::raw(" "),
-                        Span::styled(format!("{} {}", prefix, line.content), content_style),
-                    ]))
+                    ];
+
+                    let content_spans = build_highlighted_spans(
+                        prefix,
+                        &line.content,
+                        &line.highlights,
+                        content_style,
+                        is_current,
+                    );
+                    spans.extend(content_spans);
+
+                    ListItem::new(Line::from(spans))
                 }
                 DisplayLine::Annotation { annotation, .. } => {
                     // Annotation in a prominent box - handle multiple lines
@@ -1567,40 +1600,42 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect) {
                     LineKind::Deletion => {
                         let old_no = line.old_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(Color::Red).bg(Color::Rgb(40, 0, 0));
-                        let content_style = if is_current { content_style.add_modifier(Modifier::REVERSED) } else { content_style };
-                        left_items.push(ListItem::new(Line::from(vec![
+                        let mut left_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(old_no, line_num_style),
-                            Span::styled(format!(" - {}", line.content), content_style),
-                        ])));
+                        ];
+                        left_spans.extend(build_highlighted_spans("-", &line.content, &line.highlights, content_style, is_current));
+                        left_items.push(ListItem::new(Line::from(left_spans)));
                         right_items.push(ListItem::new(Line::from("")));
                     }
                     LineKind::Addition => {
                         let new_no = line.new_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(Color::Green).bg(Color::Rgb(0, 40, 0));
-                        let content_style = if is_current { content_style.add_modifier(Modifier::REVERSED) } else { content_style };
                         left_items.push(ListItem::new(Line::from("")));
-                        right_items.push(ListItem::new(Line::from(vec![
+                        let mut right_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(new_no, line_num_style),
-                            Span::styled(format!(" + {}", line.content), content_style),
-                        ])));
+                        ];
+                        right_spans.extend(build_highlighted_spans("+", &line.content, &line.highlights, content_style, is_current));
+                        right_items.push(ListItem::new(Line::from(right_spans)));
                     }
                     LineKind::Context => {
                         let old_no = line.old_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let new_no = line.new_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(Color::White);
-                        let content_style = if is_current { content_style.add_modifier(Modifier::REVERSED) } else { content_style };
-                        left_items.push(ListItem::new(Line::from(vec![
+                        let mut left_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(old_no, line_num_style),
-                            Span::styled(format!("   {}", line.content), content_style),
-                        ])));
-                        right_items.push(ListItem::new(Line::from(vec![
+                        ];
+                        left_spans.extend(build_highlighted_spans(" ", &line.content, &line.highlights, content_style, is_current));
+                        left_items.push(ListItem::new(Line::from(left_spans)));
+
+                        let mut right_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(new_no, line_num_style),
-                            Span::styled(format!("   {}", line.content), content_style),
-                        ])));
+                        ];
+                        right_spans.extend(build_highlighted_spans(" ", &line.content, &line.highlights, content_style, is_current));
+                        right_items.push(ListItem::new(Line::from(right_spans)));
                     }
                 }
             }
@@ -1793,4 +1828,84 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+/// Get the color for a syntax token type
+fn token_color(token_type: TokenType) -> Color {
+    match token_type {
+        TokenType::Keyword => Color::Magenta,
+        TokenType::String => Color::Yellow,
+        TokenType::Comment => Color::DarkGray,
+        TokenType::Function => Color::Blue,
+        TokenType::Type => Color::Cyan,
+        TokenType::Number => Color::LightRed,
+        TokenType::Operator => Color::White,
+        TokenType::Variable => Color::LightCyan,
+        TokenType::Atom => Color::Cyan,
+        TokenType::Module => Color::LightYellow,
+        TokenType::Default => Color::White,
+    }
+}
+
+/// Build spans with syntax highlighting for a diff line
+fn build_highlighted_spans<'a>(
+    prefix: &'a str,
+    content: &'a str,
+    highlights: &[HighlightRange],
+    base_style: Style,
+    is_current: bool,
+) -> Vec<Span<'a>> {
+    let base_style = if is_current {
+        base_style.add_modifier(Modifier::REVERSED)
+    } else {
+        base_style
+    };
+
+    let mut spans = vec![Span::styled(format!("{} ", prefix), base_style)];
+
+    if highlights.is_empty() {
+        spans.push(Span::styled(content.to_string(), base_style));
+        return spans;
+    }
+
+    let content_bytes = content.as_bytes();
+    let mut pos = 0;
+
+    for highlight in highlights {
+        // Ensure we don't go out of bounds
+        let start = highlight.start.min(content_bytes.len());
+        let end = highlight.end.min(content_bytes.len());
+
+        if start > pos {
+            // Add unhighlighted segment
+            if let Ok(segment) = std::str::from_utf8(&content_bytes[pos..start]) {
+                spans.push(Span::styled(segment.to_string(), base_style));
+            }
+        }
+
+        if end > start {
+            // Add highlighted segment
+            if let Ok(segment) = std::str::from_utf8(&content_bytes[start..end]) {
+                let color = token_color(highlight.token_type);
+                let style = if is_current {
+                    Style::default().fg(color).add_modifier(Modifier::REVERSED)
+                } else {
+                    // Preserve background from base_style
+                    base_style.fg(color)
+                };
+                spans.push(Span::styled(segment.to_string(), style));
+            }
+        }
+
+        pos = end;
+    }
+
+    // Add remaining unhighlighted content
+    if pos < content_bytes.len() {
+        if let Ok(segment) = std::str::from_utf8(&content_bytes[pos..]) {
+            spans.push(Span::styled(segment.to_string(), base_style));
+        }
+    }
+
+    spans
 }

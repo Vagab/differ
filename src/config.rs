@@ -16,6 +16,8 @@ pub struct Config {
     pub context_lines: u32,
     /// Show annotation content inline (default true)
     pub show_annotations: bool,
+    /// Enable syntax highlighting for code in diffs (default true)
+    pub syntax_highlighting: bool,
 }
 
 impl Default for Config {
@@ -24,6 +26,7 @@ impl Default for Config {
             side_by_side: false,
             context_lines: 3,
             show_annotations: true,
+            syntax_highlighting: true,
         }
     }
 }

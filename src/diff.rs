@@ -72,11 +72,14 @@ pub enum LineKind {
     Deletion,
 }
 
+use crate::syntax::TokenType;
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct HighlightRange {
     pub start: usize,
     pub end: usize,
+    pub token_type: TokenType,
 }
 
 /// Diff engine using git diff command

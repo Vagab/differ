@@ -8,6 +8,7 @@ mod config;
 mod diff;
 mod export;
 mod storage;
+mod syntax;
 mod tui;
 
 use anyhow::{Context, Result};

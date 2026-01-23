@@ -20,6 +20,10 @@ clap = { version = "4.0", features = ["derive"] }
 dirs = "5.0"
 git2 = "0.19"
 anyhow = "1.0"
+
+# Syntax highlighting
+tree-sitter = "0.24"
+tree-sitter-elixir = "0.3"
 sha2 = "0.10"
 toml = "0.8"
 regex = "1.10"
