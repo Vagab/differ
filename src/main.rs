@@ -4,6 +4,7 @@
 //! stored in SQLite. Primary use case: annotating code changes for future AI
 //! coding sessions.
 
+mod config;
 mod diff;
 mod export;
 mod storage;
@@ -13,13 +14,95 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use crate::diff::{find_repo_root, DiffEngine};
+use crate::config::Config;
+use crate::diff::{find_repo_root, DiffEngine, DiffMode};
 use crate::export::{export, ExportFormat};
 use crate::storage::{AnnotationType, Side, Storage};
 
+/// Parsed git diff arguments
+#[derive(Debug)]
+struct DiffArgs {
+    mode: DiffMode,
+    paths: Vec<String>,
+}
+
+/// Check if args look like git external diff format:
+/// path old-file old-hex old-mode new-file new-hex new-mode
+fn is_git_external_diff_args(args: &[String]) -> bool {
+    // Git external diff passes 7 arguments
+    args.len() == 7 && args[2].len() == 40 && args[5].len() == 40
+}
+
+/// Parse git diff-style arguments
+fn parse_diff_args(args: &[String], staged: bool) -> DiffArgs {
+    // Check if this is git external diff format
+    if is_git_external_diff_args(args) {
+        return DiffArgs {
+            mode: DiffMode::ExternalDiff {
+                path: args[0].clone(),
+                old_file: args[1].clone(),
+                new_file: args[4].clone(),
+            },
+            paths: Vec::new(),
+        };
+    }
+
+    // Find -- separator for path filtering
+    let (rev_args, paths): (Vec<_>, Vec<_>) = if let Some(pos) = args.iter().position(|a| a == "--") {
+        (args[..pos].to_vec(), args[pos + 1..].to_vec())
+    } else {
+        (args.to_vec(), Vec::new())
+    };
+
+    let mode = if staged {
+        // --staged: index vs HEAD
+        DiffMode::Staged
+    } else if rev_args.is_empty() {
+        // No args: working tree vs index (unstaged changes)
+        DiffMode::Unstaged
+    } else if rev_args.len() == 1 {
+        let arg = &rev_args[0];
+        // Check for .. or ... syntax
+        if let Some(pos) = arg.find("...") {
+            let (from, to) = arg.split_at(pos);
+            let to = &to[3..]; // skip "..."
+            DiffMode::MergeBase {
+                from: from.to_string(),
+                to: to.to_string(),
+            }
+        } else if let Some(pos) = arg.find("..") {
+            let (from, to) = arg.split_at(pos);
+            let to = &to[2..]; // skip ".."
+            DiffMode::Commits {
+                from: from.to_string(),
+                to: to.to_string(),
+            }
+        } else {
+            // Single revision: working tree vs that revision
+            DiffMode::WorkingTree { base: arg.clone() }
+        }
+    } else {
+        // Two revisions
+        DiffMode::Commits {
+            from: rev_args[0].clone(),
+            to: rev_args[1].clone(),
+        }
+    };
+
+    DiffArgs {
+        mode,
+        paths: paths.into_iter().map(String::from).collect(),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "differ")]
-#[command(about = "Syntactic diff viewer with persistent annotations")]
+#[command(about = "TUI diff viewer with persistent annotations")]
+#[command(long_about = "A drop-in replacement for git diff with an interactive TUI and \
+    the ability to add persistent annotations to code changes.\n\n\
+    Use 'git d' as an alias by adding to ~/.gitconfig:\n\
+    [alias]\n    \
+    d = ! /path/to/differ diff")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -28,29 +111,41 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// View diff interactively with TUI
+    /// View diff interactively with TUI (accepts git diff arguments)
+    ///
+    /// Examples:
+    ///   differ diff                    # working tree vs index (unstaged changes)
+    ///   differ diff --staged           # index vs HEAD (staged changes)
+    ///   differ diff HEAD               # working tree vs HEAD
+    ///   differ diff main..feature      # between two branches
+    ///   differ diff abc123 def456      # between two commits
+    ///   differ diff HEAD -- src/       # only files in src/
     Diff {
-        /// Base revision (default: HEAD)
-        #[arg(default_value = "HEAD~1")]
-        from: String,
+        /// Show staged changes (index vs HEAD)
+        #[arg(long, visible_alias = "cached")]
+        staged: bool,
 
-        /// Target revision (default: HEAD)
-        #[arg(default_value = "HEAD")]
-        to: String,
+        /// Enable side-by-side view
+        #[arg(short = 's', long)]
+        side_by_side: bool,
+
+        /// Number of context lines around changes
+        #[arg(short = 'c', long)]
+        context_lines: Option<u32>,
+
+        /// Git diff arguments: [<commit>] [<commit>] [-- <path>...]
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
 
-    /// List annotations for the repository
+    /// List all annotations for the current repository
     List {
         /// Filter by file path
         #[arg(short, long)]
         file: Option<String>,
-
-        /// Include resolved annotations
-        #[arg(long)]
-        resolved: bool,
     },
 
-    /// Add an annotation (non-interactive)
+    /// Add an annotation from the command line
     Add {
         /// File path (relative to repo root)
         #[arg(short, long)]
@@ -64,7 +159,7 @@ enum Commands {
         #[arg(long)]
         end_line: Option<u32>,
 
-        /// Annotation type: comment, todo, ai_prompt
+        /// Annotation type: comment or todo
         #[arg(short = 't', long, default_value = "comment")]
         annotation_type: String,
 
@@ -72,27 +167,19 @@ enum Commands {
         content: String,
     },
 
-    /// Export annotations for AI context
+    /// Export annotations to markdown or JSON (useful for AI context)
     Export {
         /// Export format: markdown (md) or json
         #[arg(short, long, default_value = "markdown")]
         format: String,
-
-        /// Include resolved annotations
-        #[arg(long)]
-        resolved: bool,
 
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
 
-    /// Clear resolved annotations
-    Clear {
-        /// Clear all annotations (not just resolved)
-        #[arg(long)]
-        all: bool,
-    },
+    /// Clear all annotations for the current repository
+    Clear,
 }
 
 fn main() -> Result<()> {
@@ -110,12 +197,27 @@ fn main() -> Result<()> {
 
     let repo_id = storage.get_or_create_repo(&repo_path, display_name.as_deref())?;
 
+    // Load config and apply CLI overrides
+    let config = Config::load().unwrap_or_default();
+
     match cli.command {
-        Commands::Diff { from, to } => {
-            cmd_diff(&storage, &repo_path, repo_id, &from, &to)?;
+        Commands::Diff {
+            staged,
+            side_by_side,
+            context_lines,
+            args,
+        } => {
+            let config = config.with_overrides(
+                if side_by_side { Some(true) } else { None },
+                context_lines,
+            );
+
+            // Parse git diff-style arguments
+            let diff_args = parse_diff_args(&args, staged);
+            cmd_diff(&storage, &repo_path, repo_id, diff_args, config)?;
         }
-        Commands::List { file, resolved } => {
-            cmd_list(&storage, repo_id, file.as_deref(), resolved)?;
+        Commands::List { file } => {
+            cmd_list(&storage, repo_id, file.as_deref())?;
         }
         Commands::Add {
             file,
@@ -134,15 +236,11 @@ fn main() -> Result<()> {
                 &content,
             )?;
         }
-        Commands::Export {
-            format,
-            resolved,
-            output,
-        } => {
-            cmd_export(&storage, repo_id, &format, resolved, output)?;
+        Commands::Export { format, output } => {
+            cmd_export(&storage, repo_id, &format, output)?;
         }
-        Commands::Clear { all } => {
-            cmd_clear(&storage, repo_id, all)?;
+        Commands::Clear => {
+            cmd_clear(&storage, repo_id)?;
         }
     }
 
@@ -150,33 +248,41 @@ fn main() -> Result<()> {
 }
 
 fn cmd_diff(
-    storage: &Storage,
+    _storage: &Storage,
     repo_path: &PathBuf,
     repo_id: i64,
-    from: &str,
-    to: &str,
+    args: DiffArgs,
+    config: Config,
 ) -> Result<()> {
-    let diff_engine = DiffEngine::new(repo_path.clone());
-    let files = diff_engine.get_changed_files(from, to)?;
+    let diff_engine = DiffEngine::new(repo_path.clone(), config.context_lines);
+
+    let files = diff_engine.diff(&args.mode, &args.paths)?;
 
     if files.is_empty() {
-        println!("No changes between {} and {}", from, to);
+        let msg = match &args.mode {
+            DiffMode::Unstaged => "No unstaged changes",
+            DiffMode::Staged => "No staged changes",
+            DiffMode::WorkingTree { base } => &format!("No changes against {}", base),
+            DiffMode::Commits { from, to } => &format!("No changes between {} and {}", from, to),
+            DiffMode::MergeBase { from, to } => &format!("No changes between {} and {} (merge-base)", from, to),
+            DiffMode::ExternalDiff { path, .. } => &format!("No changes in {}", path),
+        };
+        println!("{}", msg);
         return Ok(());
     }
 
     // Clone storage for TUI (it needs ownership)
     let tui_storage = Storage::open_default()?;
 
-    tui::run(tui_storage, diff_engine, repo_path.clone(), repo_id, files)
+    tui::run(tui_storage, diff_engine, repo_path.clone(), repo_id, files, config)
 }
 
 fn cmd_list(
     storage: &Storage,
     repo_id: i64,
     file: Option<&str>,
-    include_resolved: bool,
 ) -> Result<()> {
-    let annotations = storage.list_annotations(repo_id, file, include_resolved)?;
+    let annotations = storage.list_annotations(repo_id, file)?;
 
     if annotations.is_empty() {
         println!("No annotations found");
@@ -197,7 +303,6 @@ fn cmd_list(
         let type_marker = match annotation.annotation_type {
             AnnotationType::Comment => "[C]",
             AnnotationType::Todo => "[T]",
-            AnnotationType::AiPrompt => "[A]",
         };
 
         let line_info = if let Some(end) = annotation.end_line {
@@ -211,19 +316,12 @@ fn cmd_list(
             Side::New => "",
         };
 
-        let resolved = if annotation.resolved_at.is_some() {
-            " [resolved]"
-        } else {
-            ""
-        };
-
         println!(
-            "  #{} {} {}{}{}: {}",
+            "  #{} {} {}{}: {}",
             annotation.id,
             type_marker,
             line_info,
             side,
-            resolved,
             annotation.content
         );
     }
@@ -241,7 +339,7 @@ fn cmd_add(
     content: &str,
 ) -> Result<()> {
     let atype = AnnotationType::from_str(annotation_type)
-        .context("Invalid annotation type. Use: comment, todo, or ai_prompt")?;
+        .context("Invalid annotation type. Use: comment or todo")?;
 
     let id = storage.add_annotation(
         repo_id,
@@ -262,13 +360,12 @@ fn cmd_export(
     storage: &Storage,
     repo_id: i64,
     format: &str,
-    include_resolved: bool,
     output: Option<PathBuf>,
 ) -> Result<()> {
     let export_format = ExportFormat::from_str(format)
         .context("Invalid format. Use: markdown (md) or json")?;
 
-    let content = export(storage, repo_id, export_format, include_resolved)?;
+    let content = export(storage, repo_id, export_format)?;
 
     if let Some(path) = output {
         std::fs::write(&path, &content)
@@ -281,19 +378,8 @@ fn cmd_export(
     Ok(())
 }
 
-fn cmd_clear(storage: &Storage, repo_id: i64, all: bool) -> Result<()> {
-    if all {
-        // Clear all annotations - need to implement this
-        let annotations = storage.list_annotations(repo_id, None, true)?;
-        for annotation in annotations {
-            storage.delete_annotation(annotation.id)?;
-        }
-        println!("Cleared all annotations");
-    } else {
-        let count = storage.clear_resolved(repo_id)?;
-        println!("Cleared {} resolved annotations", count);
-    }
-
+fn cmd_clear(storage: &Storage, repo_id: i64) -> Result<()> {
+    let count = storage.clear_all(repo_id)?;
+    println!("Cleared {} annotations", count);
     Ok(())
 }
-// Testing diff

@@ -7,8 +7,8 @@ use anyhow::Result;
 use std::collections::BTreeMap;
 
 /// Exports annotations for a repository in markdown format
-pub fn export_markdown(storage: &Storage, repo_id: i64, include_resolved: bool) -> Result<String> {
-    let annotations = storage.list_annotations(repo_id, None, include_resolved)?;
+pub fn export_markdown(storage: &Storage, repo_id: i64) -> Result<String> {
+    let annotations = storage.list_annotations(repo_id, None)?;
 
     if annotations.is_empty() {
         return Ok("# No annotations found\n".to_string());
@@ -33,7 +33,6 @@ pub fn export_markdown(storage: &Storage, repo_id: i64, include_resolved: bool) 
             let type_badge = match annotation.annotation_type {
                 AnnotationType::Comment => "💬",
                 AnnotationType::Todo => "📋",
-                AnnotationType::AiPrompt => "🤖",
             };
 
             let side_indicator = match annotation.side {
@@ -47,15 +46,9 @@ pub fn export_markdown(storage: &Storage, repo_id: i64, include_resolved: bool) 
                 format!("L{}", annotation.start_line)
             };
 
-            let resolved = if annotation.resolved_at.is_some() {
-                " ✅"
-            } else {
-                ""
-            };
-
             output.push_str(&format!(
-                "### {} {}{}{}\n\n",
-                type_badge, line_range, side_indicator, resolved
+                "### {} {}{}\n\n",
+                type_badge, line_range, side_indicator
             ));
 
             output.push_str(&annotation.content);
@@ -71,8 +64,8 @@ pub fn export_markdown(storage: &Storage, repo_id: i64, include_resolved: bool) 
 }
 
 /// Exports annotations as JSON for programmatic consumption
-pub fn export_json(storage: &Storage, repo_id: i64, include_resolved: bool) -> Result<String> {
-    let annotations = storage.list_annotations(repo_id, None, include_resolved)?;
+pub fn export_json(storage: &Storage, repo_id: i64) -> Result<String> {
+    let annotations = storage.list_annotations(repo_id, None)?;
 
     #[derive(serde::Serialize)]
     struct ExportAnnotation {
@@ -83,7 +76,6 @@ pub fn export_json(storage: &Storage, repo_id: i64, include_resolved: bool) -> R
         annotation_type: String,
         content: String,
         commit_sha: Option<String>,
-        resolved: bool,
     }
 
     let export: Vec<ExportAnnotation> = annotations
@@ -96,7 +88,6 @@ pub fn export_json(storage: &Storage, repo_id: i64, include_resolved: bool) -> R
             annotation_type: a.annotation_type.as_str().to_string(),
             content: a.content,
             commit_sha: a.commit_sha,
-            resolved: a.resolved_at.is_some(),
         })
         .collect();
 
@@ -125,11 +116,10 @@ pub fn export(
     storage: &Storage,
     repo_id: i64,
     format: ExportFormat,
-    include_resolved: bool,
 ) -> Result<String> {
     match format {
-        ExportFormat::Markdown => export_markdown(storage, repo_id, include_resolved),
-        ExportFormat::Json => export_json(storage, repo_id, include_resolved),
+        ExportFormat::Markdown => export_markdown(storage, repo_id),
+        ExportFormat::Json => export_json(storage, repo_id),
     }
 }
 
@@ -171,12 +161,12 @@ mod tests {
                 Side::New,
                 5,
                 Some(10),
-                AnnotationType::AiPrompt,
+                AnnotationType::Comment,
                 "Add error handling here",
             )
             .unwrap();
 
-        let md = export_markdown(&storage, repo_id, false).unwrap();
+        let md = export_markdown(&storage, repo_id).unwrap();
 
         assert!(md.contains("# Code Annotations"));
         assert!(md.contains("## src/lib.rs"));
@@ -209,7 +199,7 @@ mod tests {
             )
             .unwrap();
 
-        let json = export_json(&storage, repo_id, false).unwrap();
+        let json = export_json(&storage, repo_id).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert!(parsed.is_array());

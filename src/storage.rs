@@ -41,7 +41,6 @@ CREATE INDEX IF NOT EXISTS idx_unresolved ON annotations(resolved_at) WHERE reso
 pub enum AnnotationType {
     Comment,
     Todo,
-    AiPrompt,
 }
 
 impl AnnotationType {
@@ -49,7 +48,6 @@ impl AnnotationType {
         match self {
             Self::Comment => "comment",
             Self::Todo => "todo",
-            Self::AiPrompt => "ai_prompt",
         }
     }
 
@@ -57,7 +55,6 @@ impl AnnotationType {
         match s {
             "comment" => Some(Self::Comment),
             "todo" => Some(Self::Todo),
-            "ai_prompt" => Some(Self::AiPrompt),
             _ => None,
         }
     }
@@ -87,6 +84,7 @@ impl Side {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Annotation {
     pub id: i64,
     pub repo_id: i64,
@@ -98,7 +96,6 @@ pub struct Annotation {
     pub annotation_type: AnnotationType,
     pub content: String,
     pub created_at: String,
-    pub resolved_at: Option<String>,
 }
 
 pub struct Storage {
@@ -221,15 +218,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Marks an annotation as resolved
-    pub fn resolve_annotation(&self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE annotations SET resolved_at = CURRENT_TIMESTAMP WHERE id = ?1",
-            params![id],
-        )?;
-        Ok(())
-    }
-
     /// Deletes an annotation
     pub fn delete_annotation(&self, id: i64) -> Result<()> {
         self.conn.execute(
@@ -244,23 +232,18 @@ impl Storage {
         &self,
         repo_id: i64,
         file_path: Option<&str>,
-        include_resolved: bool,
     ) -> Result<Vec<Annotation>> {
         let mut sql = String::from(
             r#"
             SELECT id, repo_id, file_path, commit_sha, side, start_line, end_line,
-                   annotation_type, content, created_at, resolved_at
+                   annotation_type, content, created_at
             FROM annotations
             WHERE repo_id = ?1
             "#,
         );
 
-        if let Some(_) = file_path {
+        if file_path.is_some() {
             sql.push_str(" AND file_path = ?2");
-        }
-
-        if !include_resolved {
-            sql.push_str(" AND resolved_at IS NULL");
         }
 
         sql.push_str(" ORDER BY file_path, start_line");
@@ -278,6 +261,7 @@ impl Storage {
     }
 
     /// Gets annotations for a specific line range in a file
+    #[allow(dead_code)]
     pub fn get_annotations_for_line(
         &self,
         repo_id: i64,
@@ -288,14 +272,13 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, repo_id, file_path, commit_sha, side, start_line, end_line,
-                   annotation_type, content, created_at, resolved_at
+                   annotation_type, content, created_at
             FROM annotations
             WHERE repo_id = ?1
               AND file_path = ?2
               AND side = ?3
               AND start_line <= ?4
               AND (end_line IS NULL AND start_line = ?4 OR end_line >= ?4)
-              AND resolved_at IS NULL
             ORDER BY start_line
             "#,
         )?;
@@ -309,10 +292,10 @@ impl Storage {
             .context("Failed to fetch annotations for line")
     }
 
-    /// Clears all resolved annotations for a repo
-    pub fn clear_resolved(&self, repo_id: i64) -> Result<usize> {
+    /// Clears all annotations for a repo
+    pub fn clear_all(&self, repo_id: i64) -> Result<usize> {
         let count = self.conn.execute(
-            "DELETE FROM annotations WHERE repo_id = ?1 AND resolved_at IS NOT NULL",
+            "DELETE FROM annotations WHERE repo_id = ?1",
             params![repo_id],
         )?;
         Ok(count)
@@ -331,7 +314,6 @@ impl Storage {
                 .unwrap_or(AnnotationType::Comment),
             content: row.get(8)?,
             created_at: row.get(9)?,
-            resolved_at: row.get(10)?,
         })
     }
 }
@@ -371,14 +353,14 @@ mod tests {
             )
             .unwrap();
 
-        let annotations = storage.list_annotations(repo_id, None, false).unwrap();
+        let annotations = storage.list_annotations(repo_id, None).unwrap();
         assert_eq!(annotations.len(), 1);
         assert_eq!(annotations[0].id, id);
         assert_eq!(annotations[0].content, "This needs refactoring");
     }
 
     #[test]
-    fn test_resolve_and_clear() {
+    fn test_delete_and_clear() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let storage = Storage::open(&db_path).unwrap();
@@ -400,27 +382,15 @@ mod tests {
             )
             .unwrap();
 
-        // Should be visible before resolving
-        let annotations = storage.list_annotations(repo_id, None, false).unwrap();
+        // Should be visible
+        let annotations = storage.list_annotations(repo_id, None).unwrap();
         assert_eq!(annotations.len(), 1);
 
-        // Resolve it
-        storage.resolve_annotation(id).unwrap();
+        // Delete it
+        storage.delete_annotation(id).unwrap();
 
-        // Should be hidden by default
-        let annotations = storage.list_annotations(repo_id, None, false).unwrap();
-        assert_eq!(annotations.len(), 0);
-
-        // Should be visible with include_resolved
-        let annotations = storage.list_annotations(repo_id, None, true).unwrap();
-        assert_eq!(annotations.len(), 1);
-
-        // Clear resolved
-        let cleared = storage.clear_resolved(repo_id).unwrap();
-        assert_eq!(cleared, 1);
-
-        // Should be gone completely
-        let annotations = storage.list_annotations(repo_id, None, true).unwrap();
+        // Should be gone
+        let annotations = storage.list_annotations(repo_id, None).unwrap();
         assert_eq!(annotations.len(), 0);
     }
 }
