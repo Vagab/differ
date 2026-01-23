@@ -14,8 +14,10 @@ A TUI diff viewer with persistent annotations. Drop-in replacement for `git diff
 ## Installation
 
 ```bash
-cargo install --path .
+./install.sh
 ```
+
+This builds the binary, installs it to `~/.local/bin`, and adds it to your PATH.
 
 ## Git Setup
 
