@@ -3,7 +3,9 @@
 //! Provides interactive diff viewing with annotation support.
 
 use crate::config::Config;
-use crate::diff::{DiffEngine, DiffFile, DiffLine, HighlightRange, LineKind};
+use crate::diff::{
+    DiffEngine, DiffFile, DiffHunk, DiffLine, DiffMode, FileStatus, HighlightRange, LineKind,
+};
 use crate::storage::{Annotation, AnnotationType, Side, Storage};
 use crate::syntax::{SyntaxHighlighter, TokenType};
 use anyhow::Result;
@@ -21,8 +23,9 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
 const REATTACH_WINDOW: i32 = 5;
@@ -44,15 +47,21 @@ pub enum DisplayLine {
         line_no: u32,
         additions: usize,
         deletions: usize,
+        file_idx: usize,
+        hunk_idx: usize,
     },
     /// End of hunk marker for spacing
-    HunkEnd,
+    HunkEnd {
+        file_idx: usize,
+        hunk_idx: usize,
+    },
     /// A diff line (addition, deletion, or context)
     Diff {
         line: DiffLine,
         #[allow(dead_code)]
         file_idx: usize,
         file_path: String,
+        hunk_idx: Option<usize>,
     },
     /// An annotation shown inline below its line
     Annotation {
@@ -70,6 +79,8 @@ pub struct App {
     repo_path: PathBuf,
     repo_id: i64,
     config: Config,
+    diff_mode: DiffMode,
+    diff_paths: Vec<String>,
 
     // Diff state
     files: Vec<DiffFile>,
@@ -128,8 +139,6 @@ enum SearchType {
 
 #[derive(Clone, Copy)]
 struct Theme {
-    bg: Color,
-    surface: Color,
     surface_alt: Color,
     current_line_bg: Color,
     header_bg: Color,
@@ -178,8 +187,6 @@ struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            bg: Color::Rgb(18, 20, 24),
-            surface: Color::Rgb(26, 30, 36),
             surface_alt: Color::Rgb(34, 38, 46),
             current_line_bg: Color::Rgb(64, 72, 86),
             header_bg: Color::Rgb(38, 44, 60),
@@ -235,6 +242,8 @@ impl App {
         repo_id: i64,
         files: Vec<DiffFile>,
         config: Config,
+        diff_mode: DiffMode,
+        diff_paths: Vec<String>,
     ) -> Self {
         let show_annotations = config.show_annotations;
         let side_by_side = config.side_by_side;
@@ -245,6 +254,8 @@ impl App {
             repo_path,
             repo_id,
             config,
+            diff_mode,
+            diff_paths,
             files,
             display_lines: Vec::new(),
             current_line_idx: 0,
@@ -269,7 +280,11 @@ impl App {
 
     /// Load all annotations for all files and build the display lines
     fn load_all_annotations(&mut self) -> Result<()> {
-        self.all_annotations.clear();
+        self.all_annotations = self.storage.list_annotations(self.repo_id, None)?;
+
+        if self.all_annotations.is_empty() {
+            return Ok(());
+        }
 
         let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -285,14 +300,27 @@ impl App {
             .collect();
 
         for path in file_paths {
-            let mut annotations = self.storage.list_annotations(self.repo_id, Some(&path))?;
-            if annotations.is_empty() {
+            if !self.all_annotations.iter().any(|a| a.file_path == path) {
                 continue;
             }
             if let Some(lines) = self.read_file_lines(&path, &mut file_cache) {
-                self.reattach_annotations_for_file(&mut annotations, &lines)?;
+                let indices: Vec<usize> = self
+                    .all_annotations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.file_path == path)
+                    .map(|(idx, _)| idx)
+                    .collect();
+
+                let storage = &self.storage;
+                let message = &mut self.message;
+                let annotations = &mut self.all_annotations;
+
+                for idx in indices {
+                    let annotation = &mut annotations[idx];
+                    Self::reattach_annotation(storage, message, annotation, &lines)?;
+                }
             }
-            self.all_annotations.extend(annotations);
         }
 
         Ok(())
@@ -313,93 +341,97 @@ impl App {
         Some(lines)
     }
 
-    fn reattach_annotations_for_file(
-        &mut self,
-        annotations: &mut [Annotation],
+    fn reattach_annotation(
+        storage: &Storage,
+        message: &mut Option<String>,
+        annotation: &mut Annotation,
         lines: &[String],
     ) -> Result<()> {
-        for annotation in annotations.iter_mut() {
-            if annotation.side != Side::New {
-                continue;
-            }
+        if annotation.side != Side::New {
+            return Ok(());
+        }
 
-            let anchor_line = if annotation.anchor_line > 0 {
-                annotation.anchor_line
-            } else {
-                annotation.start_line
-            };
+        let anchor_line = if annotation.anchor_line > 0 {
+            annotation.anchor_line
+        } else {
+            annotation.start_line
+        };
 
-            if annotation.anchor_text.is_empty() {
-                let (anchor_line, anchor_text, context_before, context_after) =
-                    Self::build_anchor(lines, annotation.start_line);
-                if !anchor_text.is_empty() {
-                    if let Err(err) = self.storage.update_annotation_location(
-                        annotation.id,
-                        annotation.start_line,
-                        annotation.end_line,
-                        anchor_line,
-                        &anchor_text,
-                        &context_before,
-                        &context_after,
-                    ) {
-                        self.message = Some(format!("Anchor update failed: {}", err));
-                    }
-                    annotation.anchor_line = anchor_line;
-                    annotation.anchor_text = anchor_text;
-                    annotation.context_before = context_before;
-                    annotation.context_after = context_after;
-                }
-                continue;
-            }
-
-            if lines.is_empty() {
-                continue;
-            }
-
-            let base = anchor_line as i32;
-            let start = (base - REATTACH_WINDOW).max(1) as usize;
-            let end = (base + REATTACH_WINDOW).min(lines.len() as i32) as usize;
-
-            let mut best_line = anchor_line;
-            let mut best_score = -1.0f32;
-
-            for line_no in start..=end {
-                let candidate = lines.get(line_no - 1).map(String::as_str).unwrap_or("");
-                let line_score = Self::similarity(annotation.anchor_text.as_str(), candidate);
-                let ctx_bonus = Self::context_bonus(lines, line_no, &annotation.context_before, &annotation.context_after);
-                let score = line_score + ctx_bonus;
-                if score > best_score {
-                    best_score = score;
-                    best_line = line_no as u32;
-                }
-            }
-
-            if best_score >= REATTACH_THRESHOLD {
-                let range_len = annotation
-                    .end_line
-                    .map(|end| end.saturating_sub(annotation.start_line));
-                let new_end = range_len.map(|len| best_line.saturating_add(len));
-                let (anchor_line, anchor_text, context_before, context_after) =
-                    Self::build_anchor(lines, best_line);
-
-                if let Err(err) = self.storage.update_annotation_location(
+        if annotation.anchor_text.is_empty() {
+            let (anchor_line, anchor_text, context_before, context_after) =
+                Self::build_anchor(lines, annotation.start_line);
+            if !anchor_text.is_empty() {
+                if let Err(err) = storage.update_annotation_location(
                     annotation.id,
-                    best_line,
-                    new_end,
+                    annotation.start_line,
+                    annotation.end_line,
                     anchor_line,
                     &anchor_text,
                     &context_before,
                     &context_after,
                 ) {
-                    self.message = Some(format!("Reattach update failed: {}", err));
+                    *message = Some(format!("Anchor update failed: {}", err));
                 }
-                annotation.start_line = best_line;
-                annotation.end_line = new_end;
                 annotation.anchor_line = anchor_line;
                 annotation.anchor_text = anchor_text;
                 annotation.context_before = context_before;
                 annotation.context_after = context_after;
             }
+            return Ok(());
+        }
+
+        if lines.is_empty() {
+            return Ok(());
+        }
+
+        let base = anchor_line as i32;
+        let start = (base - REATTACH_WINDOW).max(1) as usize;
+        let end = (base + REATTACH_WINDOW).min(lines.len() as i32) as usize;
+
+        let mut best_line = anchor_line;
+        let mut best_score = -1.0f32;
+
+        for line_no in start..=end {
+            let candidate = lines.get(line_no - 1).map(String::as_str).unwrap_or("");
+            let line_score = Self::similarity(annotation.anchor_text.as_str(), candidate);
+            let ctx_bonus = Self::context_bonus(
+                lines,
+                line_no,
+                &annotation.context_before,
+                &annotation.context_after,
+            );
+            let score = line_score + ctx_bonus;
+            if score > best_score {
+                best_score = score;
+                best_line = line_no as u32;
+            }
+        }
+
+        if best_score >= REATTACH_THRESHOLD {
+            let range_len = annotation
+                .end_line
+                .map(|end| end.saturating_sub(annotation.start_line));
+            let new_end = range_len.map(|len| best_line.saturating_add(len));
+            let (anchor_line, anchor_text, context_before, context_after) =
+                Self::build_anchor(lines, best_line);
+
+            if let Err(err) = storage.update_annotation_location(
+                annotation.id,
+                best_line,
+                new_end,
+                anchor_line,
+                &anchor_text,
+                &context_before,
+                &context_after,
+            ) {
+                *message = Some(format!("Reattach update failed: {}", err));
+            }
+            annotation.start_line = best_line;
+            annotation.end_line = new_end;
+            annotation.anchor_line = anchor_line;
+            annotation.anchor_text = anchor_text;
+            annotation.context_before = context_before;
+            annotation.context_after = context_after;
         }
 
         Ok(())
@@ -535,7 +567,7 @@ impl App {
 
     /// Build display lines for diff hunks (normal mode)
     fn build_diff_hunk_lines(&mut self, file_idx: usize, file: &DiffFile, file_path: &str) {
-        for hunk in file.hunks.iter() {
+        for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             // Count additions and deletions in this hunk
             let additions = hunk.lines.iter().filter(|l| l.kind == LineKind::Addition).count();
             let deletions = hunk.lines.iter().filter(|l| l.kind == LineKind::Deletion).count();
@@ -549,6 +581,8 @@ impl App {
                 line_no,
                 additions,
                 deletions,
+                file_idx,
+                hunk_idx,
             });
 
             for line in &hunk.lines {
@@ -559,13 +593,14 @@ impl App {
                     line: highlighted_line.clone(),
                     file_idx,
                     file_path: file_path.to_string(),
+                    hunk_idx: Some(hunk_idx),
                 });
 
                 self.add_annotations_for_line(file_idx, file_path, &highlighted_line);
             }
 
             // Add hunk end marker
-            self.display_lines.push(DisplayLine::HunkEnd);
+            self.display_lines.push(DisplayLine::HunkEnd { file_idx, hunk_idx });
         }
     }
 
@@ -624,6 +659,7 @@ impl App {
                         line: del_line,
                         file_idx,
                         file_path: file_path.to_string(),
+                        hunk_idx: None,
                     });
                 }
             }
@@ -648,6 +684,7 @@ impl App {
                 line: diff_line.clone(),
                 file_idx,
                 file_path: file_path.to_string(),
+                hunk_idx: None,
             });
 
             self.add_annotations_for_line(file_idx, file_path, &diff_line);
@@ -669,6 +706,7 @@ impl App {
                     line: del_line,
                     file_idx,
                     file_path: file_path.to_string(),
+                    hunk_idx: None,
                 });
             }
         }
@@ -871,9 +909,9 @@ impl App {
         match self.display_lines.get(idx) {
             Some(DisplayLine::FileHeader { file_idx, .. }) => !self.collapsed_files.contains(file_idx),
             Some(DisplayLine::Annotation { .. })
-            | Some(DisplayLine::HunkHeader { .. })
-            | Some(DisplayLine::HunkEnd)
-            | Some(DisplayLine::Spacer) => true,
+                | Some(DisplayLine::HunkHeader { .. })
+                | Some(DisplayLine::HunkEnd { .. })
+                | Some(DisplayLine::Spacer) => true,
             _ => false,
         }
     }
@@ -1091,6 +1129,12 @@ impl App {
                 self.annotation_list_idx = 0;
             }
             KeyCode::Char('s') => {
+                self.toggle_stage_current_hunk()?;
+            }
+            KeyCode::Char('u') => {
+                self.toggle_diff_view()?;
+            }
+            KeyCode::Char('v') => {
                 self.side_by_side = !self.side_by_side;
                 self.message = Some(format!(
                     "View: {}",
@@ -1526,6 +1570,216 @@ impl App {
         }
     }
 
+    fn current_hunk_ref(&self) -> Option<(usize, usize)> {
+        match self.current_display_line() {
+            Some(DisplayLine::Diff { file_idx, hunk_idx: Some(hunk_idx), .. }) => {
+                Some((*file_idx, *hunk_idx))
+            }
+            Some(DisplayLine::HunkHeader { file_idx, hunk_idx, .. }) => {
+                Some((*file_idx, *hunk_idx))
+            }
+            Some(DisplayLine::HunkEnd { file_idx, hunk_idx, .. }) => {
+                Some((*file_idx, *hunk_idx))
+            }
+            _ => None,
+        }
+    }
+
+    fn toggle_stage_current_hunk(&mut self) -> Result<()> {
+        let reverse = match self.diff_mode {
+            DiffMode::Unstaged => false,
+            DiffMode::Staged => true,
+            _ => {
+                self.message = Some("Staging only works for unstaged/staged diffs".to_string());
+                return Ok(());
+            }
+        };
+
+        let Some((file_idx, hunk_idx)) = self.current_hunk_ref() else {
+            self.message = Some("Move to a diff hunk to stage/unstage".to_string());
+            return Ok(());
+        };
+
+        let Some(file) = self.files.get(file_idx) else {
+            self.message = Some("File not found".to_string());
+            return Ok(());
+        };
+
+        let Some(hunk) = file.hunks.get(hunk_idx) else {
+            self.message = Some("Hunk not found".to_string());
+            return Ok(());
+        };
+
+        let patch = Self::build_hunk_patch(file, hunk);
+
+        match self.apply_patch_to_index(&patch, reverse) {
+            Ok(()) => {
+                self.message = Some(if reverse {
+                    "Unstaged hunk".to_string()
+                } else {
+                    "Staged hunk".to_string()
+                });
+                self.reload_diff()?;
+            }
+            Err(err) => {
+                self.message = Some(format!("Stage/unstage failed: {}", err));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn toggle_diff_view(&mut self) -> Result<()> {
+        let target = match self.diff_mode {
+            DiffMode::Unstaged => DiffMode::Staged,
+            DiffMode::Staged => DiffMode::Unstaged,
+            _ => {
+                self.message = Some("Only unstaged/staged views can be toggled".to_string());
+                return Ok(());
+            }
+        };
+
+        self.switch_diff_mode(target)
+    }
+
+    fn switch_diff_mode(&mut self, target: DiffMode) -> Result<()> {
+        let files = self.diff_engine.diff(&target, &self.diff_paths)?;
+
+        self.diff_mode = target;
+        self.files = files;
+        self.display_lines.clear();
+        self.current_line_idx = 0;
+        self.scroll_offset = 0;
+        self.expanded_file = None;
+        self.collapsed_files.clear();
+        self.load_all_annotations()?;
+        self.build_display_lines();
+
+        if self.files.is_empty() {
+            let msg = match self.diff_mode {
+                DiffMode::Unstaged => "No unstaged changes",
+                DiffMode::Staged => "No staged changes",
+                _ => "No changes",
+            };
+            self.message = Some(msg.to_string());
+            return Ok(());
+        }
+
+        while self.current_line_idx < self.display_lines.len().saturating_sub(1)
+            && self.is_skippable_line(self.current_line_idx)
+        {
+            self.current_line_idx += 1;
+        }
+
+        Ok(())
+    }
+
+    fn build_hunk_patch(file: &DiffFile, hunk: &DiffHunk) -> String {
+        let old_path = file
+            .old_path
+            .as_ref()
+            .or(file.new_path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let new_path = file
+            .new_path
+            .as_ref()
+            .or(file.old_path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| old_path.clone());
+
+        let mut patch = String::new();
+        patch.push_str(&format!("diff --git a/{} b/{}\n", old_path, new_path));
+
+        match file.status {
+            FileStatus::Added => {
+                patch.push_str("--- /dev/null\n");
+                patch.push_str(&format!("+++ b/{}\n", new_path));
+            }
+            FileStatus::Deleted => {
+                patch.push_str(&format!("--- a/{}\n", old_path));
+                patch.push_str("+++ /dev/null\n");
+            }
+            FileStatus::Modified | FileStatus::Renamed => {
+                patch.push_str(&format!("--- a/{}\n", old_path));
+                patch.push_str(&format!("+++ b/{}\n", new_path));
+            }
+        }
+
+        patch.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines
+        ));
+
+        for line in &hunk.lines {
+            let prefix = match line.kind {
+                LineKind::Context => ' ',
+                LineKind::Addition => '+',
+                LineKind::Deletion => '-',
+            };
+            patch.push(prefix);
+            patch.push_str(&line.content);
+            patch.push('\n');
+        }
+
+        patch
+    }
+
+    fn apply_patch_to_index(&self, patch: &str, reverse: bool) -> Result<(), String> {
+        let mut cmd = Command::new("git");
+        cmd.arg("apply").arg("--cached");
+        if reverse {
+            cmd.arg("-R");
+        }
+        cmd.current_dir(&self.repo_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(patch.as_bytes()).map_err(|e| e.to_string())?;
+        }
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if stderr.is_empty() { "git apply failed".to_string() } else { stderr })
+        }
+    }
+
+    fn reload_diff(&mut self) -> Result<()> {
+        let files = self.diff_engine.diff(&self.diff_mode, &self.diff_paths)?;
+        self.files = files;
+        self.display_lines.clear();
+        self.current_line_idx = 0;
+        self.scroll_offset = 0;
+        self.expanded_file = None;
+        self.collapsed_files.clear();
+        self.load_all_annotations()?;
+        self.build_display_lines();
+
+        if self.files.is_empty() {
+            let msg = match self.diff_mode {
+                DiffMode::Unstaged => "No unstaged changes",
+                DiffMode::Staged => "No staged changes",
+                _ => "No changes",
+            };
+            self.message = Some(msg.to_string());
+            return Ok(());
+        }
+
+        while self.current_line_idx < self.display_lines.len().saturating_sub(1)
+            && self.is_skippable_line(self.current_line_idx)
+        {
+            self.current_line_idx += 1;
+        }
+
+        Ok(())
+    }
+
     fn toggle_collapse_current_file(&mut self) {
         let current_header_idx = self.find_current_file_header_idx();
         let Some((_, file_idx)) = self.current_file_info() else {
@@ -1653,6 +1907,8 @@ pub fn run(
     repo_id: i64,
     files: Vec<DiffFile>,
     config: Config,
+    diff_mode: DiffMode,
+    diff_paths: Vec<String>,
 ) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
@@ -1661,7 +1917,16 @@ pub fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(storage, diff_engine, repo_path, repo_id, files, config);
+    let mut app = App::new(
+        storage,
+        diff_engine,
+        repo_path,
+        repo_id,
+        files,
+        config,
+        diff_mode,
+        diff_paths,
+    );
     app.load_all_annotations()?;
     app.build_display_lines();
 
@@ -1917,7 +2182,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         Span::styled(format!("starting at line {} ", line_no), style),
                     ]))
                 }
-                DisplayLine::HunkEnd => {
+                DisplayLine::HunkEnd { .. } => {
                     // End of hunk - subtle bottom border
                     let style = Style::default().fg(theme.hunk_border);
                     ListItem::new(Line::from(Span::styled("╰".to_string() + &"─".repeat(30), style)))
@@ -2128,7 +2393,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                 ])));
                 right_items.push(ListItem::new(Line::from("")));
             }
-            DisplayLine::HunkEnd => {
+            DisplayLine::HunkEnd { .. } => {
                 // End of hunk - subtle bottom border
                 let style = Style::default().fg(theme.hunk_border);
                 left_items.push(ListItem::new(Line::from(Span::styled("╰".to_string() + &"─".repeat(20), style))));
@@ -2262,14 +2527,28 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
 fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
     match &app.mode {
         Mode::Normal => {
+            let mode_label = match app.diff_mode {
+                DiffMode::Unstaged => "[unstaged] ",
+                DiffMode::Staged => "[staged] ",
+                _ => "",
+            };
             let content = if let Some(msg) = &app.message {
-                msg.clone()
+                format!("{}{}", mode_label, msg)
             } else if app.expanded_file.is_some() {
-                " j/k:line  n/N:chunk  ^d/^u:page  x:collapse  c:collapse  A:list  a:annotate  ?:help  q:quit".to_string()
+                format!(
+                    "{} j/k:line  n/N:chunk  ^d/^u:page  x:collapse  c:collapse  s:stage  u:toggle  v:view  A:list  a:annotate  ?:help  q:quit",
+                    mode_label
+                )
             } else if app.search.is_some() {
-                " n/N:match  Esc:clear  j/k:nav  Tab:file  c:collapse  x:expand  A:list  a:annotate  ?:help  q:quit".to_string()
+                format!(
+                    "{} n/N:match  Esc:clear  j/k:nav  Tab:file  c:collapse  x:expand  s:stage  u:toggle  v:view  A:list  a:annotate  ?:help  q:quit",
+                    mode_label
+                )
             } else {
-                " j/k:nav  n/N:chunk  Tab:file  c:collapse  f:find  /:search  x:expand  A:list  a:annotate  ?:help  q:quit".to_string()
+                format!(
+                    "{} j/k:nav  n/N:chunk  Tab:file  c:collapse  f:find  /:search  x:expand  s:stage  u:toggle  v:view  A:list  a:annotate  ?:help  q:quit",
+                    mode_label
+                )
             };
             let status = Paragraph::new(content)
                 .style(Style::default().fg(theme.status_fg).bg(theme.status_bg));
@@ -2361,7 +2640,9 @@ fn render_help(f: &mut Frame, theme: Theme) {
         "  View:",
         "    x         Expand/collapse current file (full view)",
         "    c         Collapse/expand current file",
-        "    s         Toggle side-by-side view",
+        "    v         Toggle side-by-side view",
+        "    s         Stage/unstage current hunk",
+        "    u         Toggle staged/unstaged view",
         "    A         Annotation list",
         "",
         "  Annotations:",

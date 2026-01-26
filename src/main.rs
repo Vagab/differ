@@ -284,7 +284,16 @@ fn cmd_diff(
     // Clone storage for TUI (it needs ownership)
     let tui_storage = Storage::open_default()?;
 
-    tui::run(tui_storage, diff_engine, repo_path.clone(), repo_id, files, config)
+    tui::run(
+        tui_storage,
+        diff_engine,
+        repo_path.clone(),
+        repo_id,
+        files,
+        config,
+        args.mode.clone(),
+        args.paths.clone(),
+    )
 }
 
 fn cmd_list(
