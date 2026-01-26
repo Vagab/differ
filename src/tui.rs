@@ -20,8 +20,13 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
+
+const REATTACH_CONTEXT_LINES: usize = 2;
+const REATTACH_WINDOW: i32 = 5;
+const REATTACH_THRESHOLD: f32 = 0.7;
 
 /// Represents a line in the unified display
 #[derive(Debug, Clone)]
@@ -88,8 +93,10 @@ pub struct App {
     side_by_side: bool,
     visible_height: usize,
     expanded_file: Option<usize>, // When Some, only show this file
+    collapsed_files: HashSet<usize>,
     // Position to restore when collapsing expanded view
     pre_expand_position: Option<(usize, usize)>, // (line_idx, scroll_offset)
+    annotation_list_idx: usize,
 
     // Search state
     search: Option<SearchState>,
@@ -102,6 +109,7 @@ enum Mode {
     EditAnnotation(i64), // annotation id
     SearchFile,          // searching by filename
     SearchContent,       // searching within content
+    AnnotationList,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +138,7 @@ struct Theme {
     header_match_fg: Color,
     header_dim_bg: Color,
     header_dim_fg: Color,
+    header_focus_bg: Color,
     expanded_bg: Color,
     expanded_fg: Color,
     hunk_bg: Color,
@@ -143,6 +152,8 @@ struct Theme {
     line_num: Color,
     annotation_bg: Color,
     annotation_fg: Color,
+    todo_bg: Color,
+    todo_fg: Color,
     annotation_marker: Color,
     status_bg: Color,
     status_fg: Color,
@@ -170,13 +181,14 @@ impl Default for Theme {
             bg: Color::Rgb(18, 20, 24),
             surface: Color::Rgb(26, 30, 36),
             surface_alt: Color::Rgb(34, 38, 46),
-            current_line_bg: Color::Rgb(48, 54, 62),
+            current_line_bg: Color::Rgb(64, 72, 86),
             header_bg: Color::Rgb(38, 44, 60),
             header_fg: Color::Rgb(235, 238, 242),
             header_match_bg: Color::Rgb(220, 190, 90),
             header_match_fg: Color::Rgb(18, 18, 18),
             header_dim_bg: Color::Rgb(120, 120, 70),
             header_dim_fg: Color::Rgb(20, 20, 20),
+            header_focus_bg: Color::Rgb(58, 66, 84),
             expanded_bg: Color::Rgb(96, 72, 40),
             expanded_fg: Color::Rgb(255, 245, 230),
             hunk_bg: Color::Rgb(140, 130, 78),
@@ -190,6 +202,8 @@ impl Default for Theme {
             line_num: Color::Rgb(120, 130, 140),
             annotation_bg: Color::Rgb(40, 76, 78),
             annotation_fg: Color::Rgb(230, 245, 245),
+            todo_bg: Color::Rgb(115, 86, 26),
+            todo_fg: Color::Rgb(255, 245, 210),
             annotation_marker: Color::Rgb(255, 208, 96),
             status_bg: Color::Rgb(22, 24, 28),
             status_fg: Color::Rgb(150, 160, 170),
@@ -246,8 +260,10 @@ impl App {
             side_by_side,
             visible_height: 20, // Will be updated on first render
             expanded_file: None,
+            collapsed_files: HashSet::new(),
             pre_expand_position: None,
             search: None,
+            annotation_list_idx: 0,
         }
     }
 
@@ -255,20 +271,218 @@ impl App {
     fn load_all_annotations(&mut self) -> Result<()> {
         self.all_annotations.clear();
 
-        for file in &self.files {
-            let path = file
-                .new_path
-                .as_ref()
-                .or(file.old_path.as_ref())
-                .map(|p| p.to_string_lossy().to_string());
+        let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
 
-            if let Some(path) = path {
-                let annotations = self.storage.list_annotations(self.repo_id, Some(&path))?;
-                self.all_annotations.extend(annotations);
+        let file_paths: Vec<String> = self
+            .files
+            .iter()
+            .filter_map(|file| {
+                file.new_path
+                    .as_ref()
+                    .or(file.old_path.as_ref())
+                    .map(|p| p.to_string_lossy().to_string())
+            })
+            .collect();
+
+        for path in file_paths {
+            let mut annotations = self.storage.list_annotations(self.repo_id, Some(&path))?;
+            if annotations.is_empty() {
+                continue;
+            }
+            if let Some(lines) = self.read_file_lines(&path, &mut file_cache) {
+                self.reattach_annotations_for_file(&mut annotations, &lines)?;
+            }
+            self.all_annotations.extend(annotations);
+        }
+
+        Ok(())
+    }
+
+    fn read_file_lines(
+        &self,
+        file_path: &str,
+        cache: &mut HashMap<String, Vec<String>>,
+    ) -> Option<Vec<String>> {
+        if let Some(lines) = cache.get(file_path) {
+            return Some(lines.clone());
+        }
+        let full_path = self.repo_path.join(file_path);
+        let content = std::fs::read_to_string(&full_path).ok()?;
+        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        cache.insert(file_path.to_string(), lines.clone());
+        Some(lines)
+    }
+
+    fn reattach_annotations_for_file(
+        &mut self,
+        annotations: &mut [Annotation],
+        lines: &[String],
+    ) -> Result<()> {
+        for annotation in annotations.iter_mut() {
+            if annotation.side != Side::New {
+                continue;
+            }
+
+            let anchor_line = if annotation.anchor_line > 0 {
+                annotation.anchor_line
+            } else {
+                annotation.start_line
+            };
+
+            if annotation.anchor_text.is_empty() {
+                let (anchor_line, anchor_text, context_before, context_after) =
+                    Self::build_anchor(lines, annotation.start_line);
+                if !anchor_text.is_empty() {
+                    if let Err(err) = self.storage.update_annotation_location(
+                        annotation.id,
+                        annotation.start_line,
+                        annotation.end_line,
+                        anchor_line,
+                        &anchor_text,
+                        &context_before,
+                        &context_after,
+                    ) {
+                        self.message = Some(format!("Anchor update failed: {}", err));
+                    }
+                    annotation.anchor_line = anchor_line;
+                    annotation.anchor_text = anchor_text;
+                    annotation.context_before = context_before;
+                    annotation.context_after = context_after;
+                }
+                continue;
+            }
+
+            if lines.is_empty() {
+                continue;
+            }
+
+            let base = anchor_line as i32;
+            let start = (base - REATTACH_WINDOW).max(1) as usize;
+            let end = (base + REATTACH_WINDOW).min(lines.len() as i32) as usize;
+
+            let mut best_line = anchor_line;
+            let mut best_score = -1.0f32;
+
+            for line_no in start..=end {
+                let candidate = lines.get(line_no - 1).map(String::as_str).unwrap_or("");
+                let line_score = Self::similarity(annotation.anchor_text.as_str(), candidate);
+                let ctx_bonus = Self::context_bonus(lines, line_no, &annotation.context_before, &annotation.context_after);
+                let score = line_score + ctx_bonus;
+                if score > best_score {
+                    best_score = score;
+                    best_line = line_no as u32;
+                }
+            }
+
+            if best_score >= REATTACH_THRESHOLD {
+                let range_len = annotation
+                    .end_line
+                    .map(|end| end.saturating_sub(annotation.start_line));
+                let new_end = range_len.map(|len| best_line.saturating_add(len));
+                let (anchor_line, anchor_text, context_before, context_after) =
+                    Self::build_anchor(lines, best_line);
+
+                if let Err(err) = self.storage.update_annotation_location(
+                    annotation.id,
+                    best_line,
+                    new_end,
+                    anchor_line,
+                    &anchor_text,
+                    &context_before,
+                    &context_after,
+                ) {
+                    self.message = Some(format!("Reattach update failed: {}", err));
+                }
+                annotation.start_line = best_line;
+                annotation.end_line = new_end;
+                annotation.anchor_line = anchor_line;
+                annotation.anchor_text = anchor_text;
+                annotation.context_before = context_before;
+                annotation.context_after = context_after;
             }
         }
 
         Ok(())
+    }
+
+    fn build_anchor(lines: &[String], line_no: u32) -> (u32, String, String, String) {
+        if line_no == 0 || lines.is_empty() {
+            return (line_no, String::new(), String::new(), String::new());
+        }
+        let idx = line_no.saturating_sub(1) as usize;
+        if idx >= lines.len() {
+            return (line_no, String::new(), String::new(), String::new());
+        }
+        let anchor_text = lines.get(idx).cloned().unwrap_or_default();
+        let start = idx.saturating_sub(REATTACH_CONTEXT_LINES);
+        let before = lines[start..idx].join("\n");
+        let after_end = (idx + 1 + REATTACH_CONTEXT_LINES).min(lines.len());
+        let after = if idx + 1 < after_end {
+            lines[idx + 1..after_end].join("\n")
+        } else {
+            String::new()
+        };
+        (line_no, anchor_text, before, after)
+    }
+
+    fn context_bonus(lines: &[String], line_no: usize, before: &str, after: &str) -> f32 {
+        let mut bonus = 0.0;
+        if !before.is_empty() {
+            let ctx: Vec<&str> = before.split('\n').collect();
+            for (i, ctx_line) in ctx.iter().rev().enumerate() {
+                let idx = line_no.saturating_sub(2 + i);
+                if idx < lines.len() && lines[idx].trim() == ctx_line.trim() {
+                    bonus += 0.1;
+                }
+            }
+        }
+        if !after.is_empty() {
+            let ctx: Vec<&str> = after.split('\n').collect();
+            for (i, ctx_line) in ctx.iter().enumerate() {
+                let idx = line_no + i;
+                if idx < lines.len() && lines[idx].trim() == ctx_line.trim() {
+                    bonus += 0.1;
+                }
+            }
+        }
+        bonus
+    }
+
+    fn similarity(a: &str, b: &str) -> f32 {
+        let a = a.trim();
+        let b = b.trim();
+        if a.is_empty() && b.is_empty() {
+            return 1.0;
+        }
+        if a.is_empty() || b.is_empty() {
+            return 0.0;
+        }
+        let dist = Self::levenshtein(a.as_bytes(), b.as_bytes()) as f32;
+        let max_len = a.len().max(b.len()) as f32;
+        if max_len == 0.0 {
+            1.0
+        } else {
+            1.0 - (dist / max_len)
+        }
+    }
+
+    fn levenshtein(a: &[u8], b: &[u8]) -> usize {
+        let mut prev: Vec<usize> = (0..=b.len()).collect();
+        let mut curr = vec![0; b.len() + 1];
+
+        for (i, &ac) in a.iter().enumerate() {
+            curr[0] = i + 1;
+            for (j, &bc) in b.iter().enumerate() {
+                let cost = if ac == bc { 0 } else { 1 };
+                curr[j + 1] = std::cmp::min(
+                    std::cmp::min(curr[j] + 1, prev[j + 1] + 1),
+                    prev[j] + cost,
+                );
+            }
+            prev.clone_from_slice(&curr);
+        }
+
+        prev[b.len()]
     }
 
     /// Build the unified display lines from all files
@@ -305,6 +519,10 @@ impl App {
                 path: file_path.clone(),
                 file_idx,
             });
+
+            if self.collapsed_files.contains(&file_idx) && expanded_file.is_none() {
+                continue;
+            }
 
             // If expanded, show full file with changes highlighted
             if expanded_file.is_some() {
@@ -590,6 +808,17 @@ impl App {
                 Side::Old
             };
 
+            let (anchor_line, anchor_text, context_before, context_after) = if side == Side::New {
+                let mut cache = HashMap::new();
+                if let Some(lines) = self.read_file_lines(&file_path, &mut cache) {
+                    Self::build_anchor(&lines, line_no)
+                } else {
+                    (line_no, line.content.clone(), String::new(), String::new())
+                }
+            } else {
+                (line_no, line.content.clone(), String::new(), String::new())
+            };
+
             self.storage.add_annotation(
                 self.repo_id,
                 &file_path,
@@ -599,6 +828,10 @@ impl App {
                 None, // end_line
                 self.annotation_type.clone(),
                 &self.annotation_input,
+                anchor_line,
+                &anchor_text,
+                &context_before,
+                &context_after,
             )?;
 
             self.message = Some("Annotation added".to_string());
@@ -612,7 +845,8 @@ impl App {
     }
 
     fn edit_annotation(&mut self, id: i64) -> Result<()> {
-        self.storage.update_annotation(id, &self.annotation_input)?;
+        self.storage
+            .update_annotation(id, &self.annotation_input, self.annotation_type.clone())?;
         self.message = Some("Annotation updated".to_string());
         self.load_all_annotations()?;
         self.build_display_lines();
@@ -634,14 +868,14 @@ impl App {
 
     /// Check if a display line should be skipped during navigation
     fn is_skippable_line(&self, idx: usize) -> bool {
-        matches!(
-            self.display_lines.get(idx),
+        match self.display_lines.get(idx) {
+            Some(DisplayLine::FileHeader { file_idx, .. }) => !self.collapsed_files.contains(file_idx),
             Some(DisplayLine::Annotation { .. })
-                | Some(DisplayLine::HunkHeader { .. })
-                | Some(DisplayLine::HunkEnd)
-                | Some(DisplayLine::Spacer)
-                | Some(DisplayLine::FileHeader { .. })
-        )
+            | Some(DisplayLine::HunkHeader { .. })
+            | Some(DisplayLine::HunkEnd)
+            | Some(DisplayLine::Spacer) => true,
+            _ => false,
+        }
     }
 
     fn navigate_up(&mut self) {
@@ -651,6 +885,7 @@ impl App {
             while self.current_line_idx > 0 && self.is_skippable_line(self.current_line_idx) {
                 self.current_line_idx -= 1;
             }
+            self.ensure_cursor_on_navigable();
             self.adjust_scroll();
         }
     }
@@ -665,6 +900,7 @@ impl App {
             {
                 self.current_line_idx += 1;
             }
+            self.ensure_cursor_on_navigable();
             self.adjust_scroll();
         }
     }
@@ -685,6 +921,7 @@ impl App {
                 }
             }
         }
+        self.ensure_cursor_on_navigable();
         self.adjust_scroll();
     }
 
@@ -701,6 +938,7 @@ impl App {
                 }
             }
         }
+        self.ensure_cursor_on_navigable();
         self.adjust_scroll();
     }
 
@@ -751,6 +989,7 @@ impl App {
             Mode::Normal => self.handle_normal_input(key),
             Mode::AddAnnotation | Mode::EditAnnotation(_) => self.handle_annotation_input(key),
             Mode::SearchFile | Mode::SearchContent => self.handle_search_input(key),
+            Mode::AnnotationList => self.handle_annotation_list_input(key),
         }
     }
 
@@ -816,7 +1055,11 @@ impl App {
             }
             // Clear search
             KeyCode::Esc => {
-                self.search = None;
+                if self.show_help {
+                    self.show_help = false;
+                } else {
+                    self.search = None;
+                }
             }
             KeyCode::Char('g') => {
                 self.current_line_idx = 0;
@@ -841,16 +1084,11 @@ impl App {
 
             // Toggle views
             KeyCode::Char('c') => {
-                self.show_annotations = !self.show_annotations;
-                self.build_display_lines();
-                // Clamp current line index
-                if self.current_line_idx >= self.display_lines.len() {
-                    self.current_line_idx = self.display_lines.len().saturating_sub(1);
-                }
-                self.message = Some(format!(
-                    "Annotations {}",
-                    if self.show_annotations { "shown" } else { "hidden" }
-                ));
+                self.toggle_collapse_current_file();
+            }
+            KeyCode::Char('A') => {
+                self.mode = Mode::AnnotationList;
+                self.annotation_list_idx = 0;
             }
             KeyCode::Char('s') => {
                 self.side_by_side = !self.side_by_side;
@@ -917,10 +1155,12 @@ impl App {
                 }
             }
             KeyCode::Char('e') => {
-                if let Some(annotation) = self.get_annotation_for_current_line() {
-                    let id = annotation.id;
-                    let content = annotation.content.clone();
+                if let Some((id, content, a_type)) = self
+                    .get_annotation_for_current_line()
+                    .map(|a| (a.id, a.content.clone(), a.annotation_type.clone()))
+                {
                     self.annotation_input = content;
+                    self.annotation_type = a_type;
                     self.mode = Mode::EditAnnotation(id);
                 }
             }
@@ -928,14 +1168,27 @@ impl App {
 
             // Annotation type toggle
             KeyCode::Char('t') => {
-                self.annotation_type = match self.annotation_type {
-                    AnnotationType::Comment => AnnotationType::Todo,
-                    AnnotationType::Todo => AnnotationType::Comment,
-                };
-                self.message = Some(format!(
-                    "Annotation type: {}",
-                    self.annotation_type.as_str()
-                ));
+                if let Some(annotation) = self.get_annotation_for_current_line() {
+                    let id = annotation.id;
+                    let content = annotation.content.clone();
+                    let new_type = match annotation.annotation_type {
+                        AnnotationType::Comment => AnnotationType::Todo,
+                        AnnotationType::Todo => AnnotationType::Comment,
+                    };
+                    self.storage.update_annotation(id, &content, new_type.clone())?;
+                    self.message = Some(format!("Annotation type: {}", new_type.as_str()));
+                    self.load_all_annotations()?;
+                    self.build_display_lines();
+                } else {
+                    self.annotation_type = match self.annotation_type {
+                        AnnotationType::Comment => AnnotationType::Todo,
+                        AnnotationType::Todo => AnnotationType::Comment,
+                    };
+                    self.message = Some(format!(
+                        "Annotation type: {}",
+                        self.annotation_type.as_str()
+                    ));
+                }
             }
 
             _ => {}
@@ -948,6 +1201,14 @@ impl App {
         // Ctrl+J inserts newline
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
             self.annotation_input.push('\n');
+            return Ok(false);
+        }
+        // Ctrl+T toggles annotation type while editing/adding
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            self.annotation_type = match self.annotation_type {
+                AnnotationType::Comment => AnnotationType::Todo,
+                AnnotationType::Todo => AnnotationType::Comment,
+            };
             return Ok(false);
         }
 
@@ -1023,6 +1284,60 @@ impl App {
         Ok(false)
     }
 
+    fn handle_annotation_list_input(&mut self, key: KeyEvent) -> Result<bool> {
+        let entries = self.annotation_list_entries();
+        if entries.is_empty() {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.mode = Mode::Normal;
+            }
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Normal;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.annotation_list_idx =
+                    (self.annotation_list_idx + 1).min(entries.len().saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.annotation_list_idx = self.annotation_list_idx.saturating_sub(1);
+            }
+            KeyCode::Char('d') => {
+                if let Some(entry) = entries.get(self.annotation_list_idx) {
+                    self.storage.delete_annotation(entry.id)?;
+                    self.load_all_annotations()?;
+                    self.build_display_lines();
+                    self.annotation_list_idx =
+                        self.annotation_list_idx.min(self.annotation_list_entries().len().saturating_sub(1));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = entries.get(self.annotation_list_idx) {
+                    if let Some(idx) = entry.display_idx {
+                        self.current_line_idx = idx;
+                        self.ensure_cursor_on_navigable();
+                        self.adjust_scroll();
+                        self.mode = Mode::Normal;
+                    } else {
+                        self.message = Some("Annotation not present in current diff".to_string());
+                    }
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(entry) = entries.get(self.annotation_list_idx) {
+                    self.annotation_input = entry.content.clone();
+                    self.annotation_type = entry.annotation_type.clone();
+                    self.mode = Mode::EditAnnotation(entry.id);
+                }
+            }
+            _ => {}
+        }
+
+        Ok(false)
+    }
+
     fn execute_search(&mut self) {
         let Some(ref mut search) = self.search else {
             return;
@@ -1078,6 +1393,7 @@ impl App {
         search.current_match = 0;
         if let Some(&idx) = search.matches.first() {
             self.current_line_idx = idx;
+            self.ensure_cursor_on_navigable();
             self.adjust_scroll();
         }
     }
@@ -1210,6 +1526,108 @@ impl App {
         }
     }
 
+    fn toggle_collapse_current_file(&mut self) {
+        let current_header_idx = self.find_current_file_header_idx();
+        let Some((_, file_idx)) = self.current_file_info() else {
+            return;
+        };
+
+        let was_collapsed = self.collapsed_files.contains(&file_idx);
+        if was_collapsed {
+            self.collapsed_files.remove(&file_idx);
+            self.message = Some("Expanded file".to_string());
+        } else {
+            self.collapsed_files.insert(file_idx);
+            self.message = Some("Collapsed file".to_string());
+        }
+
+        self.build_display_lines();
+
+        let header_idx = current_header_idx.and_then(|idx| {
+            if let Some(DisplayLine::FileHeader { file_idx: header_file_idx, .. }) = self.display_lines.get(idx) {
+                if *header_file_idx == file_idx {
+                    return Some(idx);
+                }
+            }
+            None
+        }).or_else(|| {
+            self.display_lines.iter().enumerate().find_map(|(idx, line)| {
+                if let DisplayLine::FileHeader { file_idx: header_file_idx, .. } = line {
+                    if *header_file_idx == file_idx {
+                        return Some(idx);
+                    }
+                }
+                None
+            })
+        });
+
+        if let Some(idx) = header_idx {
+            if was_collapsed {
+                // Just expanded; move to first navigable line under the header if possible.
+                let mut cursor = idx.saturating_add(1);
+                while cursor < self.display_lines.len() && self.is_skippable_line(cursor) {
+                    cursor += 1;
+                }
+                self.current_line_idx = cursor.min(self.display_lines.len().saturating_sub(1));
+            } else {
+                // Just collapsed; focus the header.
+                self.current_line_idx = idx;
+            }
+            self.ensure_cursor_on_navigable();
+            self.adjust_scroll();
+        }
+    }
+
+    fn ensure_cursor_on_navigable(&mut self) {
+        if self.display_lines.is_empty() {
+            return;
+        }
+        if !self.is_skippable_line(self.current_line_idx) {
+            return;
+        }
+
+        let mut down = self.current_line_idx;
+        while down < self.display_lines.len() && self.is_skippable_line(down) {
+            down += 1;
+        }
+        if down < self.display_lines.len() {
+            self.current_line_idx = down;
+            return;
+        }
+
+        let mut up = self.current_line_idx;
+        while up > 0 && self.is_skippable_line(up) {
+            up -= 1;
+        }
+        self.current_line_idx = up;
+    }
+
+    fn annotation_list_entries(&self) -> Vec<AnnotationListEntry> {
+        let mut visible: HashMap<i64, usize> = HashMap::new();
+        for (idx, line) in self.display_lines.iter().enumerate() {
+            if let DisplayLine::Annotation { annotation, .. } = line {
+                visible.insert(annotation.id, idx);
+            }
+        }
+
+        let mut entries: Vec<AnnotationListEntry> = self
+            .all_annotations
+            .iter()
+            .map(|a| AnnotationListEntry {
+                id: a.id,
+                file_path: a.file_path.clone(),
+                line: a.start_line,
+                side: a.side.clone(),
+                annotation_type: a.annotation_type.clone(),
+                content: a.content.clone(),
+                display_idx: visible.get(&a.id).copied(),
+            })
+            .collect();
+
+        entries.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.line.cmp(&b.line)));
+        entries
+    }
+
     /// Adjust scroll to keep cursor visible with vim-like margins
     fn adjust_scroll(&mut self) {
         let scroll_margin = 5; // Keep 5 lines of padding
@@ -1317,6 +1735,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     if app.show_help {
         render_help(f, theme);
     }
+
+    if matches!(app.mode, Mode::AnnotationList) {
+        render_annotation_list(f, app, theme);
+    }
 }
 
 fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
@@ -1340,6 +1762,7 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
     }
 
     let (file_path, file_idx) = app.current_file_info().unwrap_or(("<none>".to_string(), 0));
+    let is_collapsed = app.collapsed_files.contains(&file_idx);
 
     // Calculate file stats
     let file = app.files.get(file_idx);
@@ -1390,14 +1813,17 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
         )
     };
 
+    let collapse_indicator = if is_collapsed { " ▶" } else { "" };
+
     let header = format!(
-        " Δ {}  [+{} -{}]  ({}/{}){}",
+        " Δ {}  [+{} -{}]  ({}/{}){}{}",
         file_path,
         additions,
         deletions,
         file_idx + 1,
         app.files.len(),
-        expanded_indicator
+        expanded_indicator,
+        collapse_indicator
     );
 
     let paragraph = Paragraph::new(header).style(style);
@@ -1435,7 +1861,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                     let is_current_match = app.is_current_search_match(idx);
                     let is_match = app.is_search_match(idx);
 
-                    let (style, stats_bg) = if is_current_match {
+                    let (mut style, stats_bg) = if is_current_match {
                         // Current match: bright yellow background
                         (
                             Style::default()
@@ -1463,8 +1889,16 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         )
                     };
 
+                    if is_current {
+                        style = style
+                            .bg(theme.header_focus_bg)
+                            .add_modifier(Modifier::UNDERLINED);
+                    }
+
+                    let collapse_indicator = if app.collapsed_files.contains(file_idx) { " ▶" } else { "" };
+
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!(" Δ {}  ", path), style),
+                        Span::styled(format!(" Δ {}{}  ", path, collapse_indicator), style),
                         Span::styled(format!("+{} ", adds), Style::default().fg(theme.added_fg).bg(stats_bg)),
                         Span::styled(format!("-{} ", dels), Style::default().fg(theme.deleted_fg).bg(stats_bg)),
                     ]))
@@ -1556,13 +1990,19 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 }
                 DisplayLine::Annotation { annotation, .. } => {
                     // Annotation in a prominent box - handle multiple lines
-                    let icon = match annotation.annotation_type {
-                        AnnotationType::Comment => "💬",
-                        AnnotationType::Todo => "📋",
+                    let (prefix, style) = match annotation.annotation_type {
+                        AnnotationType::Comment => (
+                            "    💬 ",
+                            Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg),
+                        ),
+                        AnnotationType::Todo => (
+                            "    📌 ",
+                            Style::default()
+                                .fg(theme.todo_fg)
+                                .bg(theme.todo_bg)
+                                .add_modifier(Modifier::BOLD),
+                        ),
                     };
-                    let style = Style::default()
-                        .fg(theme.annotation_fg)
-                        .bg(theme.annotation_bg);
 
                     // Split content by newlines and create multiple lines
                     let lines: Vec<Line> = annotation.content
@@ -1570,7 +2010,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         .enumerate()
                         .map(|(i, line)| {
                             let prefix = if i == 0 {
-                                format!("    {} ", icon)
+                                prefix.to_string()
                             } else {
                                 "       ".to_string() // Indent continuation lines
                             };
@@ -1629,7 +2069,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                 let is_current_match = app.is_current_search_match(idx);
                 let is_match = app.is_search_match(idx);
 
-                let (style, stats_bg) = if is_current_match {
+                let (mut style, stats_bg) = if is_current_match {
                     // Current match: bright yellow background
                     (
                         Style::default()
@@ -1657,8 +2097,16 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     )
                 };
 
+                if is_current {
+                    style = style
+                        .bg(theme.header_focus_bg)
+                        .add_modifier(Modifier::UNDERLINED);
+                }
+
+                let collapse_indicator = if app.collapsed_files.contains(file_idx) { " ▶" } else { "" };
+
                 let header = Line::from(vec![
-                    Span::styled(format!(" Δ {} ", path), style),
+                    Span::styled(format!(" Δ {}{} ", path, collapse_indicator), style),
                     Span::styled(format!("+{} ", adds), Style::default().fg(theme.added_fg).bg(stats_bg)),
                     Span::styled(format!("-{} ", dels), Style::default().fg(theme.deleted_fg).bg(stats_bg)),
                 ]);
@@ -1760,13 +2208,19 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
             }
             DisplayLine::Annotation { annotation, .. } => {
                 // Annotation in a prominent box - handle multiple lines
-                let icon = match annotation.annotation_type {
-                    AnnotationType::Comment => "💬",
-                    AnnotationType::Todo => "📋",
+                let (prefix, style) = match annotation.annotation_type {
+                    AnnotationType::Comment => (
+                        "   💬 ",
+                        Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg),
+                    ),
+                    AnnotationType::Todo => (
+                        "   📌 ",
+                        Style::default()
+                            .fg(theme.todo_fg)
+                            .bg(theme.todo_bg)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 };
-                let style = Style::default()
-                    .fg(theme.annotation_fg)
-                    .bg(theme.annotation_bg);
 
                 // Split content by newlines and create multiple lines
                 let lines: Vec<Line> = annotation.content
@@ -1774,7 +2228,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     .enumerate()
                     .map(|(i, line)| {
                         let prefix = if i == 0 {
-                            format!("   {} ", icon)
+                            prefix.to_string()
                         } else {
                             "      ".to_string()
                         };
@@ -1811,11 +2265,11 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             let content = if let Some(msg) = &app.message {
                 msg.clone()
             } else if app.expanded_file.is_some() {
-                " j/k:line  n/N:chunk  ^d/^u:page  x:collapse  a:annotate  ?:help  q:quit".to_string()
+                " j/k:line  n/N:chunk  ^d/^u:page  x:collapse  c:collapse  A:list  a:annotate  ?:help  q:quit".to_string()
             } else if app.search.is_some() {
-                " n/N:match  Esc:clear  j/k:nav  Tab:file  x:expand  a:annotate  ?:help  q:quit".to_string()
+                " n/N:match  Esc:clear  j/k:nav  Tab:file  c:collapse  x:expand  A:list  a:annotate  ?:help  q:quit".to_string()
             } else {
-                " j/k:nav  n/N:chunk  Tab:file  f:find  /:search  x:expand  a:annotate  ?:help  q:quit".to_string()
+                " j/k:nav  n/N:chunk  Tab:file  c:collapse  f:find  /:search  x:expand  A:list  a:annotate  ?:help  q:quit".to_string()
             };
             let status = Paragraph::new(content)
                 .style(Style::default().fg(theme.status_fg).bg(theme.status_bg));
@@ -1824,8 +2278,14 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
         Mode::AddAnnotation | Mode::EditAnnotation(_) => {
             // Multi-line input area with border
             let title = match &app.mode {
-                Mode::AddAnnotation => format!(" Add {} (^J: newline, Enter: save, Esc: cancel) ", app.annotation_type.as_str()),
-                Mode::EditAnnotation(_) => " Edit (^J: newline, Enter: save, Esc: cancel) ".to_string(),
+                Mode::AddAnnotation => format!(
+                    " Add {} (^J: newline, Ctrl+T: type, Enter: save, Esc: cancel) ",
+                    app.annotation_type.as_str()
+                ),
+                Mode::EditAnnotation(_) => format!(
+                    " Edit {} (^J: newline, Ctrl+T: type, Enter: save, Esc: cancel) ",
+                    app.annotation_type.as_str()
+                ),
                 _ => String::new(),
             };
 
@@ -1868,6 +2328,11 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 .style(Style::default().fg(theme.search_fg).bg(theme.search_bg));
             f.render_widget(status, area);
         }
+        Mode::AnnotationList => {
+            let status = Paragraph::new(" Annotations: j/k, Enter: jump, e: edit, d: delete, Esc: close")
+                .style(Style::default().fg(theme.status_fg).bg(theme.status_bg));
+            f.render_widget(status, area);
+        }
     }
 }
 
@@ -1895,8 +2360,9 @@ fn render_help(f: &mut Frame, theme: Theme) {
         "",
         "  View:",
         "    x         Expand/collapse current file (full view)",
-        "    c         Toggle annotation visibility",
+        "    c         Collapse/expand current file",
         "    s         Toggle side-by-side view",
+        "    A         Annotation list",
         "",
         "  Annotations:",
         "    a         Add annotation at current line",
@@ -1911,6 +2377,7 @@ fn render_help(f: &mut Frame, theme: Theme) {
         "  In annotation mode:",
         "    Enter     Save annotation",
         "    Ctrl+j    Add newline",
+        "    Ctrl+t    Toggle annotation type",
         "    Esc       Cancel",
         "",
     ];
@@ -1928,6 +2395,99 @@ fn render_help(f: &mut Frame, theme: Theme) {
 
     f.render_widget(Clear, area);
     f.render_widget(help, area);
+}
+
+#[derive(Clone)]
+struct AnnotationListEntry {
+    id: i64,
+    file_path: String,
+    line: u32,
+    side: Side,
+    annotation_type: AnnotationType,
+    content: String,
+    display_idx: Option<usize>,
+}
+
+fn render_annotation_list(f: &mut Frame, app: &mut App, theme: Theme) {
+    let entries = app.annotation_list_entries();
+    let area = centered_rect(80, 80, f.area());
+
+    if entries.is_empty() {
+        let empty = Paragraph::new("No annotations")
+            .style(Style::default().fg(theme.help_fg).bg(theme.help_bg))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Annotations ")
+                    .border_style(Style::default().fg(theme.border)),
+            );
+        f.render_widget(Clear, area);
+        f.render_widget(empty, area);
+        return;
+    }
+
+    let visible_height = area.height.saturating_sub(2) as usize;
+    let start = app
+        .annotation_list_idx
+        .saturating_sub(visible_height / 2);
+    let end = (start + visible_height).min(entries.len());
+
+    let lines: Vec<Line> = entries[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, entry)| {
+            let idx = start + offset;
+            let is_selected = idx == app.annotation_list_idx;
+            let is_orphaned = entry.display_idx.is_none();
+
+            let type_marker = match entry.annotation_type {
+                AnnotationType::Comment => "💬",
+                AnnotationType::Todo => "📌",
+            };
+            let side_marker = match entry.side {
+                Side::Old => "old",
+                Side::New => "new",
+            };
+
+            let mut content = entry.content.replace('\n', " ");
+            if content.len() > 60 {
+                content.truncate(57);
+                content.push_str("...");
+            }
+
+            let mut label = format!(
+                "{} {}:{} [{}] {}",
+                type_marker, entry.file_path, entry.line, side_marker, content
+            );
+            if is_orphaned {
+                label.push_str("  (orphaned)");
+            }
+
+            let mut style = if is_orphaned {
+                Style::default().fg(theme.deleted_fg)
+            } else {
+                Style::default().fg(theme.help_fg)
+            };
+
+            if is_selected {
+                style = style.bg(theme.header_focus_bg).add_modifier(Modifier::BOLD);
+            }
+
+            Line::from(Span::styled(label, style))
+        })
+        .collect();
+
+    let list = Paragraph::new(lines)
+        .style(Style::default().bg(theme.help_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Annotations (j/k, Enter, e, d, Esc) ")
+                .border_style(Style::default().fg(theme.border)),
+        );
+
+    f.render_widget(Clear, area);
+    f.render_widget(list, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

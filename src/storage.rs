@@ -26,6 +26,10 @@ CREATE TABLE IF NOT EXISTS annotations (
     annotation_type TEXT NOT NULL DEFAULT 'comment'
         CHECK (annotation_type IN ('comment', 'todo', 'ai_prompt')),
     content TEXT NOT NULL,
+    anchor_line INTEGER DEFAULT 0,
+    anchor_text TEXT DEFAULT '',
+    context_before TEXT DEFAULT '',
+    context_after TEXT DEFAULT '',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     resolved_at DATETIME,
 
@@ -95,6 +99,10 @@ pub struct Annotation {
     pub end_line: Option<u32>,
     pub annotation_type: AnnotationType,
     pub content: String,
+    pub anchor_line: u32,
+    pub anchor_text: String,
+    pub context_before: String,
+    pub context_after: String,
     pub created_at: String,
 }
 
@@ -131,7 +139,37 @@ impl Storage {
         conn.execute_batch(SCHEMA)
             .context("Failed to initialize database schema")?;
 
+        // Migrate missing columns
+        Self::ensure_annotation_columns(&conn)?;
+
         Ok(Self { conn })
+    }
+
+    fn ensure_annotation_columns(conn: &Connection) -> Result<()> {
+        let mut stmt = conn.prepare("PRAGMA table_info(annotations)")?;
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+
+        let has_anchor_line = cols.iter().any(|c| c == "anchor_line");
+        let has_anchor_text = cols.iter().any(|c| c == "anchor_text");
+        let has_context_before = cols.iter().any(|c| c == "context_before");
+        let has_context_after = cols.iter().any(|c| c == "context_after");
+
+        if !has_anchor_line {
+            conn.execute("ALTER TABLE annotations ADD COLUMN anchor_line INTEGER DEFAULT 0", [])?;
+        }
+        if !has_anchor_text {
+            conn.execute("ALTER TABLE annotations ADD COLUMN anchor_text TEXT DEFAULT ''", [])?;
+        }
+        if !has_context_before {
+            conn.execute("ALTER TABLE annotations ADD COLUMN context_before TEXT DEFAULT ''", [])?;
+        }
+        if !has_context_after {
+            conn.execute("ALTER TABLE annotations ADD COLUMN context_after TEXT DEFAULT ''", [])?;
+        }
+
+        Ok(())
     }
 
     /// Generates a hash for a repository path
@@ -186,13 +224,17 @@ impl Storage {
         end_line: Option<u32>,
         annotation_type: AnnotationType,
         content: &str,
+        anchor_line: u32,
+        anchor_text: &str,
+        context_before: &str,
+        context_after: &str,
     ) -> Result<i64> {
         self.conn.execute(
             r#"
             INSERT INTO annotations (
                 repo_id, file_path, commit_sha, side, start_line, end_line,
-                annotation_type, content
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                annotation_type, content, anchor_line, anchor_text, context_before, context_after
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             "#,
             params![
                 repo_id,
@@ -203,17 +245,52 @@ impl Storage {
                 end_line,
                 annotation_type.as_str(),
                 content,
+                anchor_line,
+                anchor_text,
+                context_before,
+                context_after,
             ],
         )?;
 
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Updates an existing annotation's content
-    pub fn update_annotation(&self, id: i64, content: &str) -> Result<()> {
+    /// Updates an existing annotation's content and type
+    pub fn update_annotation(&self, id: i64, content: &str, annotation_type: AnnotationType) -> Result<()> {
         self.conn.execute(
-            "UPDATE annotations SET content = ?1 WHERE id = ?2",
-            params![content, id],
+            "UPDATE annotations SET content = ?1, annotation_type = ?2 WHERE id = ?3",
+            params![content, annotation_type.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Updates an annotation's position and anchor data
+    pub fn update_annotation_location(
+        &self,
+        id: i64,
+        start_line: u32,
+        end_line: Option<u32>,
+        anchor_line: u32,
+        anchor_text: &str,
+        context_before: &str,
+        context_after: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            r#"
+            UPDATE annotations
+            SET start_line = ?1, end_line = ?2, anchor_line = ?3, anchor_text = ?4,
+                context_before = ?5, context_after = ?6
+            WHERE id = ?7
+            "#,
+            params![
+                start_line,
+                end_line,
+                anchor_line,
+                anchor_text,
+                context_before,
+                context_after,
+                id,
+            ],
         )?;
         Ok(())
     }
@@ -236,7 +313,8 @@ impl Storage {
         let mut sql = String::from(
             r#"
             SELECT id, repo_id, file_path, commit_sha, side, start_line, end_line,
-                   annotation_type, content, created_at
+                   annotation_type, content, anchor_line, anchor_text, context_before, context_after,
+                   created_at
             FROM annotations
             WHERE repo_id = ?1
             "#,
@@ -272,7 +350,8 @@ impl Storage {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT id, repo_id, file_path, commit_sha, side, start_line, end_line,
-                   annotation_type, content, created_at
+                   annotation_type, content, anchor_line, anchor_text, context_before, context_after,
+                   created_at
             FROM annotations
             WHERE repo_id = ?1
               AND file_path = ?2
@@ -313,7 +392,11 @@ impl Storage {
             annotation_type: AnnotationType::from_str(row.get::<_, String>(7)?.as_str())
                 .unwrap_or(AnnotationType::Comment),
             content: row.get(8)?,
-            created_at: row.get(9)?,
+            anchor_line: row.get(9)?,
+            anchor_text: row.get(10)?,
+            context_before: row.get(11)?,
+            context_after: row.get(12)?,
+            created_at: row.get(13)?,
         })
     }
 }
@@ -350,6 +433,10 @@ mod tests {
                 Some(15),
                 AnnotationType::Comment,
                 "This needs refactoring",
+                10,
+                "This needs refactoring",
+                "",
+                "",
             )
             .unwrap();
 
@@ -379,6 +466,10 @@ mod tests {
                 None,
                 AnnotationType::Todo,
                 "Fix this",
+                1,
+                "Fix this",
+                "",
+                "",
             )
             .unwrap();
 

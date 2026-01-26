@@ -15,6 +15,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+const REATTACH_CONTEXT_LINES: usize = 2;
+
 use crate::config::Config;
 use crate::diff::{find_repo_root, DiffEngine, DiffMode};
 use crate::export::{export, ExportFormat};
@@ -232,6 +234,7 @@ fn main() -> Result<()> {
         } => {
             cmd_add(
                 &storage,
+                &repo_path,
                 repo_id,
                 &file,
                 line,
@@ -338,6 +341,7 @@ fn cmd_list(
 
 fn cmd_add(
     storage: &Storage,
+    repo_path: &PathBuf,
     repo_id: i64,
     file: &str,
     line: u32,
@@ -348,6 +352,9 @@ fn cmd_add(
     let atype = AnnotationType::from_str(annotation_type)
         .context("Invalid annotation type. Use: comment or todo")?;
 
+    let (anchor_line, anchor_text, context_before, context_after) =
+        build_anchor_from_file(repo_path, file, line);
+
     let id = storage.add_annotation(
         repo_id,
         file,
@@ -357,10 +364,44 @@ fn cmd_add(
         end_line,
         atype,
         content,
+        anchor_line,
+        &anchor_text,
+        &context_before,
+        &context_after,
     )?;
 
     println!("Added annotation #{}", id);
     Ok(())
+}
+
+fn build_anchor_from_file(
+    repo_path: &PathBuf,
+    file: &str,
+    line: u32,
+) -> (u32, String, String, String) {
+    let full_path = repo_path.join(file);
+    let content = match std::fs::read_to_string(&full_path) {
+        Ok(content) => content,
+        Err(_) => return (line, String::new(), String::new(), String::new()),
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    if line == 0 || lines.is_empty() || (line as usize) > lines.len() {
+        return (line, String::new(), String::new(), String::new());
+    }
+
+    let idx = line.saturating_sub(1) as usize;
+    let anchor_text = lines.get(idx).copied().unwrap_or("").to_string();
+    let start = idx.saturating_sub(REATTACH_CONTEXT_LINES);
+    let before = lines[start..idx].join("\n");
+    let after_end = (idx + 1 + REATTACH_CONTEXT_LINES).min(lines.len());
+    let after = if idx + 1 < after_end {
+        lines[idx + 1..after_end].join("\n")
+    } else {
+        String::new()
+    };
+
+    (line, anchor_text, before, after)
 }
 
 fn cmd_export(

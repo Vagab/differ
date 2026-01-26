@@ -30,11 +30,6 @@ pub fn export_markdown(storage: &Storage, repo_id: i64) -> Result<String> {
         output.push_str(&format!("## {}\n\n", file_path));
 
         for annotation in file_annotations {
-            let type_badge = match annotation.annotation_type {
-                AnnotationType::Comment => "💬",
-                AnnotationType::Todo => "📋",
-            };
-
             let side_indicator = match annotation.side {
                 Side::Old => " (deleted code)",
                 Side::New => "",
@@ -46,13 +41,25 @@ pub fn export_markdown(storage: &Storage, repo_id: i64) -> Result<String> {
                 format!("L{}", annotation.start_line)
             };
 
-            output.push_str(&format!(
-                "### {} {}{}\n\n",
-                type_badge, line_range, side_indicator
-            ));
-
-            output.push_str(&annotation.content);
-            output.push_str("\n\n");
+            match annotation.annotation_type {
+                AnnotationType::Todo => {
+                    let mut lines = annotation.content.lines();
+                    let first = lines.next().unwrap_or("");
+                    output.push_str(&format!("- [ ] {}{}: {}\n", line_range, side_indicator, first));
+                    for line in lines {
+                        output.push_str(&format!("  {}\n", line));
+                    }
+                    output.push('\n');
+                }
+                AnnotationType::Comment => {
+                    output.push_str(&format!(
+                        "### 💬 {}{}\n\n",
+                        line_range, side_indicator
+                    ));
+                    output.push_str(&annotation.content);
+                    output.push_str("\n\n");
+                }
+            }
 
             if let Some(ref commit) = annotation.commit_sha {
                 output.push_str(&format!("_Commit: {}_\n\n", &commit[..7.min(commit.len())]));
@@ -150,6 +157,10 @@ mod tests {
                 None,
                 AnnotationType::Todo,
                 "Refactor this function",
+                10,
+                "Refactor this function",
+                "",
+                "",
             )
             .unwrap();
 
@@ -163,6 +174,10 @@ mod tests {
                 Some(10),
                 AnnotationType::Comment,
                 "Add error handling here",
+                5,
+                "Add error handling here",
+                "",
+                "",
             )
             .unwrap();
 
@@ -172,6 +187,7 @@ mod tests {
         assert!(md.contains("## src/lib.rs"));
         assert!(md.contains("## src/main.rs"));
         assert!(md.contains("Refactor this function"));
+        assert!(md.contains("- [ ] L10: Refactor this function"));
         assert!(md.contains("Add error handling here"));
         assert!(md.contains("L5-10"));
     }
@@ -196,6 +212,10 @@ mod tests {
                 None,
                 AnnotationType::Comment,
                 "Test annotation",
+                1,
+                "Test annotation",
+                "",
+                "",
             )
             .unwrap();
 
