@@ -104,6 +104,7 @@ pub struct Annotation {
     pub context_before: String,
     pub context_after: String,
     pub created_at: String,
+    pub resolved_at: Option<String>,
 }
 
 pub struct Storage {
@@ -314,7 +315,7 @@ impl Storage {
             r#"
             SELECT id, repo_id, file_path, commit_sha, side, start_line, end_line,
                    annotation_type, content, anchor_line, anchor_text, context_before, context_after,
-                   created_at
+                   created_at, resolved_at
             FROM annotations
             WHERE repo_id = ?1
             "#,
@@ -351,7 +352,7 @@ impl Storage {
             r#"
             SELECT id, repo_id, file_path, commit_sha, side, start_line, end_line,
                    annotation_type, content, anchor_line, anchor_text, context_before, context_after,
-                   created_at
+                   created_at, resolved_at
             FROM annotations
             WHERE repo_id = ?1
               AND file_path = ?2
@@ -397,7 +398,17 @@ impl Storage {
             context_before: row.get(11)?,
             context_after: row.get(12)?,
             created_at: row.get(13)?,
+            resolved_at: row.get(14)?,
         })
+    }
+
+    /// Mark an annotation as resolved
+    pub fn resolve_annotation(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE annotations SET resolved_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
     }
 }
 

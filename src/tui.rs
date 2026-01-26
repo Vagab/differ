@@ -2,13 +2,13 @@
 //!
 //! Provides interactive diff viewing with annotation support.
 
-use crate::config::Config;
+use crate::config::{AiTarget, Config};
 use crate::diff::{
     DiffEngine, DiffFile, DiffHunk, DiffLine, DiffMode, FileStatus, HighlightRange, LineKind,
 };
 use crate::storage::{Annotation, AnnotationType, Side, Storage};
 use crate::syntax::{SyntaxHighlighter, TokenType};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -23,9 +23,10 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Stdout, Write};
+use std::io::{self, BufRead, Stdout, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
 const REATTACH_WINDOW: i32 = 5;
@@ -97,6 +98,7 @@ pub struct App {
     // UI state
     mode: Mode,
     annotation_input: String,
+    annotation_cursor: usize,
     annotation_type: AnnotationType,
     message: Option<String>,
     show_help: bool,
@@ -111,6 +113,12 @@ pub struct App {
 
     // Search state
     search: Option<SearchState>,
+    ai_jobs: Vec<AiJob>,
+    ai_next_id: u64,
+    ai_rx: Receiver<AiEvent>,
+    ai_tx: Sender<AiEvent>,
+    show_ai_pane: bool,
+    ai_selected_idx: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +129,30 @@ enum Mode {
     SearchFile,          // searching by filename
     SearchContent,       // searching within content
     AnnotationList,
+}
+
+#[derive(Debug, Clone)]
+enum AiStatus {
+    Running,
+    Done { ok: bool },
+}
+
+#[derive(Debug, Clone)]
+struct AiJob {
+    id: u64,
+    annotation_id: i64,
+    annotation_type: AnnotationType,
+    file_path: String,
+    line: u32,
+    status: AiStatus,
+    output: String,
+    target: AiTarget,
+}
+
+#[derive(Debug)]
+enum AiEvent {
+    Output { job_id: u64, chunk: String },
+    Done { job_id: u64, ok: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +195,8 @@ struct Theme {
     annotation_fg: Color,
     todo_bg: Color,
     todo_fg: Color,
+    resolved_bg: Color,
+    resolved_fg: Color,
     annotation_marker: Color,
     status_bg: Color,
     status_fg: Color,
@@ -211,6 +245,8 @@ impl Default for Theme {
             annotation_fg: Color::Rgb(230, 245, 245),
             todo_bg: Color::Rgb(115, 86, 26),
             todo_fg: Color::Rgb(255, 245, 210),
+            resolved_bg: Color::Rgb(34, 40, 42),
+            resolved_fg: Color::Rgb(160, 170, 180),
             annotation_marker: Color::Rgb(255, 208, 96),
             status_bg: Color::Rgb(22, 24, 28),
             status_fg: Color::Rgb(150, 160, 170),
@@ -247,6 +283,7 @@ impl App {
     ) -> Self {
         let show_annotations = config.show_annotations;
         let side_by_side = config.side_by_side;
+        let (ai_tx, ai_rx) = mpsc::channel();
 
         Self {
             storage,
@@ -264,6 +301,7 @@ impl App {
             syntax_highlighter: SyntaxHighlighter::new(),
             mode: Mode::Normal,
             annotation_input: String::new(),
+            annotation_cursor: 0,
             annotation_type: AnnotationType::Comment,
             message: None,
             show_help: false,
@@ -275,6 +313,12 @@ impl App {
             pre_expand_position: None,
             search: None,
             annotation_list_idx: 0,
+            ai_jobs: Vec::new(),
+            ai_next_id: 1,
+            ai_rx,
+            ai_tx,
+            show_ai_pane: false,
+            ai_selected_idx: 0,
         }
     }
 
@@ -878,6 +922,7 @@ impl App {
         }
 
         self.annotation_input.clear();
+        self.annotation_cursor = 0;
         self.mode = Mode::Normal;
         Ok(())
     }
@@ -889,6 +934,7 @@ impl App {
         self.load_all_annotations()?;
         self.build_display_lines();
         self.annotation_input.clear();
+        self.annotation_cursor = 0;
         self.mode = Mode::Normal;
         Ok(())
     }
@@ -1047,6 +1093,24 @@ impl App {
             }
         }
 
+        if self.show_ai_pane {
+            match key.code {
+                KeyCode::Char('[') => {
+                    if self.ai_selected_idx > 0 {
+                        self.ai_selected_idx -= 1;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char(']') => {
+                    if self.ai_selected_idx + 1 < self.ai_jobs.len() {
+                        self.ai_selected_idx += 1;
+                    }
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => return Ok(true), // Quit
             KeyCode::Char('?') => self.show_help = !self.show_help,
@@ -1128,6 +1192,22 @@ impl App {
                 self.mode = Mode::AnnotationList;
                 self.annotation_list_idx = 0;
             }
+            KeyCode::Char('r') => {
+                if let Some(annotation) = self.get_annotation_for_current_line() {
+                    self.storage.resolve_annotation(annotation.id)?;
+                    self.load_all_annotations()?;
+                    self.build_display_lines();
+                    self.message = Some("Annotation resolved".to_string());
+                } else {
+                    self.message = Some("Move to an annotation to resolve".to_string());
+                }
+            }
+            KeyCode::Char('@') => {
+                self.spawn_ai_for_current_annotation()?;
+            }
+            KeyCode::Char('P') => {
+                self.show_ai_pane = !self.show_ai_pane;
+            }
             KeyCode::Char('s') => {
                 self.toggle_stage_current_hunk()?;
             }
@@ -1194,6 +1274,7 @@ impl App {
                 if let Some(DisplayLine::Diff { .. }) = self.current_display_line() {
                     self.mode = Mode::AddAnnotation;
                     self.annotation_input.clear();
+                    self.annotation_cursor = 0;
                 } else {
                     self.message = Some("Move to a diff line to add annotation".to_string());
                 }
@@ -1204,6 +1285,7 @@ impl App {
                     .map(|a| (a.id, a.content.clone(), a.annotation_type.clone()))
                 {
                     self.annotation_input = content;
+                    self.annotation_cursor = self.annotation_input.chars().count();
                     self.annotation_type = a_type;
                     self.mode = Mode::EditAnnotation(id);
                 }
@@ -1244,7 +1326,7 @@ impl App {
     fn handle_annotation_input(&mut self, key: KeyEvent) -> Result<bool> {
         // Ctrl+J inserts newline
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
-            self.annotation_input.push('\n');
+            self.insert_at_cursor('\n');
             return Ok(false);
         }
         // Ctrl+T toggles annotation type while editing/adding
@@ -1260,6 +1342,7 @@ impl App {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
                 self.annotation_input.clear();
+                self.annotation_cursor = 0;
             }
             KeyCode::Enter => {
                 // Plain Enter (no modifiers) saves
@@ -1275,10 +1358,31 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                self.annotation_input.pop();
+                self.backspace_at_cursor();
+            }
+            KeyCode::Delete => {
+                self.delete_at_cursor();
+            }
+            KeyCode::Left => {
+                self.move_cursor_left();
+            }
+            KeyCode::Right => {
+                self.move_cursor_right();
+            }
+            KeyCode::Up => {
+                self.move_cursor_up();
+            }
+            KeyCode::Down => {
+                self.move_cursor_down();
+            }
+            KeyCode::Home => {
+                self.move_cursor_line_start();
+            }
+            KeyCode::End => {
+                self.move_cursor_line_end();
             }
             KeyCode::Char(c) => {
-                self.annotation_input.push(c);
+                self.insert_at_cursor(c);
             }
             _ => {}
         }
@@ -1341,6 +1445,9 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = Mode::Normal;
             }
+            KeyCode::Char('P') => {
+                self.show_ai_pane = !self.show_ai_pane;
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.annotation_list_idx =
                     (self.annotation_list_idx + 1).min(entries.len().saturating_sub(1));
@@ -1380,6 +1487,62 @@ impl App {
         }
 
         Ok(false)
+    }
+
+    fn handle_ai_event(&mut self, evt: AiEvent) -> Result<()> {
+        match evt {
+            AiEvent::Output { job_id, chunk } => {
+                if let Some(job) = self.ai_jobs.iter_mut().find(|j| j.id == job_id) {
+                    match job.target {
+                        AiTarget::Claude => {
+                            if let Some(text) = extract_claude_text(&chunk) {
+                                job.output.push_str(&text);
+                            }
+                        }
+                        AiTarget::Codex => {
+                            job.output.push_str(&chunk);
+                        }
+                    }
+                }
+            }
+            AiEvent::Done { job_id, ok } => {
+                let mut resolve_target: Option<(i64, String)> = None;
+                if let Some(job) = self.ai_jobs.iter_mut().find(|j| j.id == job_id) {
+                    job.status = AiStatus::Done { ok };
+                    if ok {
+                        resolve_target = Some((job.annotation_id, job.output.clone()));
+                    }
+                }
+                if let Some((annotation_id, output)) = resolve_target {
+                    self.apply_ai_resolve(annotation_id, &output)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_ai_resolve(&mut self, annotation_id: i64, output: &str) -> Result<()> {
+        for line in output.lines() {
+            let line = line.trim();
+            if line == "RESOLVE_ANNOTATION" {
+                self.storage.resolve_annotation(annotation_id)?;
+                self.load_all_annotations()?;
+                self.build_display_lines();
+                return Ok(());
+            }
+            if let Some(rest) = line.strip_prefix("RESOLVE_ANNOTATION:") {
+                let id_str = rest.trim();
+                if let Ok(id) = id_str.parse::<i64>() {
+                    if id == annotation_id {
+                        self.storage.resolve_annotation(id)?;
+                        self.load_all_annotations()?;
+                        self.build_display_lines();
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn execute_search(&mut self) {
@@ -1629,6 +1792,80 @@ impl App {
         Ok(())
     }
 
+    fn spawn_ai_for_current_annotation(&mut self) -> Result<()> {
+        let annotation = if let Some(DisplayLine::Annotation { annotation, .. }) =
+            self.current_display_line()
+        {
+            annotation.clone()
+        } else if let Some(entry) = self.annotation_list_entries().get(self.annotation_list_idx) {
+            self.all_annotations
+                .iter()
+                .find(|a| a.id == entry.id)
+                .cloned()
+                .ok_or_else(|| anyhow!("Annotation not found"))?
+        } else if let Some(annotation) = self.get_annotation_for_current_line().cloned() {
+            annotation
+        } else {
+            self.message = Some("Move to an annotation to send to AI".to_string());
+            return Ok(());
+        };
+
+        let prompt = self.build_ai_prompt(&annotation);
+        let job_id = self.ai_next_id;
+        self.ai_next_id += 1;
+
+        let job = AiJob {
+            id: job_id,
+            annotation_id: annotation.id,
+            annotation_type: annotation.annotation_type.clone(),
+            file_path: annotation.file_path.clone(),
+            line: annotation.start_line,
+            status: AiStatus::Running,
+            output: String::new(),
+            target: self.config.ai_target.clone(),
+        };
+        self.ai_jobs.push(job);
+
+        let ai_target = self.config.ai_target.clone();
+        let repo_path = self.repo_path.clone();
+        let tx = self.ai_tx.clone();
+        std::thread::spawn(move || {
+            let result = run_ai_process(&ai_target, &prompt, &repo_path, |chunk| {
+                let _ = tx.send(AiEvent::Output {
+                    job_id,
+                    chunk: chunk.to_string(),
+                });
+            });
+            let ok = result.is_ok();
+            let _ = tx.send(AiEvent::Done { job_id, ok });
+        });
+
+        Ok(())
+    }
+
+    fn build_ai_prompt(&self, annotation: &Annotation) -> String {
+        let mut prompt = String::new();
+        prompt.push_str("You are a coding agent. Use the instruction below to act.\n\n");
+        prompt.push_str("Instruction:\n");
+        prompt.push_str(&format!(
+            "- Annotation ID: {}\n- File: {}\n- Line: {}\n- Side: {}\n- Type: {}\n",
+            annotation.id,
+            annotation.file_path,
+            annotation.start_line,
+            annotation.side.as_str(),
+            annotation.annotation_type.as_str()
+        ));
+        prompt.push_str("\nAnnotation:\n");
+        prompt.push_str(&annotation.content);
+        prompt.push_str("\n\nContext (before):\n");
+        prompt.push_str(&annotation.context_before);
+        prompt.push_str("\n\nContext (after):\n");
+        prompt.push_str(&annotation.context_after);
+        prompt.push_str("\n\nIf you complete the task, output a single line:\n");
+        prompt.push_str(&format!("RESOLVE_ANNOTATION: {}\n", annotation.id));
+        prompt
+    }
+
     fn toggle_diff_view(&mut self) -> Result<()> {
         let target = match self.diff_mode {
             DiffMode::Unstaged => DiffMode::Staged,
@@ -1875,11 +2112,136 @@ impl App {
                 annotation_type: a.annotation_type.clone(),
                 content: a.content.clone(),
                 display_idx: visible.get(&a.id).copied(),
+                resolved: a.resolved_at.is_some(),
             })
             .collect();
 
         entries.sort_by(|a, b| a.file_path.cmp(&b.file_path).then(a.line.cmp(&b.line)));
         entries
+    }
+
+    fn render_input_with_cursor(&self) -> String {
+        let mut chars: Vec<char> = self.annotation_input.chars().collect();
+        let cursor = self.annotation_cursor.min(chars.len());
+        chars.insert(cursor, '|');
+        chars.into_iter().collect()
+    }
+
+    fn insert_at_cursor(&mut self, ch: char) {
+        let mut chars: Vec<char> = self.annotation_input.chars().collect();
+        let cursor = self.annotation_cursor.min(chars.len());
+        chars.insert(cursor, ch);
+        self.annotation_cursor = cursor + 1;
+        self.annotation_input = chars.into_iter().collect();
+    }
+
+    fn backspace_at_cursor(&mut self) {
+        let mut chars: Vec<char> = self.annotation_input.chars().collect();
+        if self.annotation_cursor == 0 || chars.is_empty() {
+            return;
+        }
+        let idx = self.annotation_cursor.min(chars.len()) - 1;
+        chars.remove(idx);
+        self.annotation_cursor = idx;
+        self.annotation_input = chars.into_iter().collect();
+    }
+
+    fn delete_at_cursor(&mut self) {
+        let mut chars: Vec<char> = self.annotation_input.chars().collect();
+        if chars.is_empty() {
+            return;
+        }
+        let idx = self.annotation_cursor.min(chars.len());
+        if idx >= chars.len() {
+            return;
+        }
+        chars.remove(idx);
+        self.annotation_input = chars.into_iter().collect();
+    }
+
+    fn move_cursor_left(&mut self) {
+        if self.annotation_cursor > 0 {
+            self.annotation_cursor -= 1;
+        }
+    }
+
+    fn move_cursor_right(&mut self) {
+        let len = self.annotation_input.chars().count();
+        if self.annotation_cursor < len {
+            self.annotation_cursor += 1;
+        }
+    }
+
+    fn move_cursor_line_start(&mut self) {
+        let (line_start, _) = self.current_line_bounds();
+        self.annotation_cursor = line_start;
+    }
+
+    fn move_cursor_line_end(&mut self) {
+        let (_, line_end) = self.current_line_bounds();
+        self.annotation_cursor = line_end;
+    }
+
+    fn move_cursor_up(&mut self) {
+        let (line_start, _line_end, col) = self.current_line_bounds_with_col();
+        if line_start == 0 {
+            return;
+        }
+        let prev_end = line_start.saturating_sub(1);
+        let prev_start = self.line_start_at(prev_end);
+        let prev_len = prev_end.saturating_sub(prev_start);
+        self.annotation_cursor = prev_start + col.min(prev_len);
+    }
+
+    fn move_cursor_down(&mut self) {
+        let (_line_start, line_end, col) = self.current_line_bounds_with_col();
+        let len = self.annotation_input.chars().count();
+        if line_end >= len {
+            return;
+        }
+        let next_start = line_end + 1;
+        let next_end = self.line_end_at(next_start);
+        let next_len = next_end.saturating_sub(next_start);
+        self.annotation_cursor = next_start + col.min(next_len);
+    }
+
+    fn current_line_bounds(&self) -> (usize, usize) {
+        let (start, end, _) = self.current_line_bounds_with_col();
+        (start, end)
+    }
+
+    fn current_line_bounds_with_col(&self) -> (usize, usize, usize) {
+        let chars: Vec<char> = self.annotation_input.chars().collect();
+        let len = chars.len();
+        let cursor = self.annotation_cursor.min(len);
+        let line_start = self.line_start_at(cursor);
+        let line_end = self.line_end_at(cursor);
+        let col = cursor.saturating_sub(line_start);
+        (line_start, line_end, col)
+    }
+
+    fn line_start_at(&self, idx: usize) -> usize {
+        let chars: Vec<char> = self.annotation_input.chars().collect();
+        let mut i = idx.min(chars.len());
+        while i > 0 {
+            if chars[i - 1] == '\n' {
+                break;
+            }
+            i -= 1;
+        }
+        i
+    }
+
+    fn line_end_at(&self, idx: usize) -> usize {
+        let chars: Vec<char> = self.annotation_input.chars().collect();
+        let mut i = idx.min(chars.len());
+        while i < chars.len() {
+            if chars[i] == '\n' {
+                break;
+            }
+            i += 1;
+        }
+        i
     }
 
     /// Adjust scroll to keep cursor visible with vim-like margins
@@ -1950,9 +2312,15 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
     loop {
         terminal.draw(|f| ui(f, app))?;
 
-        if let Event::Key(key) = event::read()? {
-            if app.handle_input(key)? {
-                return Ok(());
+        while let Ok(evt) = app.ai_rx.try_recv() {
+            app.handle_ai_event(evt)?;
+        }
+
+        if event::poll(std::time::Duration::from_millis(50))? {
+            if let Event::Key(key) = event::read()? {
+                if app.handle_input(key)? {
+                    return Ok(());
+                }
             }
         }
     }
@@ -2003,6 +2371,10 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if matches!(app.mode, Mode::AnnotationList) {
         render_annotation_list(f, app, theme);
+    }
+
+    if app.show_ai_pane {
+        render_ai_pane(f, app, theme);
     }
 }
 
@@ -2255,17 +2627,32 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 }
                 DisplayLine::Annotation { annotation, .. } => {
                     // Annotation in a prominent box - handle multiple lines
+                    let resolved = annotation.resolved_at.is_some();
                     let (prefix, style) = match annotation.annotation_type {
                         AnnotationType::Comment => (
-                            "    💬 ",
-                            Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg),
+                            if resolved { "    ✓ RESOLVED " } else { "    💬 " },
+                            if resolved {
+                                Style::default()
+                                    .fg(theme.resolved_fg)
+                                    .bg(theme.resolved_bg)
+                                    .add_modifier(Modifier::ITALIC)
+                            } else {
+                                Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg)
+                            },
                         ),
                         AnnotationType::Todo => (
-                            "    📌 ",
-                            Style::default()
-                                .fg(theme.todo_fg)
-                                .bg(theme.todo_bg)
-                                .add_modifier(Modifier::BOLD),
+                            if resolved { "    ✓ RESOLVED " } else { "    📌 " },
+                            if resolved {
+                                Style::default()
+                                    .fg(theme.resolved_fg)
+                                    .bg(theme.resolved_bg)
+                                    .add_modifier(Modifier::ITALIC)
+                            } else {
+                                Style::default()
+                                    .fg(theme.todo_fg)
+                                    .bg(theme.todo_bg)
+                                    .add_modifier(Modifier::BOLD)
+                            },
                         ),
                     };
 
@@ -2473,17 +2860,32 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
             }
             DisplayLine::Annotation { annotation, .. } => {
                 // Annotation in a prominent box - handle multiple lines
+                let resolved = annotation.resolved_at.is_some();
                 let (prefix, style) = match annotation.annotation_type {
                     AnnotationType::Comment => (
-                        "   💬 ",
-                        Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg),
+                        if resolved { "   ✓ RESOLVED " } else { "   💬 " },
+                        if resolved {
+                            Style::default()
+                                .fg(theme.resolved_fg)
+                                .bg(theme.resolved_bg)
+                                .add_modifier(Modifier::ITALIC)
+                        } else {
+                            Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg)
+                        },
                     ),
                     AnnotationType::Todo => (
-                        "   📌 ",
-                        Style::default()
-                            .fg(theme.todo_fg)
-                            .bg(theme.todo_bg)
-                            .add_modifier(Modifier::BOLD),
+                        if resolved { "   ✓ RESOLVED " } else { "   📌 " },
+                        if resolved {
+                            Style::default()
+                                .fg(theme.resolved_fg)
+                                .bg(theme.resolved_bg)
+                                .add_modifier(Modifier::ITALIC)
+                        } else {
+                            Style::default()
+                                .fg(theme.todo_fg)
+                                .bg(theme.todo_bg)
+                                .add_modifier(Modifier::BOLD)
+                        },
                     ),
                 };
 
@@ -2532,22 +2934,28 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 DiffMode::Staged => "[staged] ",
                 _ => "",
             };
+            let ai_running = app.ai_jobs.iter().filter(|j| matches!(j.status, AiStatus::Running)).count();
+            let ai_suffix = if ai_running > 0 {
+                format!("  AI: running ({})", ai_running)
+            } else {
+                String::new()
+            };
             let content = if let Some(msg) = &app.message {
-                format!("{}{}", mode_label, msg)
+                format!("{}{}{}", mode_label, msg, ai_suffix)
             } else if app.expanded_file.is_some() {
                 format!(
-                    "{} j/k:line  n/N:chunk  ^d/^u:page  x:collapse  c:collapse  s:stage  u:toggle  v:view  A:list  a:annotate  ?:help  q:quit",
-                    mode_label
+                    "{} j/k:line  n/N:chunk  ^d/^u:page  x:collapse  c:collapse  s:stage  u:toggle  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
+                    mode_label, ai_suffix
                 )
             } else if app.search.is_some() {
                 format!(
-                    "{} n/N:match  Esc:clear  j/k:nav  Tab:file  c:collapse  x:expand  s:stage  u:toggle  v:view  A:list  a:annotate  ?:help  q:quit",
-                    mode_label
+                    "{} n/N:match  Esc:clear  j/k:nav  Tab:file  c:collapse  x:expand  s:stage  u:toggle  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
+                    mode_label, ai_suffix
                 )
             } else {
                 format!(
-                    "{} j/k:nav  n/N:chunk  Tab:file  c:collapse  f:find  /:search  x:expand  s:stage  u:toggle  v:view  A:list  a:annotate  ?:help  q:quit",
-                    mode_label
+                    "{} j/k:nav  n/N:chunk  Tab:file  c:collapse  f:find  /:search  x:expand  s:stage  u:toggle  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
+                    mode_label, ai_suffix
                 )
             };
             let status = Paragraph::new(content)
@@ -2568,7 +2976,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 _ => String::new(),
             };
 
-            let input_with_cursor = format!("{}_", app.annotation_input);
+            let input_with_cursor = app.render_input_with_cursor();
 
             let input = Paragraph::new(input_with_cursor)
                 .style(Style::default().fg(theme.header_fg).bg(theme.surface_alt))
@@ -2643,12 +3051,15 @@ fn render_help(f: &mut Frame, theme: Theme) {
         "    v         Toggle side-by-side view",
         "    s         Stage/unstage current hunk",
         "    u         Toggle staged/unstaged view",
+        "    @         Send annotation to AI",
+        "    P         Toggle AI pane",
         "    A         Annotation list",
         "",
         "  Annotations:",
         "    a         Add annotation at current line",
         "    e         Edit annotation at current line",
         "    d         Delete annotation at current line",
+        "    r         Resolve annotation at current line",
         "    t         Toggle annotation type (comment/todo)",
         "",
         "  Other:",
@@ -2659,6 +3070,9 @@ fn render_help(f: &mut Frame, theme: Theme) {
         "    Enter     Save annotation",
         "    Ctrl+j    Add newline",
         "    Ctrl+t    Toggle annotation type",
+        "    Arrows    Move cursor",
+        "    Home/End  Line start/end",
+        "    Del/BS    Delete",
         "    Esc       Cancel",
         "",
     ];
@@ -2678,6 +3092,118 @@ fn render_help(f: &mut Frame, theme: Theme) {
     f.render_widget(help, area);
 }
 
+fn run_ai_process<F>(
+    target: &AiTarget,
+    prompt: &str,
+    repo_path: &PathBuf,
+    mut on_output: F,
+) -> Result<()>
+where
+    F: FnMut(&str),
+{
+    let mut cmd = match target {
+        AiTarget::Codex => {
+            let mut cmd = Command::new("codex");
+            cmd.arg("exec").arg(prompt);
+            cmd
+        }
+        AiTarget::Claude => {
+            let mut cmd = Command::new("claude");
+            cmd.arg("-p")
+                .arg("--verbose")
+                .arg("--output-format")
+                .arg("stream-json")
+                .arg("--include-partial-messages")
+                .arg("--")
+                .arg(prompt);
+            cmd
+        }
+    };
+
+    cmd.current_dir(repo_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| anyhow!(e))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let (tx, rx) = mpsc::channel::<String>();
+
+    if let Some(out) = stdout {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(out);
+            let mut buf = String::new();
+            while reader.read_line(&mut buf).is_ok() {
+                if buf.is_empty() {
+                    break;
+                }
+                let _ = tx.send(buf.clone());
+                buf.clear();
+            }
+        });
+    }
+
+    if let Some(err) = stderr {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(err);
+            let mut buf = String::new();
+            while reader.read_line(&mut buf).is_ok() {
+                if buf.is_empty() {
+                    break;
+                }
+                let _ = tx.send(buf.clone());
+                buf.clear();
+            }
+        });
+    }
+
+    drop(tx);
+
+    for line in rx.iter() {
+        on_output(&line);
+    }
+
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("AI process failed"))
+    }
+}
+
+fn extract_claude_text(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return None;
+    };
+
+    let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if event_type == "content_block_delta" {
+        if let Some(text) = value
+            .get("delta")
+            .and_then(|d| d.get("text"))
+            .and_then(|t| t.as_str())
+        {
+            return Some(text.to_string());
+        }
+    }
+    if event_type == "message_delta" {
+        if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
+            return Some(text.to_string());
+        }
+    }
+    if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
+        return Some(text.to_string());
+    }
+    None
+}
+
 #[derive(Clone)]
 struct AnnotationListEntry {
     id: i64,
@@ -2687,6 +3213,7 @@ struct AnnotationListEntry {
     annotation_type: AnnotationType,
     content: String,
     display_idx: Option<usize>,
+    resolved: bool,
 }
 
 fn render_annotation_list(f: &mut Frame, app: &mut App, theme: Theme) {
@@ -2720,6 +3247,7 @@ fn render_annotation_list(f: &mut Frame, app: &mut App, theme: Theme) {
             let idx = start + offset;
             let is_selected = idx == app.annotation_list_idx;
             let is_orphaned = entry.display_idx.is_none();
+            let resolved = entry.resolved;
 
             let type_marker = match entry.annotation_type {
                 AnnotationType::Comment => "💬",
@@ -2740,11 +3268,15 @@ fn render_annotation_list(f: &mut Frame, app: &mut App, theme: Theme) {
                 "{} {}:{} [{}] {}",
                 type_marker, entry.file_path, entry.line, side_marker, content
             );
-            if is_orphaned {
+            if resolved {
+                label.push_str("  (resolved)");
+            } else if is_orphaned {
                 label.push_str("  (orphaned)");
             }
 
-            let mut style = if is_orphaned {
+            let mut style = if resolved {
+                Style::default().fg(theme.line_num)
+            } else if is_orphaned {
                 Style::default().fg(theme.deleted_fg)
             } else {
                 Style::default().fg(theme.help_fg)
@@ -2769,6 +3301,79 @@ fn render_annotation_list(f: &mut Frame, app: &mut App, theme: Theme) {
 
     f.render_widget(Clear, area);
     f.render_widget(list, area);
+}
+
+fn render_ai_pane(f: &mut Frame, app: &mut App, theme: Theme) {
+    let area = centered_rect(96, 60, f.area());
+    let mut lines: Vec<Line> = Vec::new();
+
+    if app.ai_jobs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No AI activity",
+            Style::default().fg(theme.help_fg),
+        )));
+    } else {
+        let mut tabs: Vec<Span> = Vec::new();
+        for (idx, job) in app.ai_jobs.iter().enumerate() {
+            let status = match job.status {
+                AiStatus::Running => "…",
+                AiStatus::Done { ok } => {
+                    if ok { "✓" } else { "!" }
+                }
+            };
+            let label = format!(" {}#{}{} ", status, job.annotation_id, if job.annotation_type == AnnotationType::Todo { "T" } else { "C" });
+            let style = if idx == app.ai_selected_idx {
+                Style::default()
+                    .fg(theme.header_match_fg)
+                    .bg(theme.header_match_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.help_fg)
+            };
+            tabs.push(Span::styled(label, style));
+        }
+        lines.push(Line::from(tabs));
+        lines.push(Line::from(""));
+
+        let idx = app.ai_selected_idx.min(app.ai_jobs.len().saturating_sub(1));
+        let job = &app.ai_jobs[idx];
+        let status = match job.status {
+            AiStatus::Running => "running",
+            AiStatus::Done { ok } => if ok { "done" } else { "error" },
+        };
+        let header = format!(
+            "[{}] #{} {}:{} ({})",
+            status, job.annotation_id, job.file_path, job.line, job.annotation_type.as_str()
+        );
+        lines.push(Line::from(Span::styled(
+            header,
+            Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD),
+        )));
+
+        let mut output = job.output.replace('\t', " ");
+        if output.len() > 2000 {
+            output = format!("...{}", &output[output.len() - 2000..]);
+        }
+        let tail_lines: Vec<&str> = output.lines().rev().take(20).collect();
+        for line in tail_lines.iter().rev() {
+            lines.push(Line::from(Span::styled(
+                (*line).to_string(),
+                Style::default().fg(theme.help_fg),
+            )));
+        }
+    }
+
+    let pane = Paragraph::new(lines)
+        .style(Style::default().bg(theme.help_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" AI (P toggle, [/] switch) ")
+                .border_style(Style::default().fg(theme.border)),
+        );
+
+    f.render_widget(Clear, area);
+    f.render_widget(pane, area);
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

@@ -16,8 +16,21 @@ pub struct Config {
     pub context_lines: u32,
     /// Show annotation content inline (default true)
     pub show_annotations: bool,
-    /// Enable syntax highlighting for code in diffs (default true)
     pub syntax_highlighting: bool,
+    pub ai_target: AiTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AiTarget {
+    Claude,
+    Codex,
+}
+
+impl Default for AiTarget {
+    fn default() -> Self {
+        AiTarget::Claude
+    }
 }
 
 impl Default for Config {
@@ -27,6 +40,7 @@ impl Default for Config {
             context_lines: 3,
             show_annotations: true,
             syntax_highlighting: true,
+            ai_target: AiTarget::default(),
         }
     }
 }
