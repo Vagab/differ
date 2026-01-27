@@ -27,6 +27,7 @@ tree-sitter-elixir = "0.3"
 sha2 = "0.10"
 toml = "0.8"
 regex = "1.10"
+unicode-width = "0.1"
 
 [dev-dependencies]
 tempfile = "3.10"

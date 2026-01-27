@@ -27,6 +27,7 @@ use std::io::{self, BufRead, Stdout, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
 const REATTACH_WINDOW: i32 = 5;
@@ -2607,23 +2608,29 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         Style::default().fg(theme.annotation_marker)
                     };
 
-                    let mut spans = vec![
+                    let prefix_spans = vec![
                         Span::styled(annotation_marker, marker_style),
                         Span::styled(line_num, line_num_style),
                         Span::raw(" "),
+                        Span::styled(format!("{} ", prefix), content_style),
                     ];
 
                     let content_spans = build_highlighted_spans(
-                        prefix,
                         &line.content,
                         &line.highlights,
                         content_style,
                         is_current,
                         theme,
                     );
-                    spans.extend(content_spans);
 
-                    ListItem::new(Line::from(spans))
+                    let lines = wrap_spans_with_prefix(
+                        prefix_spans,
+                        content_spans,
+                        area.width as usize,
+                        content_style,
+                    );
+
+                    ListItem::new(lines)
                 }
                 DisplayLine::Annotation { annotation, .. } => {
                     // Annotation in a prominent box - handle multiple lines
@@ -2819,42 +2826,50 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     LineKind::Deletion => {
                         let old_no = line.old_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg);
-                        let mut left_spans = vec![
+                        let left_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(old_no, line_num_style),
+                            Span::styled("- ", content_style),
                         ];
-                        left_spans.extend(build_highlighted_spans("-", &line.content, &line.highlights, content_style, is_current, theme));
-                        left_items.push(ListItem::new(Line::from(left_spans)));
+                        let content_spans = build_highlighted_spans(&line.content, &line.highlights, content_style, is_current, theme);
+                        let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
+                        left_items.push(ListItem::new(lines));
                         right_items.push(ListItem::new(Line::from("")));
                     }
                     LineKind::Addition => {
                         let new_no = line.new_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(theme.added_fg).bg(theme.added_bg);
                         left_items.push(ListItem::new(Line::from("")));
-                        let mut right_spans = vec![
+                        let right_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(new_no, line_num_style),
+                            Span::styled("+ ", content_style),
                         ];
-                        right_spans.extend(build_highlighted_spans("+", &line.content, &line.highlights, content_style, is_current, theme));
-                        right_items.push(ListItem::new(Line::from(right_spans)));
+                        let content_spans = build_highlighted_spans(&line.content, &line.highlights, content_style, is_current, theme);
+                        let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
+                        right_items.push(ListItem::new(lines));
                     }
                     LineKind::Context => {
                         let old_no = line.old_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let new_no = line.new_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(theme.context_fg);
-                        let mut left_spans = vec![
+                        let left_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(old_no, line_num_style),
+                            Span::styled("  ", content_style),
                         ];
-                        left_spans.extend(build_highlighted_spans(" ", &line.content, &line.highlights, content_style, is_current, theme));
-                        left_items.push(ListItem::new(Line::from(left_spans)));
+                        let content_spans = build_highlighted_spans(&line.content, &line.highlights, content_style, is_current, theme);
+                        let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
+                        left_items.push(ListItem::new(lines));
 
-                        let mut right_spans = vec![
+                        let right_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(new_no, line_num_style),
+                            Span::styled("  ", content_style),
                         ];
-                        right_spans.extend(build_highlighted_spans(" ", &line.content, &line.highlights, content_style, is_current, theme));
-                        right_items.push(ListItem::new(Line::from(right_spans)));
+                        let content_spans = build_highlighted_spans(&line.content, &line.highlights, content_style, is_current, theme);
+                        let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
+                        right_items.push(ListItem::new(lines));
                     }
                 }
             }
@@ -3414,14 +3429,13 @@ fn token_color(token_type: TokenType, theme: Theme) -> Color {
 }
 
 /// Build spans with syntax highlighting for a diff line
-fn build_highlighted_spans<'a>(
-    prefix: &'a str,
-    content: &'a str,
+fn build_highlighted_spans(
+    content: &str,
     highlights: &[HighlightRange],
     base_style: Style,
     is_current: bool,
     theme: Theme,
-) -> Vec<Span<'a>> {
+) -> Vec<Span<'static>> {
     let base_style = if is_current {
         base_style
             .bg(theme.current_line_bg)
@@ -3430,15 +3444,13 @@ fn build_highlighted_spans<'a>(
         base_style
     };
 
-    let mut spans = vec![Span::styled(format!("{} ", prefix), base_style)];
-
     if highlights.is_empty() {
-        spans.push(Span::styled(content.to_string(), base_style));
-        return spans;
+        return vec![Span::styled(content.to_string(), base_style)];
     }
 
     let content_bytes = content.as_bytes();
     let mut pos = 0;
+    let mut spans: Vec<Span<'static>> = Vec::new();
 
     for highlight in highlights {
         // Ensure we don't go out of bounds
@@ -3478,4 +3490,94 @@ fn build_highlighted_spans<'a>(
     }
 
     spans
+}
+
+fn span_width(span: &Span) -> usize {
+    span.content.width()
+}
+
+fn split_by_width(s: &str, max_width: usize) -> (String, String) {
+    if max_width == 0 || s.is_empty() {
+        return (String::new(), s.to_string());
+    }
+    let mut width = 0usize;
+    let mut split_idx = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width {
+            break;
+        }
+        width += ch_width;
+        split_idx = idx + ch.len_utf8();
+    }
+    let head = s[..split_idx].to_string();
+    let tail = s[split_idx..].to_string();
+    (head, tail)
+}
+
+fn wrap_spans(content_spans: &[Span<'static>], max_width: usize) -> Vec<Vec<Span<'static>>> {
+    if max_width == 0 {
+        return vec![Vec::new()];
+    }
+
+    let mut lines: Vec<Vec<Span>> = vec![Vec::new()];
+    let mut line_width = 0usize;
+
+    for span in content_spans {
+        let mut text = span.content.to_string();
+        while !text.is_empty() {
+            let remaining = max_width.saturating_sub(line_width);
+            if remaining == 0 {
+                lines.push(Vec::new());
+                line_width = 0;
+                continue;
+            }
+            let (head, tail) = split_by_width(&text, remaining);
+            if !head.is_empty() {
+                line_width += head.width();
+                lines
+                    .last_mut()
+                    .unwrap()
+                    .push(Span::styled(head, span.style));
+            }
+            text = tail;
+            if !text.is_empty() {
+                lines.push(Vec::new());
+                line_width = 0;
+            }
+        }
+    }
+
+    lines
+}
+
+fn wrap_spans_with_prefix(
+    prefix_spans: Vec<Span<'static>>,
+    content_spans: Vec<Span<'static>>,
+    max_width: usize,
+    continuation_style: Style,
+) -> Vec<Line<'static>> {
+    let prefix_width: usize = prefix_spans.iter().map(span_width).sum();
+    let content_width = max_width.saturating_sub(prefix_width);
+    let wrapped = wrap_spans(&content_spans, content_width.max(1));
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, spans) in wrapped.into_iter().enumerate() {
+        if idx == 0 {
+            let mut all = prefix_spans.clone();
+            all.extend(spans);
+            lines.push(Line::from(all));
+        } else {
+            let indent = " ".repeat(prefix_width);
+            let mut all = vec![Span::styled(indent, continuation_style)];
+            all.extend(spans);
+            lines.push(Line::from(all));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(prefix_spans));
+    }
+
+    lines
 }
