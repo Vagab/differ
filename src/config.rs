@@ -17,6 +17,8 @@ pub struct Config {
     /// Show annotation content inline (default true)
     pub show_annotations: bool,
     pub syntax_highlighting: bool,
+    /// Syntax theme name (syntect/bat theme)
+    pub syntax_theme: Option<String>,
     pub ai_target: AiTarget,
 }
 
@@ -40,6 +42,7 @@ impl Default for Config {
             context_lines: 3,
             show_annotations: true,
             syntax_highlighting: true,
+            syntax_theme: None,
             ai_target: AiTarget::default(),
         }
     }

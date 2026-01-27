@@ -7,7 +7,7 @@ use crate::diff::{
     DiffEngine, DiffFile, DiffHunk, DiffLine, DiffMode, FileStatus, HighlightRange, LineKind,
 };
 use crate::storage::{Annotation, AnnotationType, Side, Storage};
-use crate::syntax::{SyntaxHighlighter, TokenType};
+use crate::syntax::SyntaxHighlighter;
 use anyhow::{anyhow, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -32,6 +32,58 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const REATTACH_CONTEXT_LINES: usize = 2;
 const REATTACH_WINDOW: i32 = 5;
 const REATTACH_THRESHOLD: f32 = 0.7;
+
+const HELP_TEXT: &[&str] = &[
+    "",
+    "  Navigation:",
+    "    j / Down  Move down line by line",
+    "    k / Up    Move up line by line",
+    "    n / N     Next / previous chunk",
+    "    Tab       Next file",
+    "    Shift+Tab Previous file",
+    "    Ctrl+d    Half page down",
+    "    Ctrl+u    Half page up",
+    "    g         Go to start",
+    "    G         Go to end",
+    "",
+    "  Search:",
+    "    f         Search by filename (regex)",
+    "    /         Search in content (regex)",
+    "    n / N     Next / previous match (when searching)",
+    "    Esc       Clear search",
+    "",
+    "  View:",
+    "    x         Expand/collapse current file (full view)",
+    "    c         Collapse/expand current file",
+    "    v         Toggle side-by-side view",
+    "    s         Stage/unstage current hunk",
+    "    u         Toggle staged/unstaged view",
+    "    R         Reload diff",
+    "    @         Send annotation to AI",
+    "    P         Toggle AI pane",
+    "    A         Annotation list",
+    "",
+    "  Annotations:",
+    "    a         Add annotation at current line",
+    "    e         Edit annotation at current line",
+    "    d         Delete annotation at current line",
+    "    r         Resolve annotation at current line",
+    "    t         Toggle annotation type (comment/todo)",
+    "",
+    "  Other:",
+    "    ?         Toggle this help",
+    "    q         Quit",
+    "",
+    "  In annotation mode:",
+    "    Enter     Save annotation",
+    "    Ctrl+j    Add newline",
+    "    Ctrl+t    Toggle annotation type",
+    "    Arrows    Move cursor",
+    "    Home/End  Line start/end",
+    "    Del/BS    Delete",
+    "    Esc       Cancel",
+    "",
+];
 
 /// Represents a line in the unified display
 #[derive(Debug, Clone)]
@@ -103,11 +155,16 @@ pub struct App {
     annotation_type: AnnotationType,
     message: Option<String>,
     show_help: bool,
+    help_scroll: usize,
+    help_visible_height: usize,
     show_annotations: bool,
     side_by_side: bool,
     visible_height: usize,
     expanded_file: Option<usize>, // When Some, only show this file
-    collapsed_files: HashSet<usize>,
+    collapsed_files: HashSet<String>,
+    collapsed_files_unstaged: HashSet<String>,
+    collapsed_files_staged: HashSet<String>,
+    collapsed_files_other: HashSet<String>,
     // Position to restore when collapsing expanded view
     pre_expand_position: Option<(usize, usize)>, // (line_idx, scroll_offset)
     annotation_list_idx: usize,
@@ -206,17 +263,6 @@ struct Theme {
     help_bg: Color,
     help_fg: Color,
     border: Color,
-    token_keyword: Color,
-    token_string: Color,
-    token_comment: Color,
-    token_function: Color,
-    token_type: Color,
-    token_number: Color,
-    token_operator: Color,
-    token_variable: Color,
-    token_atom: Color,
-    token_module: Color,
-    token_default: Color,
 }
 
 impl Default for Theme {
@@ -256,17 +302,6 @@ impl Default for Theme {
             help_bg: Color::Rgb(30, 34, 42),
             help_fg: Color::Rgb(220, 230, 240),
             border: Color::Rgb(210, 175, 90),
-            token_keyword: Color::Rgb(205, 140, 255),
-            token_string: Color::Rgb(255, 206, 120),
-            token_comment: Color::Rgb(120, 130, 140),
-            token_function: Color::Rgb(120, 190, 255),
-            token_type: Color::Rgb(120, 220, 210),
-            token_number: Color::Rgb(240, 170, 170),
-            token_operator: Color::Rgb(220, 224, 230),
-            token_variable: Color::Rgb(150, 210, 255),
-            token_atom: Color::Rgb(130, 220, 210),
-            token_module: Color::Rgb(240, 215, 140),
-            token_default: Color::Rgb(220, 224, 230),
         }
     }
 }
@@ -281,12 +316,14 @@ impl App {
         config: Config,
         diff_mode: DiffMode,
         diff_paths: Vec<String>,
-    ) -> Self {
+    ) -> Result<Self> {
         let show_annotations = config.show_annotations;
         let side_by_side = config.side_by_side;
         let (ai_tx, ai_rx) = mpsc::channel();
 
-        Self {
+        let syntax_theme = config.syntax_theme.clone();
+
+        Ok(Self {
             storage,
             diff_engine,
             repo_path,
@@ -299,18 +336,23 @@ impl App {
             current_line_idx: 0,
             scroll_offset: 0,
             all_annotations: Vec::new(),
-            syntax_highlighter: SyntaxHighlighter::new(),
+            syntax_highlighter: SyntaxHighlighter::new(syntax_theme.as_deref())?,
             mode: Mode::Normal,
             annotation_input: String::new(),
             annotation_cursor: 0,
             annotation_type: AnnotationType::Comment,
             message: None,
             show_help: false,
+            help_scroll: 0,
+            help_visible_height: 0,
             show_annotations,
             side_by_side,
             visible_height: 20, // Will be updated on first render
             expanded_file: None,
             collapsed_files: HashSet::new(),
+            collapsed_files_unstaged: HashSet::new(),
+            collapsed_files_staged: HashSet::new(),
+            collapsed_files_other: HashSet::new(),
             pre_expand_position: None,
             search: None,
             annotation_list_idx: 0,
@@ -320,7 +362,7 @@ impl App {
             ai_tx,
             show_ai_pane: false,
             ai_selected_idx: 0,
-        }
+        })
     }
 
     /// Load all annotations for all files and build the display lines
@@ -597,7 +639,7 @@ impl App {
                 file_idx,
             });
 
-            if self.collapsed_files.contains(&file_idx) && expanded_file.is_none() {
+            if self.collapsed_files.contains(&file_path) && expanded_file.is_none() {
                 continue;
             }
 
@@ -610,8 +652,114 @@ impl App {
         }
     }
 
+    fn git_show(&self, spec: &str) -> Option<String> {
+        let output = Command::new("git")
+            .arg("show")
+            .arg(spec)
+            .current_dir(&self.repo_path)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).to_string())
+        } else {
+            None
+        }
+    }
+
+    fn read_working_file(&self, path: &str) -> Option<String> {
+        let full_path = self.repo_path.join(path);
+        std::fs::read(&full_path)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn build_highlight_map(&mut self, content: &str, file_path: &str) -> Vec<Vec<HighlightRange>> {
+        let per_line = self.syntax_highlighter.highlight_file(content, file_path);
+        per_line
+            .into_iter()
+            .map(|line_hl| {
+                line_hl
+                    .into_iter()
+                    .map(|h| HighlightRange {
+                        start: h.start,
+                        end: h.end,
+                        style: h.style,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn load_highlight_maps(
+        &mut self,
+        file: &DiffFile,
+        old_path: Option<&str>,
+        new_path: Option<&str>,
+    ) -> (Vec<Vec<HighlightRange>>, Vec<Vec<HighlightRange>>) {
+        if !self.config.syntax_highlighting {
+            return (Vec::new(), Vec::new());
+        }
+
+        let (mut old_content, mut new_content) = (None, None);
+        match self.diff_mode {
+            DiffMode::Unstaged => {
+                if let Some(path) = old_path {
+                    old_content = self.git_show(&format!(":{}", path));
+                }
+                if let Some(path) = new_path {
+                    new_content = self.read_working_file(path);
+                }
+            }
+            DiffMode::Staged => {
+                if let Some(path) = old_path {
+                    old_content = self.git_show(&format!("HEAD:{}", path));
+                }
+                if let Some(path) = new_path {
+                    new_content = self.git_show(&format!(":{}", path));
+                }
+            }
+            _ => {
+                if let Some(path) = new_path.or(old_path) {
+                    new_content = self.read_working_file(path);
+                }
+            }
+        }
+
+        if file.status == FileStatus::Added {
+            old_content = None;
+        }
+        if file.status == FileStatus::Deleted {
+            new_content = None;
+        }
+
+        let old_map = old_content
+            .as_ref()
+            .map(|c| self.build_highlight_map(c, old_path.unwrap_or("")))
+            .unwrap_or_default();
+        let new_map = new_content
+            .as_ref()
+            .map(|c| self.build_highlight_map(c, new_path.or(old_path).unwrap_or("")))
+            .unwrap_or_default();
+
+        (old_map, new_map)
+    }
+
     /// Build display lines for diff hunks (normal mode)
     fn build_diff_hunk_lines(&mut self, file_idx: usize, file: &DiffFile, file_path: &str) {
+        let old_path = file
+            .old_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
+        let new_path = file
+            .new_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
+        let (old_map, new_map) = self.load_highlight_maps(
+            file,
+            old_path.as_deref(),
+            new_path.as_deref().or(old_path.as_deref()),
+        );
+
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             // Count additions and deletions in this hunk
             let additions = hunk.lines.iter().filter(|l| l.kind == LineKind::Addition).count();
@@ -632,7 +780,7 @@ impl App {
 
             for line in &hunk.lines {
                 let mut highlighted_line = line.clone();
-                self.highlight_line(&mut highlighted_line, file_path);
+                self.highlight_from_maps(&mut highlighted_line, &old_map, &new_map);
 
                 self.display_lines.push(DisplayLine::Diff {
                     line: highlighted_line.clone(),
@@ -656,7 +804,7 @@ impl App {
         // Build maps of line changes from diff hunks
         // Key: new_line_no for additions/context, old_line_no for deletions
         let mut additions: HashMap<u32, String> = HashMap::new();
-        let mut deletions: Vec<(u32, String)> = Vec::new(); // (insert_after_new_line, content)
+        let mut deletions: Vec<(u32, u32, String)> = Vec::new(); // (insert_after_new_line, old_line_no, content)
 
         for hunk in &file.hunks {
             let mut last_new_line: u32 = hunk.new_start.saturating_sub(1);
@@ -669,7 +817,9 @@ impl App {
                         }
                     }
                     LineKind::Deletion => {
-                        deletions.push((last_new_line, line.content.clone()));
+                        if let Some(old_no) = line.old_line_no {
+                            deletions.push((last_new_line, old_no, line.content.clone()));
+                        }
                     }
                     LineKind::Context => {
                         if let Some(n) = line.new_line_no {
@@ -684,22 +834,33 @@ impl App {
         let full_path = self.repo_path.join(file_path);
         let file_content = std::fs::read_to_string(&full_path).unwrap_or_default();
         let file_lines: Vec<&str> = file_content.lines().collect();
+        let file_highlights = if self.config.syntax_highlighting {
+            self.syntax_highlighter
+                .highlight_file(&file_content, file_path)
+        } else {
+            Vec::new()
+        };
+        let (old_map, _) = self.load_highlight_maps(
+            file,
+            file.old_path.as_ref().map(|p| p.to_string_lossy().to_string()).as_deref(),
+            file.new_path.as_ref().map(|p| p.to_string_lossy().to_string()).as_deref(),
+        );
 
         // Show all lines with changes highlighted
         for (idx, content) in file_lines.iter().enumerate() {
             let line_no = (idx + 1) as u32;
 
             // First, show any deletions that come before this line
-            for (insert_after, del_content) in &deletions {
+            for (insert_after, old_no, del_content) in &deletions {
                 if *insert_after == line_no.saturating_sub(1) {
                     let mut del_line = DiffLine {
                         kind: LineKind::Deletion,
-                        old_line_no: None,
+                        old_line_no: Some(*old_no),
                         new_line_no: None,
                         content: del_content.clone(),
                         highlights: Vec::new(),
                     };
-                    self.highlight_line(&mut del_line, file_path);
+                    self.highlight_from_maps(&mut del_line, &old_map, &[]);
                     self.display_lines.push(DisplayLine::Diff {
                         line: del_line,
                         file_idx,
@@ -723,7 +884,16 @@ impl App {
                 content: content.to_string(),
                 highlights: Vec::new(),
             };
-            self.highlight_line(&mut diff_line, file_path);
+            if let Some(line_hl) = file_highlights.get(idx) {
+                diff_line.highlights = line_hl
+                    .iter()
+                    .map(|h| HighlightRange {
+                        start: h.start,
+                        end: h.end,
+                        style: h.style,
+                    })
+                    .collect();
+            }
 
             self.display_lines.push(DisplayLine::Diff {
                 line: diff_line.clone(),
@@ -737,16 +907,16 @@ impl App {
 
         // Show any trailing deletions
         let last_line = file_lines.len() as u32;
-        for (insert_after, del_content) in &deletions {
+        for (insert_after, old_no, del_content) in &deletions {
             if *insert_after >= last_line {
                 let mut del_line = DiffLine {
                     kind: LineKind::Deletion,
-                    old_line_no: None,
+                    old_line_no: Some(*old_no),
                     new_line_no: None,
                     content: del_content.clone(),
                     highlights: Vec::new(),
                 };
-                self.highlight_line(&mut del_line, file_path);
+                self.highlight_from_maps(&mut del_line, &old_map, &[]);
                 self.display_lines.push(DisplayLine::Diff {
                     line: del_line,
                     file_idx,
@@ -784,22 +954,29 @@ impl App {
         }
     }
 
-    /// Add syntax highlighting to a diff line
-    fn highlight_line(&mut self, line: &mut DiffLine, file_path: &str) {
+    fn highlight_from_maps(
+        &self,
+        line: &mut DiffLine,
+        old_map: &[Vec<HighlightRange>],
+        new_map: &[Vec<HighlightRange>],
+    ) {
         if !self.config.syntax_highlighting {
             return;
         }
 
-        let syntax_highlights = self.syntax_highlighter.highlight_for_file(&line.content, file_path);
+        let highlights = match line.kind {
+            LineKind::Addition | LineKind::Context => {
+                line.new_line_no
+                    .and_then(|n| new_map.get(n.saturating_sub(1) as usize))
+            }
+            LineKind::Deletion => line
+                .old_line_no
+                .and_then(|n| old_map.get(n.saturating_sub(1) as usize)),
+        };
 
-        line.highlights = syntax_highlights
-            .into_iter()
-            .map(|h| HighlightRange {
-                start: h.start,
-                end: h.end,
-                token_type: h.token_type,
-            })
-            .collect();
+        if let Some(line_hls) = highlights {
+            line.highlights = line_hls.clone();
+        }
     }
 
     /// Get the current display line
@@ -954,7 +1131,7 @@ impl App {
     /// Check if a display line should be skipped during navigation
     fn is_skippable_line(&self, idx: usize) -> bool {
         match self.display_lines.get(idx) {
-            Some(DisplayLine::FileHeader { file_idx, .. }) => !self.collapsed_files.contains(file_idx),
+            Some(DisplayLine::FileHeader { path, .. }) => !self.collapsed_files.contains(path),
             Some(DisplayLine::Annotation { .. })
                 | Some(DisplayLine::HunkHeader { .. })
                 | Some(DisplayLine::HunkEnd { .. })
@@ -1025,6 +1202,32 @@ impl App {
         }
         self.ensure_cursor_on_navigable();
         self.adjust_scroll();
+    }
+
+    fn help_scroll_down(&mut self) {
+        let max = self.max_help_scroll();
+        if self.help_scroll < max {
+            self.help_scroll = (self.help_scroll + 1).min(max);
+        }
+    }
+
+    fn help_scroll_up(&mut self) {
+        self.help_scroll = self.help_scroll.saturating_sub(1);
+    }
+
+    fn help_page_down(&mut self) {
+        let max = self.max_help_scroll();
+        let jump = self.help_visible_height.saturating_sub(1).max(1);
+        self.help_scroll = (self.help_scroll + jump).min(max);
+    }
+
+    fn help_page_up(&mut self) {
+        let jump = self.help_visible_height.saturating_sub(1).max(1);
+        self.help_scroll = self.help_scroll.saturating_sub(jump);
+    }
+
+    fn max_help_scroll(&self) -> usize {
+        HELP_TEXT.len().saturating_sub(self.help_visible_height.max(1))
     }
 
     /// Jump to next file header
@@ -1114,8 +1317,31 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => return Ok(true), // Quit
-            KeyCode::Char('?') => self.show_help = !self.show_help,
+            KeyCode::Char('?') => {
+                self.show_help = !self.show_help;
+                if self.show_help {
+                    self.help_scroll = 0;
+                }
+            }
+            _ => {}
+        }
 
+        if self.show_help {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.help_scroll_down(),
+                KeyCode::Char('k') | KeyCode::Up => self.help_scroll_up(),
+                KeyCode::PageDown | KeyCode::Char(' ') => self.help_page_down(),
+                KeyCode::PageUp => self.help_page_up(),
+                KeyCode::Char('g') => self.help_scroll = 0,
+                KeyCode::Char('G') => self.help_scroll = self.max_help_scroll(),
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.show_help = false;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        match key.code {
             // Navigation
             KeyCode::Char('j') | KeyCode::Down => self.navigate_down(),
             KeyCode::Char('k') | KeyCode::Up => self.navigate_up(),
@@ -1214,6 +1440,10 @@ impl App {
             }
             KeyCode::Char('u') => {
                 self.toggle_diff_view()?;
+            }
+            KeyCode::Char('R') => {
+                self.reload_diff()?;
+                self.message = Some("Diff reloaded".to_string());
             }
             KeyCode::Char('v') => {
                 self.side_by_side = !self.side_by_side;
@@ -1546,6 +1776,7 @@ impl App {
         Ok(())
     }
 
+
     fn execute_search(&mut self) {
         let Some(ref mut search) = self.search else {
             return;
@@ -1798,10 +2029,15 @@ impl App {
             self.current_display_line()
         {
             annotation.clone()
-        } else if let Some(entry) = self.annotation_list_entries().get(self.annotation_list_idx) {
+        } else if matches!(self.mode, Mode::AnnotationList) {
+            let entries = self.annotation_list_entries();
+            let entry = entries
+                .get(self.annotation_list_idx)
+                .ok_or_else(|| anyhow!("Annotation not found"))?;
+            let entry_id = entry.id;
             self.all_annotations
                 .iter()
-                .find(|a| a.id == entry.id)
+                .find(|a| a.id == entry_id)
                 .cloned()
                 .ok_or_else(|| anyhow!("Annotation not found"))?
         } else if let Some(annotation) = self.get_annotation_for_current_line().cloned() {
@@ -1823,11 +2059,11 @@ impl App {
             line: annotation.start_line,
             status: AiStatus::Running,
             output: String::new(),
-            target: self.config.ai_target.clone(),
+            target: self.config.ai_target,
         };
         self.ai_jobs.push(job);
 
-        let ai_target = self.config.ai_target.clone();
+        let ai_target = self.config.ai_target;
         let repo_path = self.repo_path.clone();
         let tx = self.ai_tx.clone();
         std::thread::spawn(move || {
@@ -1881,6 +2117,7 @@ impl App {
     }
 
     fn switch_diff_mode(&mut self, target: DiffMode) -> Result<()> {
+        self.save_collapsed_state();
         let files = self.diff_engine.diff(&target, &self.diff_paths)?;
 
         self.diff_mode = target;
@@ -1889,7 +2126,7 @@ impl App {
         self.current_line_idx = 0;
         self.scroll_offset = 0;
         self.expanded_file = None;
-        self.collapsed_files.clear();
+        self.load_collapsed_state();
         self.load_all_annotations()?;
         self.build_display_lines();
 
@@ -1908,6 +2145,7 @@ impl App {
         {
             self.current_line_idx += 1;
         }
+        self.adjust_scroll();
 
         Ok(())
     }
@@ -1989,13 +2227,13 @@ impl App {
     }
 
     fn reload_diff(&mut self) -> Result<()> {
+        let target = self.current_target_position();
         let files = self.diff_engine.diff(&self.diff_mode, &self.diff_paths)?;
         self.files = files;
         self.display_lines.clear();
         self.current_line_idx = 0;
         self.scroll_offset = 0;
         self.expanded_file = None;
-        self.collapsed_files.clear();
         self.load_all_annotations()?;
         self.build_display_lines();
 
@@ -2009,27 +2247,82 @@ impl App {
             return Ok(());
         }
 
-        while self.current_line_idx < self.display_lines.len().saturating_sub(1)
-            && self.is_skippable_line(self.current_line_idx)
-        {
-            self.current_line_idx += 1;
+        if let Some((file_path, line_no)) = target {
+            if let Some(idx) = self.find_best_line_match(&file_path, line_no) {
+                self.current_line_idx = idx;
+            }
+        } else {
+            while self.current_line_idx < self.display_lines.len().saturating_sub(1)
+                && self.is_skippable_line(self.current_line_idx)
+            {
+                self.current_line_idx += 1;
+            }
         }
+        self.adjust_scroll();
 
         Ok(())
     }
 
+    fn save_collapsed_state(&mut self) {
+        match self.diff_mode {
+            DiffMode::Unstaged => self.collapsed_files_unstaged = self.collapsed_files.clone(),
+            DiffMode::Staged => self.collapsed_files_staged = self.collapsed_files.clone(),
+            _ => self.collapsed_files_other = self.collapsed_files.clone(),
+        }
+    }
+
+    fn load_collapsed_state(&mut self) {
+        self.collapsed_files = match self.diff_mode {
+            DiffMode::Unstaged => self.collapsed_files_unstaged.clone(),
+            DiffMode::Staged => self.collapsed_files_staged.clone(),
+            _ => self.collapsed_files_other.clone(),
+        };
+    }
+
+    fn current_target_position(&self) -> Option<(String, u32)> {
+        match self.current_display_line() {
+            Some(DisplayLine::Diff { line, file_path, .. }) => {
+                let line_no = line.new_line_no.or(line.old_line_no)?;
+                Some((file_path.clone(), line_no))
+            }
+            Some(DisplayLine::Annotation { annotation, .. }) => {
+                Some((annotation.file_path.clone(), annotation.start_line))
+            }
+            _ => self.current_file_info().map(|(path, _)| (path, 1)),
+        }
+    }
+
+    fn find_best_line_match(&self, file_path: &str, line_no: u32) -> Option<usize> {
+        let mut best: Option<(usize, u32)> = None;
+        for (idx, line) in self.display_lines.iter().enumerate() {
+            if let DisplayLine::Diff { line, file_path: fp, .. } = line {
+                if fp != file_path {
+                    continue;
+                }
+                if let Some(ln) = line.new_line_no.or(line.old_line_no) {
+                    let dist = ln.abs_diff(line_no);
+                    match best {
+                        Some((_, best_dist)) if dist >= best_dist => {}
+                        _ => best = Some((idx, dist)),
+                    }
+                }
+            }
+        }
+        best.map(|(idx, _)| idx)
+    }
+
     fn toggle_collapse_current_file(&mut self) {
         let current_header_idx = self.find_current_file_header_idx();
-        let Some((_, file_idx)) = self.current_file_info() else {
+        let Some((file_path, file_idx)) = self.current_file_info() else {
             return;
         };
 
-        let was_collapsed = self.collapsed_files.contains(&file_idx);
+        let was_collapsed = self.collapsed_files.contains(&file_path);
         if was_collapsed {
-            self.collapsed_files.remove(&file_idx);
+            self.collapsed_files.remove(&file_path);
             self.message = Some("Expanded file".to_string());
         } else {
-            self.collapsed_files.insert(file_idx);
+            self.collapsed_files.insert(file_path);
             self.message = Some("Collapsed file".to_string());
         }
 
@@ -2289,7 +2582,7 @@ pub fn run(
         config,
         diff_mode,
         diff_paths,
-    );
+    )?;
     app.load_all_annotations()?;
     app.build_display_lines();
 
@@ -2334,8 +2627,9 @@ fn ui(f: &mut Frame, app: &mut App) {
     let input_height = match app.mode {
         Mode::Normal => 1,
         _ => {
-            // Count newlines + 1 for current line, + 2 for border, max 10 lines
-            let line_count = app.annotation_input.chars().filter(|&c| c == '\n').count() + 1;
+            let inner_width = f.area().width.saturating_sub(2) as usize;
+            let input_with_cursor = app.render_input_with_cursor();
+            let line_count = wrapped_line_count(&input_with_cursor, inner_width.max(1));
             (line_count + 2).min(10) as u16
         }
     };
@@ -2367,7 +2661,9 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // Help overlay
     if app.show_help {
-        render_help(f, theme);
+        let help_area = centered_rect(60, 80, f.area());
+        app.help_visible_height = help_area.height.saturating_sub(2) as usize;
+        render_help(f, app, help_area, theme);
     }
 
     if matches!(app.mode, Mode::AnnotationList) {
@@ -2400,7 +2696,7 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
     }
 
     let (file_path, file_idx) = app.current_file_info().unwrap_or(("<none>".to_string(), 0));
-    let is_collapsed = app.collapsed_files.contains(&file_idx);
+    let is_collapsed = app.collapsed_files.contains(&file_path);
 
     // Calculate file stats
     let file = app.files.get(file_idx);
@@ -2533,7 +2829,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                             .add_modifier(Modifier::UNDERLINED);
                     }
 
-                    let collapse_indicator = if app.collapsed_files.contains(file_idx) { " ▶" } else { "" };
+                    let collapse_indicator = if app.collapsed_files.contains(path) { " ▶" } else { "" };
 
                     ListItem::new(Line::from(vec![
                         Span::styled(format!(" Δ {}{}  ", path, collapse_indicator), style),
@@ -2620,7 +2916,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         &line.highlights,
                         content_style,
                         is_current,
-                        theme,
+                        theme.current_line_bg,
                     );
 
                     let lines = wrap_spans_with_prefix(
@@ -2663,19 +2959,29 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         ),
                     };
 
-                    // Split content by newlines and create multiple lines
-                    let lines: Vec<Line> = annotation.content
-                        .lines()
-                        .enumerate()
-                        .map(|(i, line)| {
-                            let prefix = if i == 0 {
-                                prefix.to_string()
-                            } else {
-                                "       ".to_string() // Indent continuation lines
-                            };
-                            Line::from(Span::styled(format!("{}{} ", prefix, line), style))
-                        })
-                        .collect();
+                    // Split content by newlines and wrap each line with prefix
+                    let mut lines: Vec<Line> = Vec::new();
+                    let content_lines: Vec<&str> = if annotation.content.is_empty() {
+                        vec![""]
+                    } else {
+                        annotation.content.lines().collect()
+                    };
+                    for (i, line) in content_lines.into_iter().enumerate() {
+                        let line_prefix = if i == 0 {
+                            prefix.to_string()
+                        } else {
+                            "       ".to_string() // Indent continuation lines
+                        };
+                        let prefix_spans = vec![Span::styled(line_prefix, style)];
+                        let content_spans = vec![Span::styled(line.to_string(), style)];
+                        let wrapped = wrap_spans_with_prefix(
+                            prefix_spans,
+                            content_spans,
+                            area.width as usize,
+                            style,
+                        );
+                        lines.extend(wrapped);
+                    }
 
                     ListItem::new(lines)
                 }
@@ -2762,7 +3068,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         .add_modifier(Modifier::UNDERLINED);
                 }
 
-                let collapse_indicator = if app.collapsed_files.contains(file_idx) { " ▶" } else { "" };
+                let collapse_indicator = if app.collapsed_files.contains(path) { " ▶" } else { "" };
 
                 let header = Line::from(vec![
                     Span::styled(format!(" Δ {}{} ", path, collapse_indicator), style),
@@ -2831,7 +3137,13 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             Span::styled(old_no, line_num_style),
                             Span::styled("- ", content_style),
                         ];
-                        let content_spans = build_highlighted_spans(&line.content, &line.highlights, content_style, is_current, theme);
+                        let content_spans = build_highlighted_spans(
+                            &line.content,
+                            &line.highlights,
+                            content_style,
+                            is_current,
+                            theme.current_line_bg,
+                        );
                         let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
                         left_items.push(ListItem::new(lines));
                         right_items.push(ListItem::new(Line::from("")));
@@ -2845,7 +3157,13 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             Span::styled(new_no, line_num_style),
                             Span::styled("+ ", content_style),
                         ];
-                        let content_spans = build_highlighted_spans(&line.content, &line.highlights, content_style, is_current, theme);
+                        let content_spans = build_highlighted_spans(
+                            &line.content,
+                            &line.highlights,
+                            content_style,
+                            is_current,
+                            theme.current_line_bg,
+                        );
                         let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
                         right_items.push(ListItem::new(lines));
                     }
@@ -2858,7 +3176,13 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             Span::styled(old_no, line_num_style),
                             Span::styled("  ", content_style),
                         ];
-                        let content_spans = build_highlighted_spans(&line.content, &line.highlights, content_style, is_current, theme);
+                        let content_spans = build_highlighted_spans(
+                            &line.content,
+                            &line.highlights,
+                            content_style,
+                            is_current,
+                            theme.current_line_bg,
+                        );
                         let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
                         left_items.push(ListItem::new(lines));
 
@@ -2867,7 +3191,13 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             Span::styled(new_no, line_num_style),
                             Span::styled("  ", content_style),
                         ];
-                        let content_spans = build_highlighted_spans(&line.content, &line.highlights, content_style, is_current, theme);
+                        let content_spans = build_highlighted_spans(
+                            &line.content,
+                            &line.highlights,
+                            content_style,
+                            is_current,
+                            theme.current_line_bg,
+                        );
                         let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
                         right_items.push(ListItem::new(lines));
                     }
@@ -2904,29 +3234,59 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     ),
                 };
 
-                // Split content by newlines and create multiple lines
-                let lines: Vec<Line> = annotation.content
-                    .lines()
-                    .enumerate()
-                    .map(|(i, line)| {
-                        let prefix = if i == 0 {
-                            prefix.to_string()
-                        } else {
-                            "      ".to_string()
-                        };
-                        Line::from(Span::styled(format!("{}{} ", prefix, line), style))
-                    })
-                    .collect();
-
                 // Show annotation on the appropriate side
                 match annotation.side {
                     Side::Old => {
+                        let mut lines: Vec<Line> = Vec::new();
+                        let content_lines: Vec<&str> = if annotation.content.is_empty() {
+                            vec![""]
+                        } else {
+                            annotation.content.lines().collect()
+                        };
+                        for (i, line) in content_lines.into_iter().enumerate() {
+                            let line_prefix = if i == 0 {
+                                prefix.to_string()
+                            } else {
+                                "      ".to_string()
+                            };
+                            let prefix_spans = vec![Span::styled(line_prefix, style)];
+                            let content_spans = vec![Span::styled(line.to_string(), style)];
+                            let wrapped = wrap_spans_with_prefix(
+                                prefix_spans,
+                                content_spans,
+                                columns[0].width as usize,
+                                style,
+                            );
+                            lines.extend(wrapped);
+                        }
                         left_items.push(ListItem::new(lines));
                         right_items.push(ListItem::new(Line::from("")));
                     }
                     Side::New => {
                         left_items.push(ListItem::new(Line::from("")));
-                        right_items.push(ListItem::new(lines));
+                        let mut right_lines: Vec<Line> = Vec::new();
+                        let content_lines: Vec<&str> = if annotation.content.is_empty() {
+                            vec![""]
+                        } else {
+                            annotation.content.lines().collect()
+                        };
+                        for (i, line) in content_lines.into_iter().enumerate() {
+                            let line_prefix = if i == 0 {
+                                prefix.to_string()
+                            } else {
+                                "      ".to_string()
+                            };
+                            let prefix_spans = vec![Span::styled(line_prefix, style)];
+                            let content_spans = vec![Span::styled(line.to_string(), style)];
+                            let wrapped = wrap_spans_with_prefix(
+                                prefix_spans,
+                                content_spans,
+                                columns[2].width as usize,
+                                style,
+                            );
+                            right_lines.extend(wrapped);
+                        }
+                        right_items.push(ListItem::new(right_lines));
                     }
                 }
             }
@@ -2959,17 +3319,17 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 format!("{}{}{}", mode_label, msg, ai_suffix)
             } else if app.expanded_file.is_some() {
                 format!(
-                    "{} j/k:line  n/N:chunk  ^d/^u:page  x:collapse  c:collapse  s:stage  u:toggle  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
+                    "{} j/k:line  n/N:chunk  ^d/^u:page  x:collapse  c:collapse  s:stage  u:toggle  R:reload  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
                     mode_label, ai_suffix
                 )
             } else if app.search.is_some() {
                 format!(
-                    "{} n/N:match  Esc:clear  j/k:nav  Tab:file  c:collapse  x:expand  s:stage  u:toggle  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
+                    "{} n/N:match  Esc:clear  j/k:nav  Tab:file  c:collapse  x:expand  s:stage  u:toggle  R:reload  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
                     mode_label, ai_suffix
                 )
             } else {
                 format!(
-                    "{} j/k:nav  n/N:chunk  Tab:file  c:collapse  f:find  /:search  x:expand  s:stage  u:toggle  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
+                    "{} j/k:nav  n/N:chunk  Tab:file  c:collapse  f:find  /:search  x:expand  s:stage  u:toggle  R:reload  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
                     mode_label, ai_suffix
                 )
             };
@@ -2998,7 +3358,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 .block(Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.border))
-                    .title(title));
+                    .title(title))
+                .wrap(Wrap { trim: false });
 
             f.render_widget(input, area);
         }
@@ -3038,61 +3399,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
     }
 }
 
-fn render_help(f: &mut Frame, theme: Theme) {
-    let area = centered_rect(60, 80, f.area());
-
-    let help_text = vec![
-        "",
-        "  Navigation:",
-        "    j / Down  Move down line by line",
-        "    k / Up    Move up line by line",
-        "    n / N     Next / previous chunk",
-        "    Tab       Next file",
-        "    Shift+Tab Previous file",
-        "    Ctrl+d    Half page down",
-        "    Ctrl+u    Half page up",
-        "    g         Go to start",
-        "    G         Go to end",
-        "",
-        "  Search:",
-        "    f         Search by filename (regex)",
-        "    /         Search in content (regex)",
-        "    n / N     Next / previous match (when searching)",
-        "    Esc       Clear search",
-        "",
-        "  View:",
-        "    x         Expand/collapse current file (full view)",
-        "    c         Collapse/expand current file",
-        "    v         Toggle side-by-side view",
-        "    s         Stage/unstage current hunk",
-        "    u         Toggle staged/unstaged view",
-        "    @         Send annotation to AI",
-        "    P         Toggle AI pane",
-        "    A         Annotation list",
-        "",
-        "  Annotations:",
-        "    a         Add annotation at current line",
-        "    e         Edit annotation at current line",
-        "    d         Delete annotation at current line",
-        "    r         Resolve annotation at current line",
-        "    t         Toggle annotation type (comment/todo)",
-        "",
-        "  Other:",
-        "    ?         Toggle this help",
-        "    q         Quit",
-        "",
-        "  In annotation mode:",
-        "    Enter     Save annotation",
-        "    Ctrl+j    Add newline",
-        "    Ctrl+t    Toggle annotation type",
-        "    Arrows    Move cursor",
-        "    Home/End  Line start/end",
-        "    Del/BS    Delete",
-        "    Esc       Cancel",
-        "",
-    ];
-
-    let help = Paragraph::new(help_text.join("\n"))
+fn render_help(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
+    let help = Paragraph::new(HELP_TEXT.join("\n"))
         .style(Style::default().fg(theme.help_fg).bg(theme.help_bg))
         .block(
             Block::default()
@@ -3101,7 +3409,8 @@ fn render_help(f: &mut Frame, theme: Theme) {
                 .style(Style::default().bg(theme.help_bg))
                 .border_style(Style::default().fg(theme.border)),
         )
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((app.help_scroll as u16, 0));
 
     f.render_widget(Clear, area);
     f.render_widget(help, area);
@@ -3412,33 +3721,17 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 }
 
 /// Get the color for a syntax token type
-fn token_color(token_type: TokenType, theme: Theme) -> Color {
-    match token_type {
-        TokenType::Keyword => theme.token_keyword,
-        TokenType::String => theme.token_string,
-        TokenType::Comment => theme.token_comment,
-        TokenType::Function => theme.token_function,
-        TokenType::Type => theme.token_type,
-        TokenType::Number => theme.token_number,
-        TokenType::Operator => theme.token_operator,
-        TokenType::Variable => theme.token_variable,
-        TokenType::Atom => theme.token_atom,
-        TokenType::Module => theme.token_module,
-        TokenType::Default => theme.token_default,
-    }
-}
-
 /// Build spans with syntax highlighting for a diff line
 fn build_highlighted_spans(
     content: &str,
     highlights: &[HighlightRange],
     base_style: Style,
     is_current: bool,
-    theme: Theme,
+    current_line_bg: Color,
 ) -> Vec<Span<'static>> {
     let base_style = if is_current {
         base_style
-            .bg(theme.current_line_bg)
+            .bg(current_line_bg)
             .add_modifier(Modifier::BOLD)
     } else {
         base_style
@@ -3452,10 +3745,25 @@ fn build_highlighted_spans(
     let mut pos = 0;
     let mut spans: Vec<Span<'static>> = Vec::new();
 
-    for highlight in highlights {
+    let mut sorted: Vec<HighlightRange> = highlights.to_vec();
+    sorted.sort_by_key(|h| h.start);
+    for highlight in sorted {
         // Ensure we don't go out of bounds
-        let start = highlight.start.min(content_bytes.len());
-        let end = highlight.end.min(content_bytes.len());
+        let mut start = highlight.start.min(content_bytes.len());
+        let mut end = highlight.end.min(content_bytes.len());
+
+        if start < pos {
+            start = pos;
+        }
+        if end < pos {
+            end = pos;
+        }
+        if start == end {
+            continue;
+        }
+        if end <= start {
+            continue;
+        }
 
         if start > pos {
             // Add unhighlighted segment
@@ -3467,15 +3775,8 @@ fn build_highlighted_spans(
         if end > start {
             // Add highlighted segment
             if let Ok(segment) = std::str::from_utf8(&content_bytes[start..end]) {
-                let color = token_color(highlight.token_type, theme);
-                let style = if is_current {
-                    // Keep diff background, just increase emphasis
-                    base_style.fg(color).add_modifier(Modifier::BOLD)
-                } else {
-                    // Preserve background from base_style
-                    base_style.fg(color)
-                };
-                spans.push(Span::styled(segment.to_string(), style));
+                let styled = apply_text_style(base_style, highlight.style, is_current);
+                spans.push(Span::styled(segment.to_string(), styled));
             }
         }
 
@@ -3490,6 +3791,23 @@ fn build_highlighted_spans(
     }
 
     spans
+}
+
+fn apply_text_style(base: Style, style: crate::syntax::TextStyle, is_current: bool) -> Style {
+    let mut s = base.fg(Color::Rgb(style.fg.0, style.fg.1, style.fg.2));
+    if style.bold {
+        s = s.add_modifier(Modifier::BOLD);
+    }
+    if style.italic {
+        s = s.add_modifier(Modifier::ITALIC);
+    }
+    if style.underline {
+        s = s.add_modifier(Modifier::UNDERLINED);
+    }
+    if is_current {
+        s = s.add_modifier(Modifier::BOLD);
+    }
+    s
 }
 
 fn span_width(span: &Span) -> usize {
@@ -3580,4 +3898,21 @@ fn wrap_spans_with_prefix(
     }
 
     lines
+}
+
+fn wrapped_line_count(text: &str, max_width: usize) -> usize {
+    if max_width == 0 {
+        return 1;
+    }
+    let mut count = 0usize;
+    for line in text.split('\n') {
+        let width = UnicodeWidthStr::width(line);
+        let lines = if width == 0 {
+            1
+        } else {
+            (width + max_width - 1) / max_width
+        };
+        count += lines;
+    }
+    if count == 0 { 1 } else { count }
 }
