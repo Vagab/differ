@@ -27,11 +27,13 @@ use std::io::{self, BufRead, Stdout, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
 const REATTACH_WINDOW: i32 = 5;
 const REATTACH_THRESHOLD: f32 = 0.7;
+const INITIAL_HUNK_HIGHLIGHT_COUNT: usize = 5;
 
 const HELP_TEXT: &[&str] = &[
     "",
@@ -104,6 +106,12 @@ pub enum DisplayLine {
         file_idx: usize,
         hunk_idx: usize,
     },
+    /// Hunk context (function/module) line
+    HunkContext {
+        text: String,
+        line_no: u32,
+        highlights: Vec<HighlightRange>,
+    },
     /// End of hunk marker for spacing
     HunkEnd {
         file_idx: usize,
@@ -149,6 +157,11 @@ pub struct App {
     syntax_highlighter: SyntaxHighlighter,
     syntax_cache_old: HashMap<String, Vec<Vec<HighlightRange>>>,
     syntax_cache_new: HashMap<String, Vec<Vec<HighlightRange>>>,
+    eager_highlight_files: HashSet<String>,
+    highlight_pending: HashSet<String>,
+    highlight_generation: u64,
+    highlight_rx: Receiver<HighlightEvent>,
+    highlight_tx: Sender<HighlightEvent>,
 
     // UI state
     mode: Mode,
@@ -198,6 +211,18 @@ enum AiStatus {
 }
 
 #[derive(Debug, Clone)]
+enum HighlightEvent {
+    Ready {
+        generation: u64,
+        file_key: String,
+        old_key: String,
+        new_key: String,
+        old_map: Vec<Vec<HighlightRange>>,
+        new_map: Vec<Vec<HighlightRange>>,
+    },
+}
+
+#[derive(Debug, Clone)]
 struct AiJob {
     id: u64,
     annotation_id: i64,
@@ -244,6 +269,8 @@ struct Theme {
     expanded_fg: Color,
     hunk_bg: Color,
     hunk_fg: Color,
+    hunk_ctx_bg: Color,
+    hunk_ctx_fg: Color,
     hunk_border: Color,
     added_bg: Color,
     added_fg: Color,
@@ -281,8 +308,10 @@ impl Default for Theme {
             header_focus_bg: Color::Rgb(58, 66, 84),
             expanded_bg: Color::Rgb(96, 72, 40),
             expanded_fg: Color::Rgb(255, 245, 230),
-            hunk_bg: Color::Rgb(140, 130, 78),
-            hunk_fg: Color::Rgb(20, 20, 20),
+            hunk_bg: Color::Rgb(54, 62, 92),
+            hunk_fg: Color::Rgb(220, 228, 245),
+            hunk_ctx_bg: Color::Rgb(36, 44, 70),
+            hunk_ctx_fg: Color::Rgb(185, 205, 235),
             hunk_border: Color::Rgb(80, 88, 72),
             added_bg: Color::Rgb(18, 44, 26),
             added_fg: Color::Rgb(150, 230, 185),
@@ -322,6 +351,7 @@ impl App {
         let show_annotations = config.show_annotations;
         let side_by_side = config.side_by_side;
         let (ai_tx, ai_rx) = mpsc::channel();
+        let (highlight_tx, highlight_rx) = mpsc::channel();
 
         let syntax_theme = config.syntax_theme.clone();
 
@@ -341,6 +371,11 @@ impl App {
             syntax_highlighter: SyntaxHighlighter::new(syntax_theme.as_deref())?,
             syntax_cache_old: HashMap::new(),
             syntax_cache_new: HashMap::new(),
+            eager_highlight_files: HashSet::new(),
+            highlight_pending: HashSet::new(),
+            highlight_generation: 0,
+            highlight_rx,
+            highlight_tx,
             mode: Mode::Normal,
             annotation_input: String::new(),
             annotation_cursor: 0,
@@ -414,6 +449,149 @@ impl App {
             }
         }
 
+        Ok(())
+    }
+
+    fn file_highlight_keys(file: &DiffFile) -> (String, String, String) {
+        let file_key = file
+            .new_path
+            .as_ref()
+            .or(file.old_path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let old_key = file
+            .old_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let new_key = file
+            .new_path
+            .as_ref()
+            .or(file.old_path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        (file_key, old_key, new_key)
+    }
+
+    fn highlight_file_keys_for_first_hunks(&self, max_hunks: usize) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut hunk_count = 0usize;
+
+        for file in &self.files {
+            let (file_path, _, _) = Self::file_highlight_keys(file);
+            if seen.insert(file_path.clone()) {
+                keys.push(file_path.clone());
+            }
+
+            if !file.hunks.is_empty() {
+                hunk_count += file.hunks.len();
+            }
+            if hunk_count >= max_hunks {
+                break;
+            }
+        }
+
+        if keys.is_empty() {
+            if let Some(file) = self.files.first() {
+                let (file_path, _, _) = Self::file_highlight_keys(file);
+                keys.push(file_path);
+            }
+        }
+
+        keys
+    }
+
+    fn prepare_lazy_highlighting(&mut self) {
+        if !self.config.syntax_highlighting {
+            return;
+        }
+
+        let eager_files = self.highlight_file_keys_for_first_hunks(INITIAL_HUNK_HIGHLIGHT_COUNT);
+        self.eager_highlight_files = eager_files.iter().cloned().collect();
+
+        let mut jobs: Vec<(String, String, String, DiffFile)> = Vec::new();
+        let files: Vec<DiffFile> = self.files.clone();
+        for file in files {
+            let (file_key, old_key, new_key) = Self::file_highlight_keys(&file);
+            if self.eager_highlight_files.contains(&file_key) {
+                let (old_map, new_map) = self.load_highlight_maps(
+                    &file,
+                    if old_key.is_empty() { None } else { Some(old_key.as_str()) },
+                    if new_key.is_empty() { None } else { Some(new_key.as_str()) },
+                );
+                if !old_key.is_empty() {
+                    self.syntax_cache_old.insert(old_key.clone(), old_map);
+                }
+                if !new_key.is_empty() {
+                    self.syntax_cache_new.insert(new_key.clone(), new_map);
+                }
+            } else {
+                if self.highlight_pending.insert(file_key.clone()) {
+                    jobs.push((file_key, old_key, new_key, file));
+                }
+            }
+        }
+
+        if jobs.is_empty() {
+            return;
+        }
+
+        let generation = self.highlight_generation;
+        let repo_path = self.repo_path.clone();
+        let diff_mode = self.diff_mode.clone();
+        let theme_name = self.config.syntax_theme.clone();
+        let tx = self.highlight_tx.clone();
+
+        thread::spawn(move || {
+            let mut highlighter = match SyntaxHighlighter::new(theme_name.as_deref()) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            for (file_key, old_key, new_key, file) in jobs {
+                let (old_map, new_map) = compute_highlight_maps_for_file(
+                    &mut highlighter,
+                    &repo_path,
+                    &diff_mode,
+                    &file,
+                    if old_key.is_empty() { None } else { Some(old_key.as_str()) },
+                    if new_key.is_empty() { None } else { Some(new_key.as_str()) },
+                );
+                let _ = tx.send(HighlightEvent::Ready {
+                    generation,
+                    file_key,
+                    old_key,
+                    new_key,
+                    old_map,
+                    new_map,
+                });
+            }
+        });
+    }
+
+    fn handle_highlight_event(&mut self, evt: HighlightEvent) -> Result<()> {
+        match evt {
+            HighlightEvent::Ready {
+                generation,
+                file_key,
+                old_key,
+                new_key,
+                old_map,
+                new_map,
+            } => {
+                if generation != self.highlight_generation {
+                    return Ok(());
+                }
+                if !old_key.is_empty() {
+                    self.syntax_cache_old.insert(old_key, old_map);
+                }
+                if !new_key.is_empty() {
+                    self.syntax_cache_new.insert(new_key, new_map);
+                }
+                self.highlight_pending.remove(&file_key);
+                self.build_display_lines();
+            }
+        }
         Ok(())
     }
 
@@ -677,6 +855,21 @@ impl App {
             .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
     }
 
+    fn git_merge_base(&self, from: &str, to: &str) -> Option<String> {
+        let output = Command::new("git")
+            .arg("merge-base")
+            .arg(from)
+            .arg(to)
+            .current_dir(&self.repo_path)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            None
+        }
+    }
+
     fn build_highlight_map(&mut self, content: &str, file_path: &str) -> Vec<Vec<HighlightRange>> {
         let per_line = self.syntax_highlighter.highlight_file(content, file_path);
         per_line
@@ -699,6 +892,7 @@ impl App {
         file: &DiffFile,
         old_path: Option<&str>,
         new_path: Option<&str>,
+        allow_compute: bool,
     ) -> (Vec<Vec<HighlightRange>>, Vec<Vec<HighlightRange>>) {
         if !self.config.syntax_highlighting {
             return (Vec::new(), Vec::new());
@@ -710,7 +904,7 @@ impl App {
         let has_old = !old_key.is_empty() && self.syntax_cache_old.contains_key(&old_key);
         let has_new = !new_key.is_empty() && self.syntax_cache_new.contains_key(&new_key);
 
-        if !has_old || !has_new {
+        if (!has_old || !has_new) && allow_compute {
             let (old_map, new_map) = self.load_highlight_maps(file, old_path, new_path);
             if !old_key.is_empty() && !has_old {
                 self.syntax_cache_old.insert(old_key.clone(), old_map);
@@ -795,6 +989,43 @@ impl App {
                     }
                 }
             }
+            DiffMode::WorkingTree { ref base } => {
+                if need_old {
+                    if let Some(path) = old_path {
+                        old_content = self.git_show(&format!("{}:{}", base, path));
+                    }
+                }
+                if need_new {
+                    if let Some(path) = new_path {
+                        new_content = self.read_working_file(path);
+                    }
+                }
+            }
+            DiffMode::Commits { ref from, ref to } => {
+                if need_old {
+                    if let Some(path) = old_path {
+                        old_content = self.git_show(&format!("{}:{}", from, path));
+                    }
+                }
+                if need_new {
+                    if let Some(path) = new_path {
+                        new_content = self.git_show(&format!("{}:{}", to, path));
+                    }
+                }
+            }
+            DiffMode::MergeBase { ref from, ref to } => {
+                let base = self.git_merge_base(from, to);
+                if need_old {
+                    if let (Some(path), Some(base)) = (old_path, base.as_deref()) {
+                        old_content = self.git_show(&format!("{}:{}", base, path));
+                    }
+                }
+                if need_new {
+                    if let Some(path) = new_path {
+                        new_content = self.git_show(&format!("{}:{}", to, path));
+                    }
+                }
+            }
             _ => {
                 if need_new {
                     if let Some(path) = new_path.or(old_path) {
@@ -833,10 +1064,14 @@ impl App {
             .new_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string());
+        let allow_compute = self.eager_highlight_files.contains(file_path)
+            || self.syntax_cache_new.contains_key(file_path)
+            || self.syntax_cache_old.contains_key(file_path);
         let (old_map, new_map) = self.cached_highlight_maps(
             file,
             old_path.as_deref(),
             new_path.as_deref().or(old_path.as_deref()),
+            allow_compute,
         );
 
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
@@ -846,6 +1081,32 @@ impl App {
 
             // Add spacing before hunk
             self.display_lines.push(DisplayLine::Spacer);
+
+            if let Some(text) = hunk.header.as_ref().filter(|t| !t.trim().is_empty()) {
+                let clean = text.trim().trim_start_matches("@@").trim().to_string();
+                let highlights = if allow_compute && self.config.syntax_highlighting {
+                    let mut lines = self.syntax_highlighter.highlight_file(
+                        &format!("{}\n", clean),
+                        file_path,
+                    );
+                    let line_hls = lines.pop().unwrap_or_default();
+                    line_hls
+                        .into_iter()
+                        .map(|h| HighlightRange {
+                            start: h.start,
+                            end: h.end,
+                            style: h.style,
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                self.display_lines.push(DisplayLine::HunkContext {
+                    text: clean,
+                    line_no: hunk.new_start,
+                    highlights,
+                });
+            }
 
             // Add hunk header
             let line_no = hunk.new_start;
@@ -885,7 +1146,12 @@ impl App {
         let mut additions: HashMap<u32, String> = HashMap::new();
         let mut deletions: Vec<(u32, u32, String)> = Vec::new(); // (insert_after_new_line, old_line_no, content)
 
+        let mut hunk_ranges: Vec<(std::ops::RangeInclusive<u32>, std::ops::RangeInclusive<u32>)> =
+            Vec::new();
         for hunk in &file.hunks {
+            let old_range = hunk.old_start..=hunk.old_start.saturating_add(hunk.old_lines.saturating_sub(1));
+            let new_range = hunk.new_start..=hunk.new_start.saturating_add(hunk.new_lines.saturating_sub(1));
+            hunk_ranges.push((old_range, new_range));
             let mut last_new_line: u32 = hunk.new_start.saturating_sub(1);
             for line in &hunk.lines {
                 match line.kind {
@@ -917,6 +1183,7 @@ impl App {
             file,
             file.old_path.as_ref().map(|p| p.to_string_lossy().to_string()).as_deref(),
             file.new_path.as_ref().map(|p| p.to_string_lossy().to_string()).as_deref(),
+            true,
         );
 
         // Show all lines with changes highlighted
@@ -934,11 +1201,14 @@ impl App {
                         highlights: Vec::new(),
                     };
                     self.highlight_from_maps(&mut del_line, &old_map, &[]);
+                    let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
+                        old_range.contains(old_no)
+                    });
                     self.display_lines.push(DisplayLine::Diff {
                         line: del_line,
                         file_idx,
                         file_path: file_path.to_string(),
-                        hunk_idx: None,
+                        hunk_idx,
                     });
                 }
             }
@@ -968,11 +1238,14 @@ impl App {
                     .collect();
             }
 
+            let hunk_idx = hunk_ranges.iter().position(|(_, new_range)| {
+                new_range.contains(&line_no)
+            });
             self.display_lines.push(DisplayLine::Diff {
                 line: diff_line.clone(),
                 file_idx,
                 file_path: file_path.to_string(),
-                hunk_idx: None,
+                hunk_idx,
             });
 
             self.add_annotations_for_line(file_idx, file_path, &diff_line);
@@ -990,11 +1263,14 @@ impl App {
                     highlights: Vec::new(),
                 };
                 self.highlight_from_maps(&mut del_line, &old_map, &[]);
+                let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
+                    old_range.contains(old_no)
+                });
                 self.display_lines.push(DisplayLine::Diff {
                     line: del_line,
                     file_idx,
                     file_path: file_path.to_string(),
-                    hunk_idx: None,
+                    hunk_idx,
                 });
             }
         }
@@ -1207,6 +1483,7 @@ impl App {
             Some(DisplayLine::FileHeader { path, .. }) => !self.collapsed_files.contains(path),
             Some(DisplayLine::Annotation { .. })
                 | Some(DisplayLine::HunkHeader { .. })
+                | Some(DisplayLine::HunkContext { .. })
                 | Some(DisplayLine::HunkEnd { .. })
                 | Some(DisplayLine::Spacer) => true,
             _ => false,
@@ -1494,10 +1771,15 @@ impl App {
             }
             KeyCode::Char('r') => {
                 if let Some(annotation) = self.get_annotation_for_current_line() {
-                    self.storage.resolve_annotation(annotation.id)?;
+                    if annotation.resolved_at.is_some() {
+                        self.storage.unresolve_annotation(annotation.id)?;
+                        self.message = Some("Annotation unresolved".to_string());
+                    } else {
+                        self.storage.resolve_annotation(annotation.id)?;
+                        self.message = Some("Annotation resolved".to_string());
+                    }
                     self.load_all_annotations()?;
                     self.build_display_lines();
-                    self.message = Some("Annotation resolved".to_string());
                 } else {
                     self.message = Some("Move to an annotation to resolve".to_string());
                 }
@@ -1962,6 +2244,10 @@ impl App {
 
     /// Jump to next change chunk (group of consecutive additions/deletions)
     fn next_change_chunk(&mut self) {
+        if self.expanded_file.is_some() {
+            self.next_hunk_expanded();
+            return;
+        }
         let total = self.display_lines.len();
         let mut idx = self.current_line_idx;
 
@@ -1994,6 +2280,10 @@ impl App {
 
     /// Jump to previous change chunk (group of consecutive additions/deletions)
     fn prev_change_chunk(&mut self) {
+        if self.expanded_file.is_some() {
+            self.prev_hunk_expanded();
+            return;
+        }
         let mut idx = self.current_line_idx;
 
         // If we're at the start of a chunk, move back one to get out of it
@@ -2035,6 +2325,92 @@ impl App {
         if self.is_change_line(idx) {
             self.current_line_idx = idx;
             self.adjust_scroll();
+        }
+    }
+
+    fn next_hunk_expanded(&mut self) {
+        let total = self.display_lines.len();
+        let current_hunk = match self.current_display_line() {
+            Some(DisplayLine::Diff { hunk_idx, .. }) => *hunk_idx,
+            _ => None,
+        };
+
+        let mut idx = self.current_line_idx + 1;
+        while idx < total {
+            if let Some(DisplayLine::Diff { hunk_idx: Some(h), .. }) = self.display_lines.get(idx) {
+                if current_hunk.map_or(true, |ch| ch != *h) {
+                    self.current_line_idx = idx;
+                    self.adjust_scroll();
+                    return;
+                }
+            }
+            idx += 1;
+        }
+
+        // Wrap to first hunk
+        idx = 0;
+        while idx < total {
+            if let Some(DisplayLine::Diff { hunk_idx: Some(_), .. }) = self.display_lines.get(idx) {
+                self.current_line_idx = idx;
+                self.adjust_scroll();
+                return;
+            }
+            idx += 1;
+        }
+    }
+
+    fn prev_hunk_expanded(&mut self) {
+        let mut idx = self.current_line_idx;
+        let current_hunk = match self.current_display_line() {
+            Some(DisplayLine::Diff { hunk_idx, .. }) => *hunk_idx,
+            _ => None,
+        };
+
+        while idx > 0 {
+            idx -= 1;
+            if let Some(DisplayLine::Diff { hunk_idx: Some(h), .. }) = self.display_lines.get(idx) {
+                if current_hunk.map_or(true, |ch| ch != *h) {
+                    // Move to the first line of this hunk
+                    let mut start = idx;
+                    while start > 0 {
+                        if let Some(DisplayLine::Diff { hunk_idx: Some(prev_h), .. }) =
+                            self.display_lines.get(start - 1)
+                        {
+                            if prev_h == h {
+                                start -= 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    self.current_line_idx = start;
+                    self.adjust_scroll();
+                    return;
+                }
+            }
+        }
+
+        // Wrap to last hunk
+        idx = self.display_lines.len().saturating_sub(1);
+        while idx > 0 {
+            if let Some(DisplayLine::Diff { hunk_idx: Some(h), .. }) = self.display_lines.get(idx) {
+                let mut start = idx;
+                while start > 0 {
+                    if let Some(DisplayLine::Diff { hunk_idx: Some(prev_h), .. }) =
+                        self.display_lines.get(start - 1)
+                    {
+                        if prev_h == h {
+                            start -= 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                self.current_line_idx = start;
+                self.adjust_scroll();
+                return;
+            }
+            idx -= 1;
         }
     }
 
@@ -2202,6 +2578,7 @@ impl App {
         self.load_collapsed_state();
         self.clear_syntax_cache();
         self.load_all_annotations()?;
+        self.prepare_lazy_highlighting();
         self.build_display_lines();
 
         if self.files.is_empty() {
@@ -2310,6 +2687,7 @@ impl App {
         self.expanded_file = None;
         self.clear_syntax_cache();
         self.load_all_annotations()?;
+        self.prepare_lazy_highlighting();
         self.build_display_lines();
 
         if self.files.is_empty() {
@@ -2341,6 +2719,8 @@ impl App {
     fn clear_syntax_cache(&mut self) {
         self.syntax_cache_old.clear();
         self.syntax_cache_new.clear();
+        self.highlight_pending.clear();
+        self.highlight_generation = self.highlight_generation.wrapping_add(1);
     }
 
     fn save_collapsed_state(&mut self) {
@@ -2664,6 +3044,7 @@ pub fn run(
         diff_paths,
     )?;
     app.load_all_annotations()?;
+    app.prepare_lazy_highlighting();
     app.build_display_lines();
 
     // Skip to first navigable line
@@ -2688,6 +3069,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
 
         while let Ok(evt) = app.ai_rx.try_recv() {
             app.handle_ai_event(evt)?;
+        }
+        while let Ok(evt) = app.highlight_rx.try_recv() {
+            app.handle_highlight_event(evt)?;
         }
 
         if event::poll(std::time::Duration::from_millis(50))? {
@@ -2917,6 +3301,24 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         Span::styled(format!("-{} ", dels), Style::default().fg(theme.deleted_fg).bg(stats_bg)),
                     ]))
                 }
+                DisplayLine::HunkContext { text, line_no, highlights } => {
+                    let style = Style::default()
+                        .fg(theme.hunk_ctx_fg)
+                        .bg(theme.hunk_ctx_bg);
+                    let content_spans =
+                        build_highlighted_spans(text, highlights, style, false, theme.hunk_ctx_bg);
+                    let line_num = format!("{:>4}", line_no);
+                    let line_num_style = Style::default()
+                        .fg(theme.hunk_ctx_fg)
+                        .bg(theme.hunk_ctx_bg)
+                        .add_modifier(Modifier::BOLD);
+                    ListItem::new(build_context_box(
+                        vec![Span::styled(line_num, line_num_style)],
+                        content_spans,
+                        area.width as usize,
+                        style,
+                    ))
+                }
                 DisplayLine::HunkHeader { line_no, additions, deletions, .. } => {
                     // Hunk header - prominent with stats
                     let style = Style::default()
@@ -2926,10 +3328,11 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         .fg(theme.hunk_fg)
                         .bg(theme.hunk_bg)
                         .add_modifier(Modifier::BOLD);
-                    ListItem::new(Line::from(vec![
+                    let line = vec![
                         Span::styled(format!(" +{} -{} ", additions, deletions), stats_style),
                         Span::styled(format!("starting at line {} ", line_no), style),
-                    ]))
+                    ];
+                    ListItem::new(Line::from(line))
                 }
                 DisplayLine::HunkEnd { .. } => {
                     // End of hunk - subtle bottom border
@@ -2953,10 +3356,15 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                     });
                     let annotation_marker = if has_annotation { "●" } else { " " };
 
+                    let line_num_fg = match line.kind {
+                        LineKind::Addition => theme.added_fg,
+                        LineKind::Deletion => theme.deleted_fg,
+                        LineKind::Context => theme.line_num,
+                    };
                     let line_num_style = if is_current {
-                        Style::default().fg(theme.line_num).bg(theme.current_line_bg)
+                        Style::default().fg(line_num_fg).bg(theme.current_line_bg)
                     } else {
-                        Style::default().fg(theme.line_num)
+                        Style::default().fg(line_num_fg)
                     };
                     let line_num = format!("{:>4}", line_no);
 
@@ -3158,6 +3566,25 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                 left_items.push(ListItem::new(header));
                 right_items.push(ListItem::new(Line::from("")));
             }
+            DisplayLine::HunkContext { text, line_no, highlights } => {
+                let style = Style::default()
+                    .fg(theme.hunk_ctx_fg)
+                    .bg(theme.hunk_ctx_bg);
+                let content_spans =
+                    build_highlighted_spans(text, highlights, style, false, theme.hunk_ctx_bg);
+                let line_num = format!("{:>4}", line_no);
+                let line_num_style = Style::default()
+                    .fg(theme.hunk_ctx_fg)
+                    .bg(theme.hunk_ctx_bg)
+                    .add_modifier(Modifier::BOLD);
+                left_items.push(ListItem::new(build_context_box(
+                    vec![Span::styled(line_num, line_num_style)],
+                    content_spans,
+                    columns[0].width as usize,
+                    style,
+                )));
+                right_items.push(ListItem::new(Line::from("")));
+            }
             DisplayLine::HunkHeader { line_no, additions, deletions, .. } => {
                 // Hunk header - prominent with stats
                 let style = Style::default()
@@ -3167,10 +3594,11 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     .fg(theme.hunk_fg)
                     .bg(theme.hunk_bg)
                     .add_modifier(Modifier::BOLD);
-                left_items.push(ListItem::new(Line::from(vec![
+                let line = vec![
                     Span::styled(format!(" +{} -{} ", additions, deletions), stats_style),
                     Span::styled(format!("starting at line {} ", line_no), style),
-                ])));
+                ];
+                left_items.push(ListItem::new(Line::from(line)));
                 right_items.push(ListItem::new(Line::from("")));
             }
             DisplayLine::HunkEnd { .. } => {
@@ -3194,11 +3622,6 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         && a.start_line <= line_no
                         && a.end_line.map_or(a.start_line == line_no, |e| e >= line_no)
                 });
-                let line_num_style = if is_current {
-                    Style::default().fg(theme.line_num).bg(theme.current_line_bg)
-                } else {
-                    Style::default().fg(theme.line_num)
-                };
                 let marker_style = if is_current {
                     Style::default()
                         .fg(theme.annotation_marker)
@@ -3210,8 +3633,15 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
 
                 match line.kind {
                     LineKind::Deletion => {
-                        let old_no = line.old_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
+                        let old_no = line
+                            .old_line_no
+                            .map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg);
+                        let line_num_style = if is_current {
+                            Style::default().fg(theme.deleted_fg).bg(theme.current_line_bg)
+                        } else {
+                            Style::default().fg(theme.deleted_fg)
+                        };
                         let left_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(old_no, line_num_style),
@@ -3229,8 +3659,15 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         right_items.push(ListItem::new(Line::from("")));
                     }
                     LineKind::Addition => {
-                        let new_no = line.new_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
+                        let new_no = line
+                            .new_line_no
+                            .map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(theme.added_fg).bg(theme.added_bg);
+                        let line_num_style = if is_current {
+                            Style::default().fg(theme.added_fg).bg(theme.current_line_bg)
+                        } else {
+                            Style::default().fg(theme.added_fg)
+                        };
                         left_items.push(ListItem::new(Line::from("")));
                         let right_spans = vec![
                             Span::styled(marker, marker_style),
@@ -3248,9 +3685,18 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         right_items.push(ListItem::new(lines));
                     }
                     LineKind::Context => {
-                        let old_no = line.old_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
-                        let new_no = line.new_line_no.map_or("    ".to_string(), |n| format!("{:>4}", n));
+                        let old_no = line
+                            .old_line_no
+                            .map_or("    ".to_string(), |n| format!("{:>4}", n));
+                        let new_no = line
+                            .new_line_no
+                            .map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(theme.context_fg);
+                        let line_num_style = if is_current {
+                            Style::default().fg(theme.line_num).bg(theme.current_line_bg)
+                        } else {
+                            Style::default().fg(theme.line_num)
+                        };
                         let left_spans = vec![
                             Span::styled(marker, marker_style),
                             Span::styled(old_no, line_num_style),
@@ -3395,23 +3841,11 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             } else {
                 String::new()
             };
+            let shortcuts = " j/k:nav  n/N:chunk  c:collapse  a:add  e:edit  r:resolve";
             let content = if let Some(msg) = &app.message {
                 format!("{}{}{}", mode_label, msg, ai_suffix)
-            } else if app.expanded_file.is_some() {
-                format!(
-                    "{} j/k:line  n/N:chunk  ^d/^u:page  x:collapse  c:collapse  s:stage  u:toggle  R:reload  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
-                    mode_label, ai_suffix
-                )
-            } else if app.search.is_some() {
-                format!(
-                    "{} n/N:match  Esc:clear  j/k:nav  Tab:file  c:collapse  x:expand  s:stage  u:toggle  R:reload  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
-                    mode_label, ai_suffix
-                )
             } else {
-                format!(
-                    "{} j/k:nav  n/N:chunk  Tab:file  c:collapse  f:find  /:search  x:expand  s:stage  u:toggle  R:reload  v:view  @:AI  P:pane  A:list  a:annotate  ?:help  q:quit{}",
-                    mode_label, ai_suffix
-                )
+                format!("{}{}{}", mode_label, shortcuts, ai_suffix)
             };
             let status = Paragraph::new(content)
                 .style(Style::default().fg(theme.status_fg).bg(theme.status_bg));
@@ -3477,6 +3911,72 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             f.render_widget(status, area);
         }
     }
+}
+
+fn build_context_box(
+    prefix_spans: Vec<Span<'static>>,
+    content_spans: Vec<Span<'static>>,
+    width: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
+    if width < 4 {
+        let mut line = prefix_spans;
+        line.extend(content_spans);
+        return vec![Line::from(line)];
+    }
+
+    let top = format!("┌{}┐", "─".repeat(width.saturating_sub(2)));
+    let bottom = format!("└{}┘", "─".repeat(width.saturating_sub(2)));
+
+    let available = width.saturating_sub(4);
+    let mut inner: Vec<Span<'static>> = Vec::new();
+    inner.extend(prefix_spans);
+    if !inner.is_empty() {
+        inner.push(Span::styled(" ", style));
+    }
+    inner.extend(content_spans);
+    let trimmed = truncate_spans(&inner, available);
+
+    let mut content_line = vec![Span::styled("│ ", style)];
+    content_line.extend(trimmed);
+    let used: usize = content_line.iter().map(span_width).sum();
+    let target = width.saturating_sub(1);
+    if used < target {
+        let pad = " ".repeat(target - used);
+        content_line.push(Span::styled(pad, style));
+    }
+    content_line.push(Span::styled("│", style));
+
+    vec![
+        Line::from(Span::styled(top, style)),
+        Line::from(content_line),
+        Line::from(Span::styled(bottom, style)),
+    ]
+}
+
+fn truncate_spans(spans: &[Span<'static>], max_width: usize) -> Vec<Span<'static>> {
+    if max_width == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut remaining = max_width;
+    for span in spans {
+        if remaining == 0 {
+            break;
+        }
+        let w = span_width(span);
+        if w <= remaining {
+            out.push(span.clone());
+            remaining -= w;
+        } else {
+            let (head, _) = split_by_width(&span.content, remaining);
+            if !head.is_empty() {
+                out.push(Span::styled(head, span.style));
+            }
+            break;
+        }
+    }
+    out
 }
 
 fn render_help(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
@@ -3576,6 +4076,181 @@ where
     } else {
         Err(anyhow!("AI process failed"))
     }
+}
+
+fn read_working_file_at(repo_path: &PathBuf, path: &str) -> Option<String> {
+    let full_path = repo_path.join(path);
+    std::fs::read(&full_path)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn git_show_at(repo_path: &PathBuf, spec: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("show")
+        .arg(spec)
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        None
+    }
+}
+
+fn git_merge_base_at(repo_path: &PathBuf, from: &str, to: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("merge-base")
+        .arg(from)
+        .arg(to)
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn build_highlight_map_with(
+    highlighter: &mut SyntaxHighlighter,
+    content: &str,
+    file_path: &str,
+) -> Vec<Vec<HighlightRange>> {
+    let per_line = highlighter.highlight_file(content, file_path);
+    per_line
+        .into_iter()
+        .map(|line_hl| {
+            line_hl
+                .into_iter()
+                .map(|h| HighlightRange {
+                    start: h.start,
+                    end: h.end,
+                    style: h.style,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn compute_highlight_maps_for_file(
+    highlighter: &mut SyntaxHighlighter,
+    repo_path: &PathBuf,
+    diff_mode: &DiffMode,
+    file: &DiffFile,
+    old_path: Option<&str>,
+    new_path: Option<&str>,
+) -> (Vec<Vec<HighlightRange>>, Vec<Vec<HighlightRange>>) {
+    let mut need_old = matches!(file.status, FileStatus::Deleted);
+    let mut need_new = matches!(file.status, FileStatus::Added);
+    if !need_old || !need_new {
+        for hunk in &file.hunks {
+            for line in &hunk.lines {
+                match line.kind {
+                    LineKind::Deletion => need_old = true,
+                    LineKind::Addition | LineKind::Context => need_new = true,
+                }
+                if need_old && need_new {
+                    break;
+                }
+            }
+            if need_old && need_new {
+                break;
+            }
+        }
+    }
+
+    let (mut old_content, mut new_content) = (None, None);
+    match diff_mode {
+        DiffMode::Unstaged => {
+            if need_old {
+                if let Some(path) = old_path {
+                    old_content = git_show_at(repo_path, &format!(":{}", path));
+                }
+            }
+            if need_new {
+                if let Some(path) = new_path {
+                    new_content = read_working_file_at(repo_path, path);
+                }
+            }
+        }
+        DiffMode::Staged => {
+            if need_old {
+                if let Some(path) = old_path {
+                    old_content = git_show_at(repo_path, &format!("HEAD:{}", path));
+                }
+            }
+            if need_new {
+                if let Some(path) = new_path {
+                    new_content = git_show_at(repo_path, &format!(":{}", path));
+                }
+            }
+        }
+        DiffMode::WorkingTree { base } => {
+            if need_old {
+                if let Some(path) = old_path {
+                    old_content = git_show_at(repo_path, &format!("{}:{}", base, path));
+                }
+            }
+            if need_new {
+                if let Some(path) = new_path {
+                    new_content = read_working_file_at(repo_path, path);
+                }
+            }
+        }
+        DiffMode::Commits { from, to } => {
+            if need_old {
+                if let Some(path) = old_path {
+                    old_content = git_show_at(repo_path, &format!("{}:{}", from, path));
+                }
+            }
+            if need_new {
+                if let Some(path) = new_path {
+                    new_content = git_show_at(repo_path, &format!("{}:{}", to, path));
+                }
+            }
+        }
+        DiffMode::MergeBase { from, to } => {
+            let base = git_merge_base_at(repo_path, from, to);
+            if need_old {
+                if let (Some(path), Some(base)) = (old_path, base.as_deref()) {
+                    old_content = git_show_at(repo_path, &format!("{}:{}", base, path));
+                }
+            }
+            if need_new {
+                if let Some(path) = new_path {
+                    new_content = git_show_at(repo_path, &format!("{}:{}", to, path));
+                }
+            }
+        }
+        _ => {
+            if need_new {
+                if let Some(path) = new_path.or(old_path) {
+                    new_content = read_working_file_at(repo_path, path);
+                }
+            }
+        }
+    }
+
+    if file.status == FileStatus::Added {
+        old_content = None;
+    }
+    if file.status == FileStatus::Deleted {
+        new_content = None;
+    }
+
+    let old_map = old_content
+        .as_ref()
+        .map(|c| build_highlight_map_with(highlighter, c, old_path.unwrap_or("")))
+        .unwrap_or_default();
+    let new_map = new_content
+        .as_ref()
+        .map(|c| build_highlight_map_with(highlighter, c, new_path.or(old_path).unwrap_or("")))
+        .unwrap_or_default();
+
+    (old_map, new_map)
 }
 
 fn extract_claude_text(line: &str) -> Option<String> {

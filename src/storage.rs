@@ -410,6 +410,15 @@ impl Storage {
         )?;
         Ok(())
     }
+
+    /// Mark an annotation as unresolved
+    pub fn unresolve_annotation(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE annotations SET resolved_at = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
 }
 
 // Need hex encoding for the hash

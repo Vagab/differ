@@ -50,6 +50,7 @@ pub struct DiffHunk {
     pub old_lines: u32,
     pub new_start: u32,
     pub new_lines: u32,
+    pub header: Option<String>,
     pub lines: Vec<DiffLine>,
 }
 
@@ -203,6 +204,7 @@ impl DiffEngine {
                         old_lines: header.1,
                         new_start: header.2,
                         new_lines: header.3,
+                        header: header.4,
                         lines: Vec::new(),
                     });
                 }
@@ -331,6 +333,7 @@ impl DiffEngine {
                 old_lines: old_lines.len() as u32,
                 new_start: 1,
                 new_lines: new_lines.len() as u32,
+                header: None,
                 lines,
             });
         }
@@ -352,9 +355,9 @@ fn parse_diff_git_line(line: &str) -> (Option<String>, Option<String>) {
     (old_path, new_path)
 }
 
-/// Parse a unified diff hunk header: @@ -old_start,old_count +new_start,new_count @@
-fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
-    // @@ -1,5 +1,7 @@
+/// Parse a unified diff hunk header: @@ -old_start,old_count +new_start,new_count @@ <header>
+fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32, Option<String>)> {
+    // @@ -1,5 +1,7 @@ optional header
     let line = line.trim_start_matches('@').trim();
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
@@ -367,7 +370,13 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
     let (old_start, old_count) = parse_range(old_part)?;
     let (new_start, new_count) = parse_range(new_part)?;
 
-    Some((old_start, old_count, new_start, new_count))
+    let header = if parts.len() > 2 {
+        Some(parts[2..].join(" ").trim().to_string()).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+
+    Some((old_start, old_count, new_start, new_count, header))
 }
 
 fn parse_range(s: &str) -> Option<(u32, u32)> {
