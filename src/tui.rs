@@ -147,6 +147,8 @@ pub struct App {
 
     // Syntax highlighting
     syntax_highlighter: SyntaxHighlighter,
+    syntax_cache_old: HashMap<String, Vec<Vec<HighlightRange>>>,
+    syntax_cache_new: HashMap<String, Vec<Vec<HighlightRange>>>,
 
     // UI state
     mode: Mode,
@@ -337,6 +339,8 @@ impl App {
             scroll_offset: 0,
             all_annotations: Vec::new(),
             syntax_highlighter: SyntaxHighlighter::new(syntax_theme.as_deref())?,
+            syntax_cache_old: HashMap::new(),
+            syntax_cache_new: HashMap::new(),
             mode: Mode::Normal,
             annotation_input: String::new(),
             annotation_cursor: 0,
@@ -690,6 +694,52 @@ impl App {
             .collect()
     }
 
+    fn cached_highlight_maps(
+        &mut self,
+        file: &DiffFile,
+        old_path: Option<&str>,
+        new_path: Option<&str>,
+    ) -> (Vec<Vec<HighlightRange>>, Vec<Vec<HighlightRange>>) {
+        if !self.config.syntax_highlighting {
+            return (Vec::new(), Vec::new());
+        }
+
+        let old_key = old_path.unwrap_or("").to_string();
+        let new_key = new_path.or(old_path).unwrap_or("").to_string();
+
+        let has_old = !old_key.is_empty() && self.syntax_cache_old.contains_key(&old_key);
+        let has_new = !new_key.is_empty() && self.syntax_cache_new.contains_key(&new_key);
+
+        if !has_old || !has_new {
+            let (old_map, new_map) = self.load_highlight_maps(file, old_path, new_path);
+            if !old_key.is_empty() && !has_old {
+                self.syntax_cache_old.insert(old_key.clone(), old_map);
+            }
+            if !new_key.is_empty() && !has_new {
+                self.syntax_cache_new.insert(new_key.clone(), new_map);
+            }
+        }
+
+        let old_map = if old_key.is_empty() {
+            Vec::new()
+        } else {
+            self.syntax_cache_old
+                .get(&old_key)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let new_map = if new_key.is_empty() {
+            Vec::new()
+        } else {
+            self.syntax_cache_new
+                .get(&new_key)
+                .cloned()
+                .unwrap_or_default()
+        };
+
+        (old_map, new_map)
+    }
+
     fn load_highlight_maps(
         &mut self,
         file: &DiffFile,
@@ -700,27 +750,56 @@ impl App {
             return (Vec::new(), Vec::new());
         }
 
+        let mut need_old = matches!(file.status, FileStatus::Deleted);
+        let mut need_new = matches!(file.status, FileStatus::Added);
+        if !need_old || !need_new {
+            for hunk in &file.hunks {
+                for line in &hunk.lines {
+                    match line.kind {
+                        LineKind::Deletion => need_old = true,
+                        LineKind::Addition | LineKind::Context => need_new = true,
+                    }
+                    if need_old && need_new {
+                        break;
+                    }
+                }
+                if need_old && need_new {
+                    break;
+                }
+            }
+        }
+
         let (mut old_content, mut new_content) = (None, None);
         match self.diff_mode {
             DiffMode::Unstaged => {
-                if let Some(path) = old_path {
-                    old_content = self.git_show(&format!(":{}", path));
+                if need_old {
+                    if let Some(path) = old_path {
+                        old_content = self.git_show(&format!(":{}", path));
+                    }
                 }
-                if let Some(path) = new_path {
-                    new_content = self.read_working_file(path);
+                if need_new {
+                    if let Some(path) = new_path {
+                        new_content = self.read_working_file(path);
+                    }
                 }
             }
             DiffMode::Staged => {
-                if let Some(path) = old_path {
-                    old_content = self.git_show(&format!("HEAD:{}", path));
+                if need_old {
+                    if let Some(path) = old_path {
+                        old_content = self.git_show(&format!("HEAD:{}", path));
+                    }
                 }
-                if let Some(path) = new_path {
-                    new_content = self.git_show(&format!(":{}", path));
+                if need_new {
+                    if let Some(path) = new_path {
+                        new_content = self.git_show(&format!(":{}", path));
+                    }
                 }
             }
             _ => {
-                if let Some(path) = new_path.or(old_path) {
-                    new_content = self.read_working_file(path);
+                if need_new {
+                    if let Some(path) = new_path.or(old_path) {
+                        new_content = self.read_working_file(path);
+                    }
                 }
             }
         }
@@ -754,7 +833,7 @@ impl App {
             .new_path
             .as_ref()
             .map(|p| p.to_string_lossy().to_string());
-        let (old_map, new_map) = self.load_highlight_maps(
+        let (old_map, new_map) = self.cached_highlight_maps(
             file,
             old_path.as_deref(),
             new_path.as_deref().or(old_path.as_deref()),
@@ -834,13 +913,7 @@ impl App {
         let full_path = self.repo_path.join(file_path);
         let file_content = std::fs::read_to_string(&full_path).unwrap_or_default();
         let file_lines: Vec<&str> = file_content.lines().collect();
-        let file_highlights = if self.config.syntax_highlighting {
-            self.syntax_highlighter
-                .highlight_file(&file_content, file_path)
-        } else {
-            Vec::new()
-        };
-        let (old_map, _) = self.load_highlight_maps(
+        let (old_map, new_map) = self.cached_highlight_maps(
             file,
             file.old_path.as_ref().map(|p| p.to_string_lossy().to_string()).as_deref(),
             file.new_path.as_ref().map(|p| p.to_string_lossy().to_string()).as_deref(),
@@ -884,7 +957,7 @@ impl App {
                 content: content.to_string(),
                 highlights: Vec::new(),
             };
-            if let Some(line_hl) = file_highlights.get(idx) {
+            if let Some(line_hl) = new_map.get(idx) {
                 diff_line.highlights = line_hl
                     .iter()
                     .map(|h| HighlightRange {
@@ -2127,6 +2200,7 @@ impl App {
         self.scroll_offset = 0;
         self.expanded_file = None;
         self.load_collapsed_state();
+        self.clear_syntax_cache();
         self.load_all_annotations()?;
         self.build_display_lines();
 
@@ -2234,6 +2308,7 @@ impl App {
         self.current_line_idx = 0;
         self.scroll_offset = 0;
         self.expanded_file = None;
+        self.clear_syntax_cache();
         self.load_all_annotations()?;
         self.build_display_lines();
 
@@ -2261,6 +2336,11 @@ impl App {
         self.adjust_scroll();
 
         Ok(())
+    }
+
+    fn clear_syntax_cache(&mut self) {
+        self.syntax_cache_old.clear();
+        self.syntax_cache_new.clear();
     }
 
     fn save_collapsed_state(&mut self) {
