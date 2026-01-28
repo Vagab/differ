@@ -31,8 +31,6 @@ use std::thread;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
-const REATTACH_WINDOW: i32 = 5;
-const REATTACH_THRESHOLD: f32 = 0.7;
 const INITIAL_HUNK_HIGHLIGHT_COUNT: usize = 5;
 
 const HELP_TEXT: &[&str] = &[
@@ -130,6 +128,7 @@ pub enum DisplayLine {
         annotation: Annotation,
         #[allow(dead_code)]
         file_idx: usize,
+        orphaned: bool,
     },
 }
 
@@ -407,48 +406,6 @@ impl App {
     /// Load all annotations for all files and build the display lines
     fn load_all_annotations(&mut self) -> Result<()> {
         self.all_annotations = self.storage.list_annotations(self.repo_id, None)?;
-
-        if self.all_annotations.is_empty() {
-            return Ok(());
-        }
-
-        let mut file_cache: HashMap<String, Vec<String>> = HashMap::new();
-
-        let file_paths: Vec<String> = self
-            .files
-            .iter()
-            .filter_map(|file| {
-                file.new_path
-                    .as_ref()
-                    .or(file.old_path.as_ref())
-                    .map(|p| p.to_string_lossy().to_string())
-            })
-            .collect();
-
-        for path in file_paths {
-            if !self.all_annotations.iter().any(|a| a.file_path == path) {
-                continue;
-            }
-            if let Some(lines) = self.read_file_lines(&path, &mut file_cache) {
-                let indices: Vec<usize> = self
-                    .all_annotations
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, a)| a.file_path == path)
-                    .map(|(idx, _)| idx)
-                    .collect();
-
-                let storage = &self.storage;
-                let message = &mut self.message;
-                let annotations = &mut self.all_annotations;
-
-                for idx in indices {
-                    let annotation = &mut annotations[idx];
-                    Self::reattach_annotation(storage, message, annotation, &lines)?;
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -595,117 +552,6 @@ impl App {
         Ok(())
     }
 
-    fn read_file_lines(
-        &self,
-        file_path: &str,
-        cache: &mut HashMap<String, Vec<String>>,
-    ) -> Option<Vec<String>> {
-        if let Some(lines) = cache.get(file_path) {
-            return Some(lines.clone());
-        }
-        let full_path = self.repo_path.join(file_path);
-        let content = std::fs::read_to_string(&full_path).ok()?;
-        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-        cache.insert(file_path.to_string(), lines.clone());
-        Some(lines)
-    }
-
-    fn reattach_annotation(
-        storage: &Storage,
-        message: &mut Option<String>,
-        annotation: &mut Annotation,
-        lines: &[String],
-    ) -> Result<()> {
-        if annotation.side != Side::New {
-            return Ok(());
-        }
-
-        let anchor_line = if annotation.anchor_line > 0 {
-            annotation.anchor_line
-        } else {
-            annotation.start_line
-        };
-
-        if annotation.anchor_text.is_empty() {
-            let (anchor_line, anchor_text, context_before, context_after) =
-                Self::build_anchor(lines, annotation.start_line);
-            if !anchor_text.is_empty() {
-                if let Err(err) = storage.update_annotation_location(
-                    annotation.id,
-                    annotation.start_line,
-                    annotation.end_line,
-                    anchor_line,
-                    &anchor_text,
-                    &context_before,
-                    &context_after,
-                ) {
-                    *message = Some(format!("Anchor update failed: {}", err));
-                }
-                annotation.anchor_line = anchor_line;
-                annotation.anchor_text = anchor_text;
-                annotation.context_before = context_before;
-                annotation.context_after = context_after;
-            }
-            return Ok(());
-        }
-
-        if lines.is_empty() {
-            return Ok(());
-        }
-
-        let base = anchor_line as i32;
-        let start = (base - REATTACH_WINDOW).max(1) as usize;
-        let end = (base + REATTACH_WINDOW).min(lines.len() as i32) as usize;
-
-        let mut best_line = anchor_line;
-        let mut best_score = -1.0f32;
-
-        for line_no in start..=end {
-            let candidate = lines.get(line_no - 1).map(String::as_str).unwrap_or("");
-            let line_score = Self::similarity(annotation.anchor_text.as_str(), candidate);
-            let ctx_bonus = Self::context_bonus(
-                lines,
-                line_no,
-                &annotation.context_before,
-                &annotation.context_after,
-            );
-            let score = line_score + ctx_bonus;
-            if score > best_score {
-                best_score = score;
-                best_line = line_no as u32;
-            }
-        }
-
-        if best_score >= REATTACH_THRESHOLD {
-            let range_len = annotation
-                .end_line
-                .map(|end| end.saturating_sub(annotation.start_line));
-            let new_end = range_len.map(|len| best_line.saturating_add(len));
-            let (anchor_line, anchor_text, context_before, context_after) =
-                Self::build_anchor(lines, best_line);
-
-            if let Err(err) = storage.update_annotation_location(
-                annotation.id,
-                best_line,
-                new_end,
-                anchor_line,
-                &anchor_text,
-                &context_before,
-                &context_after,
-            ) {
-                *message = Some(format!("Reattach update failed: {}", err));
-            }
-            annotation.start_line = best_line;
-            annotation.end_line = new_end;
-            annotation.anchor_line = anchor_line;
-            annotation.anchor_text = anchor_text;
-            annotation.context_before = context_before;
-            annotation.context_after = context_after;
-        }
-
-        Ok(())
-    }
-
     fn build_anchor(lines: &[String], line_no: u32) -> (u32, String, String, String) {
         if line_no == 0 || lines.is_empty() {
             return (line_no, String::new(), String::new(), String::new());
@@ -724,66 +570,6 @@ impl App {
             String::new()
         };
         (line_no, anchor_text, before, after)
-    }
-
-    fn context_bonus(lines: &[String], line_no: usize, before: &str, after: &str) -> f32 {
-        let mut bonus = 0.0;
-        if !before.is_empty() {
-            let ctx: Vec<&str> = before.split('\n').collect();
-            for (i, ctx_line) in ctx.iter().rev().enumerate() {
-                let idx = line_no.saturating_sub(2 + i);
-                if idx < lines.len() && lines[idx].trim() == ctx_line.trim() {
-                    bonus += 0.1;
-                }
-            }
-        }
-        if !after.is_empty() {
-            let ctx: Vec<&str> = after.split('\n').collect();
-            for (i, ctx_line) in ctx.iter().enumerate() {
-                let idx = line_no + i;
-                if idx < lines.len() && lines[idx].trim() == ctx_line.trim() {
-                    bonus += 0.1;
-                }
-            }
-        }
-        bonus
-    }
-
-    fn similarity(a: &str, b: &str) -> f32 {
-        let a = a.trim();
-        let b = b.trim();
-        if a.is_empty() && b.is_empty() {
-            return 1.0;
-        }
-        if a.is_empty() || b.is_empty() {
-            return 0.0;
-        }
-        let dist = Self::levenshtein(a.as_bytes(), b.as_bytes()) as f32;
-        let max_len = a.len().max(b.len()) as f32;
-        if max_len == 0.0 {
-            1.0
-        } else {
-            1.0 - (dist / max_len)
-        }
-    }
-
-    fn levenshtein(a: &[u8], b: &[u8]) -> usize {
-        let mut prev: Vec<usize> = (0..=b.len()).collect();
-        let mut curr = vec![0; b.len() + 1];
-
-        for (i, &ac) in a.iter().enumerate() {
-            curr[0] = i + 1;
-            for (j, &bc) in b.iter().enumerate() {
-                let cost = if ac == bc { 0 } else { 1 };
-                curr[j + 1] = std::cmp::min(
-                    std::cmp::min(curr[j] + 1, prev[j + 1] + 1),
-                    prev[j] + cost,
-                );
-            }
-            prev.clone_from_slice(&curr);
-        }
-
-        prev[b.len()]
     }
 
     /// Build the unified display lines from all files
@@ -853,6 +639,13 @@ impl App {
         std::fs::read(&full_path)
             .ok()
             .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn read_file_lines(&self, file_path: &str) -> Option<Vec<String>> {
+        let full_path = self.repo_path.join(file_path);
+        let content = std::fs::read(&full_path).ok()?;
+        let text = String::from_utf8_lossy(&content);
+        Some(text.lines().map(|l| l.to_string()).collect())
     }
 
     fn git_merge_base(&self, from: &str, to: &str) -> Option<String> {
@@ -1295,9 +1088,13 @@ impl App {
                 && annotation.start_line <= line_no
                 && annotation.end_line.map_or(annotation.start_line == line_no, |e| e >= line_no)
             {
+                let orphaned = annotation.side == Side::New
+                    && !annotation.anchor_text.is_empty()
+                    && annotation.anchor_text.trim() != line.content.trim();
                 self.display_lines.push(DisplayLine::Annotation {
                     annotation: annotation.clone(),
                     file_idx,
+                    orphaned,
                 });
             }
         }
@@ -1418,8 +1215,7 @@ impl App {
             };
 
             let (anchor_line, anchor_text, context_before, context_after) = if side == Side::New {
-                let mut cache = HashMap::new();
-                if let Some(lines) = self.read_file_lines(&file_path, &mut cache) {
+                if let Some(lines) = self.read_file_lines(&file_path) {
                     Self::build_anchor(&lines, line_no)
                 } else {
                     (line_no, line.content.clone(), String::new(), String::new())
@@ -1672,6 +1468,7 @@ impl App {
                 if self.show_help {
                     self.help_scroll = 0;
                 }
+                return Ok(false);
             }
             _ => {}
         }
@@ -2848,10 +2645,10 @@ impl App {
     }
 
     fn annotation_list_entries(&self) -> Vec<AnnotationListEntry> {
-        let mut visible: HashMap<i64, usize> = HashMap::new();
+        let mut visible: HashMap<i64, (usize, bool)> = HashMap::new();
         for (idx, line) in self.display_lines.iter().enumerate() {
-            if let DisplayLine::Annotation { annotation, .. } = line {
-                visible.insert(annotation.id, idx);
+            if let DisplayLine::Annotation { annotation, orphaned, .. } = line {
+                visible.insert(annotation.id, (idx, *orphaned));
             }
         }
 
@@ -2865,7 +2662,8 @@ impl App {
                 side: a.side.clone(),
                 annotation_type: a.annotation_type.clone(),
                 content: a.content.clone(),
-                display_idx: visible.get(&a.id).copied(),
+                display_idx: visible.get(&a.id).map(|(idx, _)| *idx),
+                orphaned: visible.get(&a.id).map(|(_, o)| *o).unwrap_or(true),
                 resolved: a.resolved_at.is_some(),
             })
             .collect();
@@ -3416,27 +3214,49 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
 
                     ListItem::new(lines)
                 }
-                DisplayLine::Annotation { annotation, .. } => {
+                DisplayLine::Annotation { annotation, orphaned, .. } => {
                     // Annotation in a prominent box - handle multiple lines
                     let resolved = annotation.resolved_at.is_some();
                     let (prefix, style) = match annotation.annotation_type {
                         AnnotationType::Comment => (
-                            if resolved { "    ✓ RESOLVED " } else { "    💬 " },
+                            if resolved {
+                                "    ✓ RESOLVED "
+                            } else if *orphaned {
+                                "    ⚠ ORPHANED "
+                            } else {
+                                "    💬 "
+                            },
                             if resolved {
                                 Style::default()
                                     .fg(theme.resolved_fg)
                                     .bg(theme.resolved_bg)
+                                    .add_modifier(Modifier::ITALIC)
+                            } else if *orphaned {
+                                Style::default()
+                                    .fg(theme.deleted_fg)
+                                    .bg(theme.annotation_bg)
                                     .add_modifier(Modifier::ITALIC)
                             } else {
                                 Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg)
                             },
                         ),
                         AnnotationType::Todo => (
-                            if resolved { "    ✓ RESOLVED " } else { "    📌 " },
+                            if resolved {
+                                "    ✓ RESOLVED "
+                            } else if *orphaned {
+                                "    ⚠ ORPHANED "
+                            } else {
+                                "    📌 "
+                            },
                             if resolved {
                                 Style::default()
                                     .fg(theme.resolved_fg)
                                     .bg(theme.resolved_bg)
+                                    .add_modifier(Modifier::ITALIC)
+                            } else if *orphaned {
+                                Style::default()
+                                    .fg(theme.deleted_fg)
+                                    .bg(theme.todo_bg)
                                     .add_modifier(Modifier::ITALIC)
                             } else {
                                 Style::default()
@@ -3729,27 +3549,49 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     }
                 }
             }
-            DisplayLine::Annotation { annotation, .. } => {
+            DisplayLine::Annotation { annotation, orphaned, .. } => {
                 // Annotation in a prominent box - handle multiple lines
                 let resolved = annotation.resolved_at.is_some();
                 let (prefix, style) = match annotation.annotation_type {
                     AnnotationType::Comment => (
-                        if resolved { "   ✓ RESOLVED " } else { "   💬 " },
+                        if resolved {
+                            "   ✓ RESOLVED "
+                        } else if *orphaned {
+                            "   ⚠ ORPHANED "
+                        } else {
+                            "   💬 "
+                        },
                         if resolved {
                             Style::default()
                                 .fg(theme.resolved_fg)
                                 .bg(theme.resolved_bg)
+                                .add_modifier(Modifier::ITALIC)
+                        } else if *orphaned {
+                            Style::default()
+                                .fg(theme.deleted_fg)
+                                .bg(theme.annotation_bg)
                                 .add_modifier(Modifier::ITALIC)
                         } else {
                             Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg)
                         },
                     ),
                     AnnotationType::Todo => (
-                        if resolved { "   ✓ RESOLVED " } else { "   📌 " },
+                        if resolved {
+                            "   ✓ RESOLVED "
+                        } else if *orphaned {
+                            "   ⚠ ORPHANED "
+                        } else {
+                            "   📌 "
+                        },
                         if resolved {
                             Style::default()
                                 .fg(theme.resolved_fg)
                                 .bg(theme.resolved_bg)
+                                .add_modifier(Modifier::ITALIC)
+                        } else if *orphaned {
+                            Style::default()
+                                .fg(theme.deleted_fg)
+                                .bg(theme.todo_bg)
                                 .add_modifier(Modifier::ITALIC)
                         } else {
                             Style::default()
@@ -4292,6 +4134,7 @@ struct AnnotationListEntry {
     annotation_type: AnnotationType,
     content: String,
     display_idx: Option<usize>,
+    orphaned: bool,
     resolved: bool,
 }
 
@@ -4325,7 +4168,7 @@ fn render_annotation_list(f: &mut Frame, app: &mut App, theme: Theme) {
         .map(|(offset, entry)| {
             let idx = start + offset;
             let is_selected = idx == app.annotation_list_idx;
-            let is_orphaned = entry.display_idx.is_none();
+            let is_orphaned = entry.orphaned;
             let resolved = entry.resolved;
 
             let type_marker = match entry.annotation_type {
