@@ -3683,7 +3683,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             } else {
                 String::new()
             };
-            let shortcuts = " j/k:nav  n/N:chunk  c:collapse  a:add  e:edit  r:resolve";
+            let shortcuts = " j/k:nav  n/N:chunk  c:collapse  a:add  e:edit  r:resolve  ?:help";
             let content = if let Some(msg) = &app.message {
                 format!("{}{}{}", mode_label, msg, ai_suffix)
             } else {
