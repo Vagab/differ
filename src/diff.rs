@@ -65,6 +65,8 @@ pub struct DiffLine {
     pub content: String,
     /// For syntactic diffs, highlighted ranges within the line
     pub highlights: Vec<HighlightRange>,
+    /// Intraline diff ranges for additions/deletions
+    pub inline_ranges: Vec<InlineRange>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +84,12 @@ pub struct HighlightRange {
     pub start: usize,
     pub end: usize,
     pub style: TextStyle,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlineRange {
+    pub start: usize,
+    pub end: usize,
 }
 
 /// Diff engine using git diff command
@@ -321,6 +329,7 @@ impl DiffEngine {
                     new_line_no: new_no,
                     content: content.to_string(),
                     highlights: Vec::new(),
+                    inline_ranges: Vec::new(),
                 });
             }
         }
@@ -428,6 +437,7 @@ impl DiffEngine {
                     new_line_no: new_no,
                     content: content.to_string(),
                     highlights: Vec::new(),
+                    inline_ranges: Vec::new(),
                 });
             }
         }
@@ -490,6 +500,7 @@ impl DiffEngine {
                     new_line_no: Some(new_idx as u32 + 1),
                     content: old_lines[old_idx].to_string(),
                     highlights: Vec::new(),
+                    inline_ranges: Vec::new(),
                 });
                 old_idx += 1;
                 new_idx += 1;
@@ -501,6 +512,7 @@ impl DiffEngine {
                     new_line_no: Some(new_idx as u32 + 1),
                     content: new_lines[new_idx].to_string(),
                     highlights: Vec::new(),
+                    inline_ranges: Vec::new(),
                 });
                 new_idx += 1;
             } else if old_idx < old_lines.len() {
@@ -511,6 +523,7 @@ impl DiffEngine {
                     new_line_no: None,
                     content: old_lines[old_idx].to_string(),
                     highlights: Vec::new(),
+                    inline_ranges: Vec::new(),
                 });
                 old_idx += 1;
             }

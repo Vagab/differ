@@ -4,7 +4,8 @@
 
 use crate::config::{AiTarget, Config};
 use crate::diff::{
-    DiffEngine, DiffFile, DiffHunk, DiffLine, DiffMode, FileStatus, HighlightRange, LineKind,
+    DiffEngine, DiffFile, DiffHunk, DiffLine, DiffMode, FileStatus, HighlightRange, InlineRange,
+    LineKind,
 };
 use crate::storage::{Annotation, AnnotationType, Side, Storage};
 use crate::syntax::SyntaxHighlighter;
@@ -30,6 +31,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use tui_textarea::{CursorMove, Input, TextArea};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use similar::{ChangeTag, TextDiff};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
 const INITIAL_HUNK_HIGHLIGHT_COUNT: usize = 5;
@@ -303,6 +305,8 @@ struct Theme {
     added_fg: Color,
     deleted_bg: Color,
     deleted_fg: Color,
+    intraline_added_bg: Color,
+    intraline_deleted_bg: Color,
     context_fg: Color,
     line_num: Color,
     annotation_bg: Color,
@@ -341,10 +345,12 @@ impl Default for Theme {
             hunk_ctx_fg: Color::Rgb(185, 205, 235),
             hunk_border: Color::Rgb(80, 88, 72),
             selection_bg: Color::Rgb(56, 66, 88),
-            added_bg: Color::Rgb(18, 44, 26),
-            added_fg: Color::Rgb(150, 230, 185),
-            deleted_bg: Color::Rgb(52, 24, 26),
-            deleted_fg: Color::Rgb(240, 160, 160),
+            added_bg: Color::Rgb(20, 40, 28),
+            added_fg: Color::Rgb(168, 234, 196),
+            deleted_bg: Color::Rgb(48, 26, 26),
+            deleted_fg: Color::Rgb(238, 170, 170),
+            intraline_added_bg: Color::Rgb(28, 66, 38),
+            intraline_deleted_bg: Color::Rgb(84, 34, 34),
             context_fg: Color::Rgb(220, 224, 230),
             line_num: Color::Rgb(120, 130, 140),
             annotation_bg: Color::Rgb(40, 76, 78),
@@ -946,6 +952,7 @@ impl App {
         );
 
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+            let inline_ranges = compute_intraline_ranges(&hunk.lines);
             // Count additions and deletions in this hunk
             let additions = hunk.lines.iter().filter(|l| l.kind == LineKind::Addition).count();
             let deletions = hunk.lines.iter().filter(|l| l.kind == LineKind::Deletion).count();
@@ -989,8 +996,11 @@ impl App {
                 hunk_idx,
             });
 
-            for line in &hunk.lines {
+            for (line_idx, line) in hunk.lines.iter().enumerate() {
                 let mut highlighted_line = line.clone();
+                if let Some(ranges) = inline_ranges.get(line_idx) {
+                    highlighted_line.inline_ranges = ranges.clone();
+                }
                 self.highlight_from_maps(&mut highlighted_line, &old_map, &new_map);
 
                 out.push(DisplayLine::Diff {
@@ -1021,21 +1031,28 @@ impl App {
         // Build maps of line changes from diff hunks
         // Key: new_line_no for additions/context, old_line_no for deletions
         let mut additions: HashMap<u32, String> = HashMap::new();
+        let mut inline_additions: HashMap<u32, Vec<InlineRange>> = HashMap::new();
         let mut deletions: Vec<(u32, u32, String)> = Vec::new(); // (insert_after_new_line, old_line_no, content)
 
         let mut hunk_ranges: Vec<(std::ops::RangeInclusive<u32>, std::ops::RangeInclusive<u32>)> =
             Vec::new();
         for hunk in &file.hunks {
+            let inline_ranges = compute_intraline_ranges(&hunk.lines);
             let old_range = hunk.old_start..=hunk.old_start.saturating_add(hunk.old_lines.saturating_sub(1));
             let new_range = hunk.new_start..=hunk.new_start.saturating_add(hunk.new_lines.saturating_sub(1));
             hunk_ranges.push((old_range, new_range));
             let mut last_new_line: u32 = hunk.new_start.saturating_sub(1);
-            for line in &hunk.lines {
+            for (line_idx, line) in hunk.lines.iter().enumerate() {
                 match line.kind {
                     LineKind::Addition => {
                         if let Some(n) = line.new_line_no {
                             additions.insert(n, line.content.clone());
                             last_new_line = n;
+                            if let Some(ranges) = inline_ranges.get(line_idx) {
+                                if !ranges.is_empty() {
+                                    inline_additions.insert(n, ranges.clone());
+                                }
+                            }
                         }
                     }
                     LineKind::Deletion => {
@@ -1069,19 +1086,21 @@ impl App {
 
             // First, show any deletions that come before this line
             for (insert_after, old_no, del_content) in &deletions {
-                if *insert_after == line_no.saturating_sub(1) {
+                let effective_insert_after = if *insert_after == 0 { 1 } else { *insert_after };
+                if effective_insert_after == line_no.saturating_sub(1) {
                     let mut del_line = DiffLine {
                         kind: LineKind::Deletion,
                         old_line_no: Some(*old_no),
                         new_line_no: None,
                         content: del_content.clone(),
                         highlights: Vec::new(),
+                        inline_ranges: Vec::new(),
                     };
                     self.highlight_from_maps(&mut del_line, &old_map, &[]);
                     let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
                         old_range.contains(old_no)
                     });
-                    self.display_lines.push(DisplayLine::Diff {
+                    out.push(DisplayLine::Diff {
                         line: del_line,
                         file_idx,
                         file_path: file_path.to_string(),
@@ -1103,7 +1122,11 @@ impl App {
                 new_line_no: Some(line_no),
                 content: content.to_string(),
                 highlights: Vec::new(),
+                inline_ranges: Vec::new(),
             };
+            if let Some(ranges) = inline_additions.get(&line_no) {
+                diff_line.inline_ranges = ranges.clone();
+            }
             if let Some(line_hl) = new_map.get(idx) {
                 diff_line.highlights = line_hl
                     .iter()
@@ -1131,13 +1154,15 @@ impl App {
         // Show any trailing deletions
         let last_line = file_lines.len() as u32;
         for (insert_after, old_no, del_content) in &deletions {
-            if *insert_after >= last_line {
+            let effective_insert_after = if *insert_after == 0 { 1 } else { *insert_after };
+            if effective_insert_after >= last_line {
                 let mut del_line = DiffLine {
                     kind: LineKind::Deletion,
                     old_line_no: Some(*old_no),
                     new_line_no: None,
                     content: del_content.clone(),
                     highlights: Vec::new(),
+                    inline_ranges: Vec::new(),
                 };
                 self.highlight_from_maps(&mut del_line, &old_map, &[]);
                 let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
@@ -1653,11 +1678,13 @@ impl App {
         }
 
         if key.code == KeyCode::Char('?') {
-            self.show_help = !self.show_help;
-            if self.show_help {
-                self.help_scroll = 0;
+            if matches!(self.mode, Mode::Normal | Mode::AnnotationList) {
+                self.show_help = !self.show_help;
+                if self.show_help {
+                    self.help_scroll = 0;
+                }
+                return Ok(false);
             }
-            return Ok(false);
         }
 
         if self.show_help {
@@ -3644,8 +3671,15 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                     let style = Style::default()
                         .fg(theme.hunk_ctx_fg)
                         .bg(theme.hunk_ctx_bg);
-                    let content_spans =
-                        build_highlighted_spans(text, highlights, style, false, theme.hunk_ctx_bg);
+                    let content_spans = build_highlighted_spans(
+                        text,
+                        highlights,
+                        &[],
+                        style,
+                        false,
+                        theme.hunk_ctx_bg,
+                        None,
+                    );
                     let line_num = format!("{:>4}", line_no);
                     let line_num_style = Style::default()
                         .fg(theme.hunk_ctx_fg)
@@ -3708,17 +3742,20 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                     };
                     let line_num = format!("{:>4}", line_no);
 
-                    let (prefix, mut content_style) = match line.kind {
+                    let (prefix, mut content_style, prefix_style) = match line.kind {
                         LineKind::Addition => (
                             "+",
+                            Style::default().fg(theme.context_fg).bg(theme.added_bg),
                             Style::default().fg(theme.added_fg).bg(theme.added_bg),
                         ),
                         LineKind::Deletion => (
                             "-",
+                            Style::default().fg(theme.context_fg).bg(theme.deleted_bg),
                             Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg),
                         ),
                         LineKind::Context => (
                             " ",
+                            Style::default().fg(theme.context_fg),
                             Style::default().fg(theme.context_fg),
                         ),
                     };
@@ -3743,15 +3780,22 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         Span::styled(annotation_marker, marker_style),
                         Span::styled(line_num, line_num_style),
                         Span::raw(" "),
-                        Span::styled(format!("{} ", prefix), content_style),
+                        Span::styled(format!("{} ", prefix), prefix_style),
                     ];
 
+                    let inline_bg = match line.kind {
+                        LineKind::Addition => Some(theme.intraline_added_bg),
+                        LineKind::Deletion => Some(theme.intraline_deleted_bg),
+                        _ => None,
+                    };
                     let content_spans = build_highlighted_spans(
                         &line.content,
                         &line.highlights,
+                        &line.inline_ranges,
                         content_style,
                         is_current,
                         if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                        inline_bg,
                     );
 
                     let lines = wrap_spans_with_prefix(
@@ -3941,7 +3985,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     .fg(theme.hunk_ctx_fg)
                     .bg(theme.hunk_ctx_bg);
                 let content_spans =
-                    build_highlighted_spans(text, highlights, style, false, theme.hunk_ctx_bg);
+                    build_highlighted_spans(text, highlights, &[], style, false, theme.hunk_ctx_bg, None);
                 let line_num = format!("{:>4}", line_no);
                 let line_num_style = Style::default()
                     .fg(theme.hunk_ctx_fg)
@@ -4009,7 +4053,8 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         let old_no = line
                             .old_line_no
                             .map_or("    ".to_string(), |n| format!("{:>4}", n));
-                        let content_style = Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg);
+                        let content_style = Style::default().fg(theme.context_fg).bg(theme.deleted_bg);
+                        let prefix_style = Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg);
                         let line_num_style = if is_current {
                             Style::default().fg(theme.deleted_fg).bg(theme.current_line_bg)
                         } else if is_selected {
@@ -4025,14 +4070,16 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         let left_spans = vec![
                             Span::styled(marker.clone(), marker_style),
                             Span::styled(old_no, line_num_style),
-                            Span::styled("- ", content_style),
+                            Span::styled("- ", prefix_style),
                         ];
                         let content_spans = build_highlighted_spans(
                             &line.content,
                             &line.highlights,
+                            &line.inline_ranges,
                             content_style,
                             is_current,
                             if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                            Some(theme.intraline_deleted_bg),
                         );
                         let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
                         left_items.push(ListItem::new(lines));
@@ -4042,7 +4089,8 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         let new_no = line
                             .new_line_no
                             .map_or("    ".to_string(), |n| format!("{:>4}", n));
-                        let content_style = Style::default().fg(theme.added_fg).bg(theme.added_bg);
+                        let content_style = Style::default().fg(theme.context_fg).bg(theme.added_bg);
+                        let prefix_style = Style::default().fg(theme.added_fg).bg(theme.added_bg);
                         let line_num_style = if is_current {
                             Style::default().fg(theme.added_fg).bg(theme.current_line_bg)
                         } else if is_selected {
@@ -4059,14 +4107,16 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         let right_spans = vec![
                             Span::styled(marker.clone(), marker_style),
                             Span::styled(new_no, line_num_style),
-                            Span::styled("+ ", content_style),
+                            Span::styled("+ ", prefix_style),
                         ];
                         let content_spans = build_highlighted_spans(
                             &line.content,
                             &line.highlights,
+                            &line.inline_ranges,
                             content_style,
                             is_current,
                             if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                            Some(theme.intraline_added_bg),
                         );
                         let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
                         right_items.push(ListItem::new(lines));
@@ -4099,9 +4149,11 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         let content_spans = build_highlighted_spans(
                             &line.content,
                             &line.highlights,
+                            &line.inline_ranges,
                             content_style,
                             is_current,
                             if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                            None,
                         );
                         let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
                         left_items.push(ListItem::new(lines));
@@ -4114,9 +4166,11 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         let content_spans = build_highlighted_spans(
                             &line.content,
                             &line.highlights,
+                            &line.inline_ranges,
                             content_style,
                             is_current,
                             if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                            None,
                         );
                         let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
                         right_items.push(ListItem::new(lines));
@@ -4902,9 +4956,11 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 fn build_highlighted_spans(
     content: &str,
     highlights: &[HighlightRange],
+    inline_ranges: &[InlineRange],
     base_style: Style,
     is_current: bool,
     current_line_bg: Color,
+    inline_bg: Option<Color>,
 ) -> Vec<Span<'static>> {
     let base_style = if is_current {
         base_style
@@ -4914,56 +4970,64 @@ fn build_highlighted_spans(
         base_style
     };
 
-    if highlights.is_empty() {
+    if highlights.is_empty() && inline_ranges.is_empty() {
         return vec![Span::styled(content.to_string(), base_style)];
     }
 
     let content_bytes = content.as_bytes();
-    let mut pos = 0;
-    let mut spans: Vec<Span<'static>> = Vec::new();
-
-    let mut sorted: Vec<HighlightRange> = highlights.to_vec();
-    sorted.sort_by_key(|h| h.start);
-    for highlight in sorted {
-        // Ensure we don't go out of bounds
-        let mut start = highlight.start.min(content_bytes.len());
-        let mut end = highlight.end.min(content_bytes.len());
-
-        if start < pos {
-            start = pos;
-        }
-        if end < pos {
-            end = pos;
-        }
-        if start == end {
-            continue;
-        }
-        if end <= start {
-            continue;
-        }
-
-        if start > pos {
-            // Add unhighlighted segment
-            if let Ok(segment) = std::str::from_utf8(&content_bytes[pos..start]) {
-                spans.push(Span::styled(segment.to_string(), base_style));
-            }
-        }
-
-        if end > start {
-            // Add highlighted segment
-            if let Ok(segment) = std::str::from_utf8(&content_bytes[start..end]) {
-                let styled = apply_text_style(base_style, highlight.style, is_current);
-                spans.push(Span::styled(segment.to_string(), styled));
-            }
-        }
-
-        pos = end;
+    let mut boundaries: Vec<usize> = Vec::new();
+    boundaries.push(0);
+    boundaries.push(content_bytes.len());
+    for h in highlights {
+        boundaries.push(h.start.min(content_bytes.len()));
+        boundaries.push(h.end.min(content_bytes.len()));
     }
+    for r in inline_ranges {
+        boundaries.push(r.start.min(content_bytes.len()));
+        boundaries.push(r.end.min(content_bytes.len()));
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
 
-    // Add remaining unhighlighted content
-    if pos < content_bytes.len() {
-        if let Ok(segment) = std::str::from_utf8(&content_bytes[pos..]) {
-            spans.push(Span::styled(segment.to_string(), base_style));
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut h_idx = 0usize;
+    let mut sorted_highlights: Vec<HighlightRange> = highlights.to_vec();
+    sorted_highlights.sort_by_key(|h| h.start);
+    let mut sorted_inline: Vec<InlineRange> = inline_ranges.to_vec();
+    sorted_inline.sort_by_key(|r| r.start);
+    let mut i_idx = 0usize;
+
+    for window in boundaries.windows(2) {
+        let start = window[0];
+        let end = window[1];
+        if start >= end {
+            continue;
+        }
+        while h_idx < sorted_highlights.len() && sorted_highlights[h_idx].end <= start {
+            h_idx += 1;
+        }
+        while i_idx < sorted_inline.len() && sorted_inline[i_idx].end <= start {
+            i_idx += 1;
+        }
+
+        let mut style = base_style;
+        if h_idx < sorted_highlights.len() {
+            let h = &sorted_highlights[h_idx];
+            if h.start <= start && h.end >= end {
+                style = apply_text_style(base_style, h.style, is_current);
+            }
+        }
+        if let Some(bg) = inline_bg {
+            if i_idx < sorted_inline.len() {
+                let r = &sorted_inline[i_idx];
+                if r.start <= start && r.end >= end {
+                    style = style.bg(bg).add_modifier(Modifier::BOLD);
+                }
+            }
+        }
+
+        if let Ok(segment) = std::str::from_utf8(&content_bytes[start..end]) {
+            spans.push(Span::styled(segment.to_string(), style));
         }
     }
 
@@ -4989,6 +5053,93 @@ fn apply_text_style(base: Style, style: crate::syntax::TextStyle, is_current: bo
 
 fn span_width(span: &Span) -> usize {
     span.content.width()
+}
+
+fn compute_inline_ranges(old: &str, new: &str) -> (Vec<InlineRange>, Vec<InlineRange>) {
+    let diff = TextDiff::from_words(old, new);
+    let mut old_pos = 0usize;
+    let mut new_pos = 0usize;
+    let mut old_ranges = Vec::new();
+    let mut new_ranges = Vec::new();
+
+    for change in diff.iter_all_changes() {
+        let len = change.value().len();
+        if len == 0 {
+            continue;
+        }
+        match change.tag() {
+            ChangeTag::Delete => {
+                old_ranges.push(InlineRange {
+                    start: old_pos,
+                    end: old_pos + len,
+                });
+                old_pos += len;
+            }
+            ChangeTag::Insert => {
+                new_ranges.push(InlineRange {
+                    start: new_pos,
+                    end: new_pos + len,
+                });
+                new_pos += len;
+            }
+            ChangeTag::Equal => {
+                old_pos += len;
+                new_pos += len;
+            }
+        }
+    }
+
+    (merge_inline_ranges(old_ranges), merge_inline_ranges(new_ranges))
+}
+
+fn merge_inline_ranges(mut ranges: Vec<InlineRange>) -> Vec<InlineRange> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort_by_key(|r| r.start);
+    let mut merged = Vec::new();
+    let mut current = ranges.remove(0);
+    for r in ranges {
+        if r.start <= current.end {
+            current.end = current.end.max(r.end);
+        } else {
+            merged.push(current);
+            current = r;
+        }
+    }
+    merged.push(current);
+    merged
+}
+
+fn compute_intraline_ranges(lines: &[DiffLine]) -> Vec<Vec<InlineRange>> {
+    let mut per_line: Vec<Vec<InlineRange>> = vec![Vec::new(); lines.len()];
+    let mut i = 0usize;
+    while i < lines.len() {
+        if lines[i].kind == LineKind::Deletion {
+            let del_start = i;
+            while i < lines.len() && lines[i].kind == LineKind::Deletion {
+                i += 1;
+            }
+            let add_start = i;
+            while i < lines.len() && lines[i].kind == LineKind::Addition {
+                i += 1;
+            }
+            let del_count = add_start - del_start;
+            let add_count = i - add_start;
+            let pair_count = del_count.min(add_count);
+            for k in 0..pair_count {
+                let (del_ranges, add_ranges) = compute_inline_ranges(
+                    &lines[del_start + k].content,
+                    &lines[add_start + k].content,
+                );
+                per_line[del_start + k] = del_ranges;
+                per_line[add_start + k] = add_ranges;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    per_line
 }
 
 fn split_by_width(s: &str, max_width: usize) -> (String, String) {

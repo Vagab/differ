@@ -29,6 +29,7 @@ sha2 = "0.10"
 toml = "0.8"
 regex = "1.10"
 unicode-width = "0.1"
+similar = "2.6"
 
 [dev-dependencies]
 tempfile = "3.10"
