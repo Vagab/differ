@@ -1652,6 +1652,30 @@ impl App {
             return Ok(false);
         }
 
+        if key.code == KeyCode::Char('?') {
+            self.show_help = !self.show_help;
+            if self.show_help {
+                self.help_scroll = 0;
+            }
+            return Ok(false);
+        }
+
+        if self.show_help {
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.help_scroll_down(),
+                KeyCode::Char('k') | KeyCode::Up => self.help_scroll_up(),
+                KeyCode::PageDown | KeyCode::Char(' ') => self.help_page_down(),
+                KeyCode::PageUp => self.help_page_up(),
+                KeyCode::Char('g') => self.help_scroll = 0,
+                KeyCode::Char('G') => self.help_scroll = self.max_help_scroll(),
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.show_help = false;
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+
         match &self.mode {
             Mode::Normal => self.handle_normal_input(key),
             Mode::AddAnnotation | Mode::EditAnnotation(_) => self.handle_annotation_input(key),
@@ -1696,13 +1720,9 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => return Ok(true), // Quit
-            KeyCode::Char('?') => {
-                self.show_help = !self.show_help;
-                if self.show_help {
-                    self.help_scroll = 0;
-                }
-                return Ok(false);
-            }
+            _ => {}
+        }
+        match key.code {
             KeyCode::Char('V') => {
                 if self.selection_active {
                     self.selection_active = false;
@@ -1726,22 +1746,6 @@ impl App {
                 return Ok(false);
             }
             _ => {}
-        }
-
-        if self.show_help {
-            match key.code {
-                KeyCode::Char('j') | KeyCode::Down => self.help_scroll_down(),
-                KeyCode::Char('k') | KeyCode::Up => self.help_scroll_up(),
-                KeyCode::PageDown | KeyCode::Char(' ') => self.help_page_down(),
-                KeyCode::PageUp => self.help_page_up(),
-                KeyCode::Char('g') => self.help_scroll = 0,
-                KeyCode::Char('G') => self.help_scroll = self.max_help_scroll(),
-                KeyCode::Esc | KeyCode::Char('?') => {
-                    self.show_help = false;
-                }
-                _ => {}
-            }
-            return Ok(false);
         }
         match key.code {
             // Navigation
@@ -3395,8 +3399,20 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
                     }
                 }
                 Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => app.scroll_by_lines(-3),
-                    MouseEventKind::ScrollDown => app.scroll_by_lines(3),
+                    MouseEventKind::ScrollUp => {
+                        if app.show_help {
+                            app.help_scroll_up();
+                        } else {
+                            app.scroll_by_lines(-3);
+                        }
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if app.show_help {
+                            app.help_scroll_down();
+                        } else {
+                            app.scroll_by_lines(3);
+                        }
+                    }
                     _ => {}
                 },
                 _ => {}
