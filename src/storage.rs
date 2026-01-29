@@ -265,37 +265,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Updates an annotation's position and anchor data
-    pub fn update_annotation_location(
-        &self,
-        id: i64,
-        start_line: u32,
-        end_line: Option<u32>,
-        anchor_line: u32,
-        anchor_text: &str,
-        context_before: &str,
-        context_after: &str,
-    ) -> Result<()> {
-        self.conn.execute(
-            r#"
-            UPDATE annotations
-            SET start_line = ?1, end_line = ?2, anchor_line = ?3, anchor_text = ?4,
-                context_before = ?5, context_after = ?6
-            WHERE id = ?7
-            "#,
-            params![
-                start_line,
-                end_line,
-                anchor_line,
-                anchor_text,
-                context_before,
-                context_after,
-                id,
-            ],
-        )?;
-        Ok(())
-    }
-
     /// Deletes an annotation
     pub fn delete_annotation(&self, id: i64) -> Result<()> {
         self.conn.execute(

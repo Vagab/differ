@@ -4,8 +4,9 @@
 
 use anyhow::{Context, Result};
 use git2::Repository;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Diff mode - what to compare
 #[derive(Debug, Clone)]
@@ -84,6 +85,7 @@ pub struct HighlightRange {
 }
 
 /// Diff engine using git diff command
+#[derive(Clone)]
 pub struct DiffEngine {
     repo_path: PathBuf,
     context_lines: u32,
@@ -98,6 +100,7 @@ impl DiffEngine {
     }
 
     /// Main diff method - handles all diff modes
+    #[allow(dead_code)]
     pub fn diff(&self, mode: &DiffMode, paths: &[String]) -> Result<Vec<DiffFile>> {
         match mode {
             DiffMode::Unstaged => self.diff_via_git_cmd(&[], paths),
@@ -117,7 +120,37 @@ impl DiffEngine {
         }
     }
 
+    /// Stream diff results file-by-file.
+    pub fn diff_stream<F>(&self, mode: &DiffMode, paths: &[String], mut on_file: F) -> Result<()>
+    where
+        F: FnMut(DiffFile) -> Result<()>,
+    {
+        match mode {
+            DiffMode::Unstaged => self.diff_via_git_cmd_stream(&[], paths, &mut on_file),
+            DiffMode::Staged => self.diff_via_git_cmd_stream(&["--staged"], paths, &mut on_file),
+            DiffMode::WorkingTree { base } => {
+                self.diff_via_git_cmd_stream(&[base.as_str()], paths, &mut on_file)
+            }
+            DiffMode::Commits { from, to } => {
+                let range = format!("{}..{}", from, to);
+                self.diff_via_git_cmd_stream(&[&range], paths, &mut on_file)
+            }
+            DiffMode::MergeBase { from, to } => {
+                let range = format!("{}...{}", from, to);
+                self.diff_via_git_cmd_stream(&[&range], paths, &mut on_file)
+            }
+            DiffMode::ExternalDiff { path, old_file, new_file } => {
+                let files = self.diff_external_files(path, old_file, new_file)?;
+                for file in files {
+                    on_file(file)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Use git diff command directly - handles custom diff drivers properly
+    #[allow(dead_code)]
     fn diff_via_git_cmd(&self, args: &[&str], paths: &[String]) -> Result<Vec<DiffFile>> {
         let mut cmd = Command::new("git");
         cmd.arg("-C")
@@ -151,7 +184,58 @@ impl DiffEngine {
         self.parse_full_diff(&String::from_utf8_lossy(&output.stdout))
     }
 
+    fn diff_via_git_cmd_stream<F>(
+        &self,
+        args: &[&str],
+        paths: &[String],
+        on_file: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(DiffFile) -> Result<()>,
+    {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.repo_path)
+            .arg("diff")
+            .arg("--no-color")
+            .arg(format!("-U{}", self.context_lines))
+            .arg("--find-renames")
+            .arg("--find-copies");
+
+        for arg in args {
+            cmd.arg(arg);
+        }
+
+        if !paths.is_empty() {
+            cmd.arg("--");
+            for path in paths {
+                if !path.is_empty() {
+                    cmd.arg(path);
+                }
+            }
+        }
+
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().context("Failed to run git diff")?;
+        let stdout = child.stdout.take().context("Failed to capture git diff stdout")?;
+        let mut reader = BufReader::new(stdout);
+        self.parse_stream(&mut reader, on_file)?;
+
+        let mut stderr = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            err.read_to_string(&mut stderr).ok();
+        }
+        let status = child.wait().context("Failed to wait for git diff")?;
+        if !status.success() {
+            anyhow::bail!("git diff failed: {}", stderr.trim());
+        }
+
+        Ok(())
+    }
+
     /// Parse full unified diff output into DiffFile structs
+    #[allow(dead_code)]
     fn parse_full_diff(&self, diff_output: &str) -> Result<Vec<DiffFile>> {
         let mut files = Vec::new();
         let mut current_file: Option<DiffFile> = None;
@@ -253,6 +337,111 @@ impl DiffEngine {
         files.retain(|f| !f.hunks.is_empty());
 
         Ok(files)
+    }
+
+    fn parse_stream<R: BufRead, F: FnMut(DiffFile) -> Result<()>>(
+        &self,
+        reader: &mut R,
+        on_file: &mut F,
+    ) -> Result<()> {
+        let mut current_file: Option<DiffFile> = None;
+        let mut current_hunk: Option<DiffHunk> = None;
+        let mut old_line = 0u32;
+        let mut new_line = 0u32;
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.starts_with("diff --git") {
+                if let Some(mut f) = current_file.take() {
+                    if let Some(h) = current_hunk.take() {
+                        f.hunks.push(h);
+                    }
+                    if !f.hunks.is_empty() {
+                        on_file(f)?;
+                    }
+                }
+                let paths = parse_diff_git_line(&line);
+                current_file = Some(DiffFile {
+                    old_path: paths.0.map(PathBuf::from),
+                    new_path: paths.1.map(PathBuf::from),
+                    status: FileStatus::Modified,
+                    hunks: Vec::new(),
+                });
+            } else if line.starts_with("new file") {
+                if let Some(ref mut f) = current_file {
+                    f.status = FileStatus::Added;
+                }
+            } else if line.starts_with("deleted file") {
+                if let Some(ref mut f) = current_file {
+                    f.status = FileStatus::Deleted;
+                }
+            } else if line.starts_with("rename from") || line.starts_with("similarity index") {
+                if let Some(ref mut f) = current_file {
+                    f.status = FileStatus::Renamed;
+                }
+            } else if line.starts_with("@@") {
+                if let Some(h) = current_hunk.take() {
+                    if let Some(ref mut f) = current_file {
+                        f.hunks.push(h);
+                        if !f.hunks.is_empty() {
+                            on_file(f.clone())?;
+                        }
+                    }
+                }
+                if let Some(header) = parse_hunk_header(&line) {
+                    old_line = header.0;
+                    new_line = header.2;
+                    current_hunk = Some(DiffHunk {
+                        old_start: header.0,
+                        old_lines: header.1,
+                        new_start: header.2,
+                        new_lines: header.3,
+                        header: header.4,
+                        lines: Vec::new(),
+                    });
+                }
+            } else if let Some(ref mut hunk) = current_hunk {
+                let (kind, old_no, new_no) = if line.starts_with('+') {
+                    let no = new_line;
+                    new_line += 1;
+                    (LineKind::Addition, None, Some(no))
+                } else if line.starts_with('-') {
+                    let no = old_line;
+                    old_line += 1;
+                    (LineKind::Deletion, Some(no), None)
+                } else if line.starts_with(' ') {
+                    let old_no = old_line;
+                    let new_no = new_line;
+                    old_line += 1;
+                    new_line += 1;
+                    (LineKind::Context, Some(old_no), Some(new_no))
+                } else if line.starts_with('\\') {
+                    continue;
+                } else {
+                    continue;
+                };
+
+                let content = if line.len() > 1 { &line[1..] } else { "" };
+                hunk.lines.push(DiffLine {
+                    kind,
+                    old_line_no: old_no,
+                    new_line_no: new_no,
+                    content: content.to_string(),
+                    highlights: Vec::new(),
+                });
+            }
+        }
+
+        if let Some(mut f) = current_file {
+            if let Some(h) = current_hunk {
+                f.hunks.push(h);
+            }
+            if !f.hunks.is_empty() {
+                on_file(f)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Diff two files directly (for git external diff mode)

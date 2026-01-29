@@ -266,21 +266,6 @@ fn cmd_diff(
 ) -> Result<()> {
     let diff_engine = DiffEngine::new(repo_path.clone(), config.context_lines);
 
-    let files = diff_engine.diff(&args.mode, &args.paths)?;
-
-    if files.is_empty() {
-        let msg = match &args.mode {
-            DiffMode::Unstaged => "No unstaged changes",
-            DiffMode::Staged => "No staged changes",
-            DiffMode::WorkingTree { base } => &format!("No changes against {}", base),
-            DiffMode::Commits { from, to } => &format!("No changes between {} and {}", from, to),
-            DiffMode::MergeBase { from, to } => &format!("No changes between {} and {} (merge-base)", from, to),
-            DiffMode::ExternalDiff { path, .. } => &format!("No changes in {}", path),
-        };
-        println!("{}", msg);
-        return Ok(());
-    }
-
     // Clone storage for TUI (it needs ownership)
     let tui_storage = Storage::open_default()?;
 
@@ -289,7 +274,7 @@ fn cmd_diff(
         diff_engine,
         repo_path.clone(),
         repo_id,
-        files,
+        Vec::new(),
         config,
         args.mode.clone(),
         args.paths.clone(),

@@ -9,6 +9,7 @@ license = "MIT"
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
+tui-textarea = "0.7"
 
 # Storage & serialization
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -10,7 +10,7 @@ use crate::storage::{Annotation, AnnotationType, Side, Storage};
 use crate::syntax::SyntaxHighlighter;
 use anyhow::{anyhow, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind, DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use tui_textarea::{CursorMove, Input, TextArea};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
@@ -59,26 +60,30 @@ const HELP_TEXT: &[&str] = &[
     "    s         Stage/unstage current hunk",
     "    u         Toggle staged/unstaged view",
     "    R         Reload diff",
+    "    Ctrl+r    Reload diff (global)",
     "    @         Send annotation to AI",
     "    P         Toggle AI pane",
     "    A         Annotation list",
-    "",
-    "  Annotations:",
-    "    a         Add annotation at current line",
-    "    e         Edit annotation at current line",
-    "    d         Delete annotation at current line",
-    "    r         Resolve annotation at current line",
-    "    t         Toggle annotation type (comment/todo)",
-    "",
+        "",
+        "  Annotations:",
+        "    a         Add annotation at current line",
+        "    e         Edit annotation at current line",
+        "    d         Delete annotation at current line",
+        "    r         Resolve annotation at current line",
+        "    t         Toggle annotation type (comment/todo)",
+        "    V         Select lines for range annotation",
+        "",
     "  Other:",
     "    ?         Toggle this help",
     "    q         Quit",
     "",
-    "  In annotation mode:",
-    "    Enter     Save annotation",
-    "    Ctrl+j    Add newline",
-    "    Ctrl+t    Toggle annotation type",
-    "    Arrows    Move cursor",
+        "  In annotation mode:",
+        "    Enter     Save annotation",
+        "    Ctrl+j    Add newline",
+        "    Ctrl+d/u  Scroll diff",
+        "    PgUp/PgDn Scroll diff",
+        "    Ctrl+t    Toggle annotation type",
+        "    Arrows    Move cursor",
     "    Home/End  Line start/end",
     "    Del/BS    Delete",
     "    Esc       Cancel",
@@ -145,7 +150,9 @@ pub struct App {
 
     // Diff state
     files: Vec<DiffFile>,
+    diff_file_index: HashMap<String, usize>,
     display_lines: Vec<DisplayLine>,
+    file_line_ranges: Vec<Option<(usize, usize)>>,
     current_line_idx: usize,
     scroll_offset: usize,
 
@@ -157,16 +164,26 @@ pub struct App {
     syntax_cache_old: HashMap<String, Vec<Vec<HighlightRange>>>,
     syntax_cache_new: HashMap<String, Vec<Vec<HighlightRange>>>,
     eager_highlight_files: HashSet<String>,
+    eager_hunks_remaining: usize,
     highlight_pending: HashSet<String>,
     highlight_generation: u64,
     highlight_rx: Receiver<HighlightEvent>,
     highlight_tx: Sender<HighlightEvent>,
+    diff_generation: u64,
+    diff_loading: bool,
+    diff_rx: Receiver<DiffStreamEvent>,
+    diff_tx: Sender<DiffStreamEvent>,
+    diff_target: Option<(String, u32)>,
+    diff_pending_reset: bool,
+    cached_unstaged: Option<Vec<DiffFile>>,
+    cached_staged: Option<Vec<DiffFile>>,
 
     // UI state
     mode: Mode,
-    annotation_input: String,
-    annotation_cursor: usize,
+    annotation_input: TextArea<'static>,
     annotation_type: AnnotationType,
+    annotation_range: Option<(u32, u32)>,
+    annotation_side: Option<Side>,
     message: Option<String>,
     show_help: bool,
     help_scroll: usize,
@@ -179,6 +196,10 @@ pub struct App {
     collapsed_files_unstaged: HashSet<String>,
     collapsed_files_staged: HashSet<String>,
     collapsed_files_other: HashSet<String>,
+    selection_active: bool,
+    selection_start: Option<usize>,
+    selection_file_idx: Option<usize>,
+    selection_hunk_idx: Option<usize>,
     // Position to restore when collapsing expanded view
     pre_expand_position: Option<(usize, usize)>, // (line_idx, scroll_offset)
     annotation_list_idx: usize,
@@ -201,6 +222,12 @@ enum Mode {
     SearchFile,          // searching by filename
     SearchContent,       // searching within content
     AnnotationList,
+}
+
+#[derive(Debug)]
+enum DiffStreamEvent {
+    File { generation: u64, file: DiffFile },
+    Done { generation: u64, error: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +298,7 @@ struct Theme {
     hunk_ctx_bg: Color,
     hunk_ctx_fg: Color,
     hunk_border: Color,
+    selection_bg: Color,
     added_bg: Color,
     added_fg: Color,
     deleted_bg: Color,
@@ -312,6 +340,7 @@ impl Default for Theme {
             hunk_ctx_bg: Color::Rgb(36, 44, 70),
             hunk_ctx_fg: Color::Rgb(185, 205, 235),
             hunk_border: Color::Rgb(80, 88, 72),
+            selection_bg: Color::Rgb(56, 66, 88),
             added_bg: Color::Rgb(18, 44, 26),
             added_fg: Color::Rgb(150, 230, 185),
             deleted_bg: Color::Rgb(52, 24, 26),
@@ -351,6 +380,7 @@ impl App {
         let side_by_side = config.side_by_side;
         let (ai_tx, ai_rx) = mpsc::channel();
         let (highlight_tx, highlight_rx) = mpsc::channel();
+        let (diff_tx, diff_rx) = mpsc::channel();
 
         let syntax_theme = config.syntax_theme.clone();
 
@@ -363,7 +393,9 @@ impl App {
             diff_mode,
             diff_paths,
             files,
+            diff_file_index: HashMap::new(),
             display_lines: Vec::new(),
+            file_line_ranges: Vec::new(),
             current_line_idx: 0,
             scroll_offset: 0,
             all_annotations: Vec::new(),
@@ -371,14 +403,24 @@ impl App {
             syntax_cache_old: HashMap::new(),
             syntax_cache_new: HashMap::new(),
             eager_highlight_files: HashSet::new(),
+            eager_hunks_remaining: INITIAL_HUNK_HIGHLIGHT_COUNT,
             highlight_pending: HashSet::new(),
             highlight_generation: 0,
             highlight_rx,
             highlight_tx,
+            diff_generation: 0,
+            diff_loading: false,
+            diff_rx,
+            diff_tx,
+            diff_target: None,
+            diff_pending_reset: false,
+            cached_unstaged: None,
+            cached_staged: None,
             mode: Mode::Normal,
-            annotation_input: String::new(),
-            annotation_cursor: 0,
+            annotation_input: TextArea::default(),
             annotation_type: AnnotationType::Comment,
+            annotation_range: None,
+            annotation_side: None,
             message: None,
             show_help: false,
             help_scroll: 0,
@@ -391,6 +433,10 @@ impl App {
             collapsed_files_unstaged: HashSet::new(),
             collapsed_files_staged: HashSet::new(),
             collapsed_files_other: HashSet::new(),
+            selection_active: false,
+            selection_start: None,
+            selection_file_idx: None,
+            selection_hunk_idx: None,
             pre_expand_position: None,
             search: None,
             annotation_list_idx: 0,
@@ -546,7 +592,11 @@ impl App {
                     self.syntax_cache_new.insert(new_key, new_map);
                 }
                 self.highlight_pending.remove(&file_key);
-                self.build_display_lines();
+                if let Some(idx) = self.diff_file_index.get(&file_key).copied() {
+                    self.update_display_lines_for_file(idx);
+                } else if self.display_lines.is_empty() {
+                    self.build_display_lines();
+                }
             }
         }
         Ok(())
@@ -575,10 +625,12 @@ impl App {
     /// Build the unified display lines from all files
     fn build_display_lines(&mut self) {
         self.display_lines.clear();
+        self.file_line_ranges = vec![None; self.files.len()];
 
         // Clone files to avoid borrow issues
         let files = self.files.clone();
         let expanded_file = self.expanded_file;
+        let mut has_any = false;
 
         for (file_idx, file) in files.iter().enumerate() {
             // Skip files if we're in expanded mode for a different file
@@ -595,29 +647,49 @@ impl App {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|| "<unknown>".to_string());
 
-            // Add spacing before file header (except first file or expanded mode)
-            if file_idx > 0 && expanded_file.is_none() {
-                self.display_lines.push(DisplayLine::Spacer);
-                self.display_lines.push(DisplayLine::Spacer);
-            }
-
-            // Add file header
-            self.display_lines.push(DisplayLine::FileHeader {
-                path: file_path.clone(),
-                file_idx,
-            });
-
-            if self.collapsed_files.contains(&file_path) && expanded_file.is_none() {
-                continue;
-            }
-
-            // If expanded, show full file with changes highlighted
-            if expanded_file.is_some() {
-                self.build_expanded_file_lines(file_idx, &file, &file_path);
-            } else {
-                self.build_diff_hunk_lines(file_idx, &file, &file_path);
+            let include_spacer = has_any && expanded_file.is_none();
+            let file_lines =
+                self.build_file_lines(file_idx, &file, &file_path, include_spacer);
+            let start = self.display_lines.len();
+            self.display_lines.extend(file_lines);
+            let len = self.display_lines.len().saturating_sub(start);
+            if len > 0 {
+                self.file_line_ranges[file_idx] = Some((start, len));
+                has_any = true;
             }
         }
+    }
+
+    fn build_file_lines(
+        &mut self,
+        file_idx: usize,
+        file: &DiffFile,
+        file_path: &str,
+        include_spacer: bool,
+    ) -> Vec<DisplayLine> {
+        let mut lines = Vec::new();
+
+        if include_spacer {
+            lines.push(DisplayLine::Spacer);
+            lines.push(DisplayLine::Spacer);
+        }
+
+        lines.push(DisplayLine::FileHeader {
+            path: file_path.to_string(),
+            file_idx,
+        });
+
+        if self.collapsed_files.contains(file_path) && self.expanded_file.is_none() {
+            return lines;
+        }
+
+        if self.expanded_file.is_some() {
+            self.build_expanded_file_lines_into(&mut lines, file_idx, file, file_path);
+        } else {
+            self.build_diff_hunk_lines_into(&mut lines, file_idx, file, file_path);
+        }
+
+        lines
     }
 
     fn git_show(&self, spec: &str) -> Option<String> {
@@ -848,7 +920,13 @@ impl App {
     }
 
     /// Build display lines for diff hunks (normal mode)
-    fn build_diff_hunk_lines(&mut self, file_idx: usize, file: &DiffFile, file_path: &str) {
+    fn build_diff_hunk_lines_into(
+        &mut self,
+        out: &mut Vec<DisplayLine>,
+        file_idx: usize,
+        file: &DiffFile,
+        file_path: &str,
+    ) {
         let old_path = file
             .old_path
             .as_ref()
@@ -873,7 +951,7 @@ impl App {
             let deletions = hunk.lines.iter().filter(|l| l.kind == LineKind::Deletion).count();
 
             // Add spacing before hunk
-            self.display_lines.push(DisplayLine::Spacer);
+            out.push(DisplayLine::Spacer);
 
             if let Some(text) = hunk.header.as_ref().filter(|t| !t.trim().is_empty()) {
                 let clean = text.trim().trim_start_matches("@@").trim().to_string();
@@ -894,7 +972,7 @@ impl App {
                 } else {
                     Vec::new()
                 };
-                self.display_lines.push(DisplayLine::HunkContext {
+                out.push(DisplayLine::HunkContext {
                     text: clean,
                     line_no: hunk.new_start,
                     highlights,
@@ -903,7 +981,7 @@ impl App {
 
             // Add hunk header
             let line_no = hunk.new_start;
-            self.display_lines.push(DisplayLine::HunkHeader {
+            out.push(DisplayLine::HunkHeader {
                 line_no,
                 additions,
                 deletions,
@@ -915,23 +993,29 @@ impl App {
                 let mut highlighted_line = line.clone();
                 self.highlight_from_maps(&mut highlighted_line, &old_map, &new_map);
 
-                self.display_lines.push(DisplayLine::Diff {
+                out.push(DisplayLine::Diff {
                     line: highlighted_line.clone(),
                     file_idx,
                     file_path: file_path.to_string(),
                     hunk_idx: Some(hunk_idx),
                 });
 
-                self.add_annotations_for_line(file_idx, file_path, &highlighted_line);
+                self.add_annotations_for_line(out, file_idx, file_path, &highlighted_line);
             }
 
             // Add hunk end marker
-            self.display_lines.push(DisplayLine::HunkEnd { file_idx, hunk_idx });
+            out.push(DisplayLine::HunkEnd { file_idx, hunk_idx });
         }
     }
 
     /// Build display lines for full file view (expanded mode)
-    fn build_expanded_file_lines(&mut self, file_idx: usize, file: &DiffFile, file_path: &str) {
+    fn build_expanded_file_lines_into(
+        &mut self,
+        out: &mut Vec<DisplayLine>,
+        file_idx: usize,
+        file: &DiffFile,
+        file_path: &str,
+    ) {
         use std::collections::HashMap;
 
         // Build maps of line changes from diff hunks
@@ -1034,14 +1118,14 @@ impl App {
             let hunk_idx = hunk_ranges.iter().position(|(_, new_range)| {
                 new_range.contains(&line_no)
             });
-            self.display_lines.push(DisplayLine::Diff {
+            out.push(DisplayLine::Diff {
                 line: diff_line.clone(),
                 file_idx,
                 file_path: file_path.to_string(),
                 hunk_idx,
             });
 
-            self.add_annotations_for_line(file_idx, file_path, &diff_line);
+            self.add_annotations_for_line(out, file_idx, file_path, &diff_line);
         }
 
         // Show any trailing deletions
@@ -1059,7 +1143,7 @@ impl App {
                 let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
                     old_range.contains(old_no)
                 });
-                self.display_lines.push(DisplayLine::Diff {
+                out.push(DisplayLine::Diff {
                     line: del_line,
                     file_idx,
                     file_path: file_path.to_string(),
@@ -1070,7 +1154,13 @@ impl App {
     }
 
     /// Add annotations for a diff line
-    fn add_annotations_for_line(&mut self, file_idx: usize, file_path: &str, line: &DiffLine) {
+    fn add_annotations_for_line(
+        &mut self,
+        out: &mut Vec<DisplayLine>,
+        file_idx: usize,
+        file_path: &str,
+        line: &DiffLine,
+    ) {
         if !self.show_annotations {
             return;
         }
@@ -1088,15 +1178,80 @@ impl App {
                 && annotation.start_line <= line_no
                 && annotation.end_line.map_or(annotation.start_line == line_no, |e| e >= line_no)
             {
+                if annotation.start_line != line_no {
+                    continue;
+                }
                 let orphaned = annotation.side == Side::New
                     && !annotation.anchor_text.is_empty()
                     && annotation.anchor_text.trim() != line.content.trim();
-                self.display_lines.push(DisplayLine::Annotation {
+                out.push(DisplayLine::Annotation {
                     annotation: annotation.clone(),
                     file_idx,
                     orphaned,
                 });
             }
+        }
+    }
+
+    fn annotation_marker_for_line(
+        &self,
+        file_path: &str,
+        side: Side,
+        line_no: u32,
+    ) -> Option<char> {
+        let mut has_range = false;
+        for a in &self.all_annotations {
+            if a.file_path != file_path || a.side != side {
+                continue;
+            }
+            if a.start_line <= line_no && a.end_line.map_or(a.start_line == line_no, |e| e >= line_no) {
+                if a.start_line == line_no {
+                    return Some('●');
+                }
+                has_range = true;
+            }
+        }
+        if has_range {
+            Some('│')
+        } else {
+            None
+        }
+    }
+
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        if !self.selection_active {
+            return None;
+        }
+        let start = self.selection_start?;
+        let end = self.current_line_idx;
+        Some((start.min(end), start.max(end)))
+    }
+
+    fn selection_range_for_new_side(&self) -> Option<(String, u32, u32)> {
+        let (start_idx, end_idx) = self.selection_range()?;
+        let file_idx = self.selection_file_idx?;
+        let file = self.files.get(file_idx)?;
+        let file_path = file
+            .new_path
+            .as_ref()
+            .or(file.old_path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())?;
+
+        let mut start_line: Option<u32> = None;
+        let mut end_line: Option<u32> = None;
+
+        for idx in start_idx..=end_idx {
+            if let Some(DisplayLine::Diff { line, .. }) = self.display_lines.get(idx) {
+                if let Some(line_no) = line.new_line_no {
+                    start_line = Some(start_line.map_or(line_no, |s| s.min(line_no)));
+                    end_line = Some(end_line.map_or(line_no, |e| e.max(line_no)));
+                }
+            }
+        }
+
+        match (start_line, end_line) {
+            (Some(start), Some(end)) => Some((file_path, start, end)),
+            _ => None,
         }
     }
 
@@ -1139,6 +1294,23 @@ impl App {
             }
         }
         None
+    }
+
+    fn file_idx_for_line(&self, idx: usize) -> Option<usize> {
+        let end = idx.min(self.display_lines.len().saturating_sub(1));
+        for i in (0..=end).rev() {
+            if let Some(DisplayLine::FileHeader { file_idx, .. }) = self.display_lines.get(i) {
+                return Some(*file_idx);
+            }
+        }
+        None
+    }
+
+    fn hunk_idx_for_line(&self, idx: usize) -> Option<usize> {
+        match self.display_lines.get(idx) {
+            Some(DisplayLine::Diff { hunk_idx: Some(h), .. }) => Some(*h),
+            _ => None,
+        }
     }
 
     /// Find the index of the current file's header in display_lines
@@ -1207,32 +1379,38 @@ impl App {
 
     fn add_annotation(&mut self) -> Result<()> {
         if let Some(DisplayLine::Diff { line, file_path, .. }) = self.current_display_line().cloned() {
-            let line_no = line.new_line_no.or(line.old_line_no).unwrap_or(1);
-            let side = if line.new_line_no.is_some() {
-                Side::New
-            } else {
-                Side::Old
-            };
+            let (start_line, end_line) = self.annotation_range.unwrap_or_else(|| {
+                let line_no = line.new_line_no.or(line.old_line_no).unwrap_or(1);
+                (line_no, line_no)
+            });
+            let side = self.annotation_side.clone().unwrap_or_else(|| {
+                if line.new_line_no.is_some() {
+                    Side::New
+                } else {
+                    Side::Old
+                }
+            });
 
             let (anchor_line, anchor_text, context_before, context_after) = if side == Side::New {
                 if let Some(lines) = self.read_file_lines(&file_path) {
-                    Self::build_anchor(&lines, line_no)
+                    Self::build_anchor(&lines, start_line)
                 } else {
-                    (line_no, line.content.clone(), String::new(), String::new())
+                    (start_line, line.content.clone(), String::new(), String::new())
                 }
             } else {
-                (line_no, line.content.clone(), String::new(), String::new())
+                (start_line, line.content.clone(), String::new(), String::new())
             };
 
+            let content = self.annotation_text();
             self.storage.add_annotation(
                 self.repo_id,
                 &file_path,
                 None, // commit_sha
                 side,
-                line_no,
-                None, // end_line
+                start_line,
+                if start_line == end_line { None } else { Some(end_line) },
                 self.annotation_type.clone(),
-                &self.annotation_input,
+                &content,
                 anchor_line,
                 &anchor_text,
                 &context_before,
@@ -1244,20 +1422,27 @@ impl App {
             self.build_display_lines();
         }
 
-        self.annotation_input.clear();
-        self.annotation_cursor = 0;
+        self.reset_annotation_input();
+        self.annotation_range = None;
+        self.annotation_side = None;
+        self.selection_active = false;
+        self.selection_start = None;
+        self.selection_file_idx = None;
+        self.selection_hunk_idx = None;
         self.mode = Mode::Normal;
         Ok(())
     }
 
     fn edit_annotation(&mut self, id: i64) -> Result<()> {
+        let content = self.annotation_text();
         self.storage
-            .update_annotation(id, &self.annotation_input, self.annotation_type.clone())?;
+            .update_annotation(id, &content, self.annotation_type.clone())?;
         self.message = Some("Annotation updated".to_string());
         self.load_all_annotations()?;
         self.build_display_lines();
-        self.annotation_input.clear();
-        self.annotation_cursor = 0;
+        self.reset_annotation_input();
+        self.annotation_range = None;
+        self.annotation_side = None;
         self.mode = Mode::Normal;
         Ok(())
     }
@@ -1288,10 +1473,24 @@ impl App {
 
     fn navigate_up(&mut self) {
         if self.current_line_idx > 0 {
+            let prev_idx = self.current_line_idx;
             self.current_line_idx -= 1;
             // Skip over non-navigable lines
             while self.current_line_idx > 0 && self.is_skippable_line(self.current_line_idx) {
                 self.current_line_idx -= 1;
+            }
+            if self.selection_active {
+                if let (Some(sel_file), Some(curr_file)) = (
+                    self.selection_file_idx,
+                    self.file_idx_for_line(self.current_line_idx),
+                ) {
+                    if sel_file != curr_file {
+                        self.current_line_idx = prev_idx;
+                    }
+                }
+                if self.selection_hunk_idx != self.hunk_idx_for_line(self.current_line_idx) {
+                    self.current_line_idx = prev_idx;
+                }
             }
             self.ensure_cursor_on_navigable();
             self.adjust_scroll();
@@ -1301,12 +1500,26 @@ impl App {
     fn navigate_down(&mut self) {
         let total_lines = self.display_lines.len();
         if self.current_line_idx < total_lines.saturating_sub(1) {
+            let prev_idx = self.current_line_idx;
             self.current_line_idx += 1;
             // Skip over non-navigable lines
             while self.current_line_idx < total_lines.saturating_sub(1)
                 && self.is_skippable_line(self.current_line_idx)
             {
                 self.current_line_idx += 1;
+            }
+            if self.selection_active {
+                if let (Some(sel_file), Some(curr_file)) = (
+                    self.selection_file_idx,
+                    self.file_idx_for_line(self.current_line_idx),
+                ) {
+                    if sel_file != curr_file {
+                        self.current_line_idx = prev_idx;
+                    }
+                }
+                if self.selection_hunk_idx != self.hunk_idx_for_line(self.current_line_idx) {
+                    self.current_line_idx = prev_idx;
+                }
             }
             self.ensure_cursor_on_navigable();
             self.adjust_scroll();
@@ -1317,6 +1530,13 @@ impl App {
     fn page_down(&mut self) {
         let half_page = self.visible_height / 2;
         let total_lines = self.display_lines.len();
+
+        if self.selection_active {
+            for _ in 0..half_page {
+                self.navigate_down();
+            }
+            return;
+        }
 
         for _ in 0..half_page {
             if self.current_line_idx < total_lines.saturating_sub(1) {
@@ -1336,6 +1556,13 @@ impl App {
     /// Move up by half a page (Ctrl+U)
     fn page_up(&mut self) {
         let half_page = self.visible_height / 2;
+
+        if self.selection_active {
+            for _ in 0..half_page {
+                self.navigate_up();
+            }
+            return;
+        }
 
         for _ in 0..half_page {
             if self.current_line_idx > 0 {
@@ -1419,6 +1646,12 @@ impl App {
         // Clear message on any input
         self.message = None;
 
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('r') {
+            self.reload_diff()?;
+            self.message = Some("Diff reloaded".to_string());
+            return Ok(false);
+        }
+
         match &self.mode {
             Mode::Normal => self.handle_normal_input(key),
             Mode::AddAnnotation | Mode::EditAnnotation(_) => self.handle_annotation_input(key),
@@ -1467,6 +1700,28 @@ impl App {
                 self.show_help = !self.show_help;
                 if self.show_help {
                     self.help_scroll = 0;
+                }
+                return Ok(false);
+            }
+            KeyCode::Char('V') => {
+                if self.selection_active {
+                    self.selection_active = false;
+                    self.selection_start = None;
+                    self.selection_file_idx = None;
+                    self.selection_hunk_idx = None;
+                    self.message = Some("Selection cleared".to_string());
+                } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line() {
+                    if line.new_line_no.is_some() {
+                        self.selection_active = true;
+                        self.selection_start = Some(self.current_line_idx);
+                        self.selection_file_idx = self.file_idx_for_line(self.current_line_idx);
+                        self.selection_hunk_idx = self.hunk_idx_for_line(self.current_line_idx);
+                        self.message = Some("Selecting lines".to_string());
+                    } else {
+                        self.message = Some("Selection only works on new/context lines".to_string());
+                    }
+                } else {
+                    self.message = Some("Move to a diff line to start selection".to_string());
                 }
                 return Ok(false);
             }
@@ -1535,6 +1790,12 @@ impl App {
                     self.show_help = false;
                 } else {
                     self.search = None;
+                    if self.selection_active {
+                        self.selection_active = false;
+                        self.selection_start = None;
+                        self.selection_file_idx = None;
+                        self.selection_hunk_idx = None;
+                    }
                 }
             }
             KeyCode::Char('g') => {
@@ -1653,11 +1914,25 @@ impl App {
 
             // Annotations
             KeyCode::Char('a') => {
-                // Only allow adding annotations on diff lines
-                if let Some(DisplayLine::Diff { .. }) = self.current_display_line() {
+                if self.selection_active {
+                    if let Some((_, start, end)) = self.selection_range_for_new_side() {
+                        self.mode = Mode::AddAnnotation;
+                        self.reset_annotation_input();
+                        self.annotation_range = Some((start, end));
+                        self.annotation_side = Some(Side::New);
+                    } else {
+                        self.message = Some("Selection has no new/context lines".to_string());
+                    }
+                } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line().cloned() {
+                    let side = if line.new_line_no.is_some() {
+                        Side::New
+                    } else {
+                        Side::Old
+                    };
                     self.mode = Mode::AddAnnotation;
-                    self.annotation_input.clear();
-                    self.annotation_cursor = 0;
+                    self.reset_annotation_input();
+                    self.annotation_range = None;
+                    self.annotation_side = Some(side);
                 } else {
                     self.message = Some("Move to a diff line to add annotation".to_string());
                 }
@@ -1667,8 +1942,7 @@ impl App {
                     .get_annotation_for_current_line()
                     .map(|a| (a.id, a.content.clone(), a.annotation_type.clone()))
                 {
-                    self.annotation_input = content;
-                    self.annotation_cursor = self.annotation_input.chars().count();
+                    self.set_annotation_input(&content);
                     self.annotation_type = a_type;
                     self.mode = Mode::EditAnnotation(id);
                 }
@@ -1709,23 +1983,71 @@ impl App {
     fn handle_annotation_input(&mut self, key: KeyEvent) -> Result<bool> {
         // Ctrl+J inserts newline
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
-            self.insert_at_cursor('\n');
+            self.annotation_input.insert_newline();
             return Ok(false);
         }
-        // Ctrl+T toggles annotation type while editing/adding
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
-            self.annotation_type = match self.annotation_type {
-                AnnotationType::Comment => AnnotationType::Todo,
-                AnnotationType::Todo => AnnotationType::Comment,
-            };
-            return Ok(false);
+        // Ctrl+D / Ctrl+U scroll diff while editing
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => {
+                    self.page_down();
+                    return Ok(false);
+                }
+                KeyCode::Char('u') => {
+                    self.page_up();
+                    return Ok(false);
+                }
+                KeyCode::Char('t') => {
+                    self.annotation_type = match self.annotation_type {
+                        AnnotationType::Comment => AnnotationType::Todo,
+                        AnnotationType::Todo => AnnotationType::Comment,
+                    };
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            match key.code {
+                KeyCode::Backspace => {
+                    self.annotation_input.delete_line_by_head();
+                    return Ok(false);
+                }
+                KeyCode::Delete => {
+                    self.annotation_input.delete_line_by_end();
+                    return Ok(false);
+                }
+                KeyCode::Left => {
+                    self.annotation_input.move_cursor(CursorMove::Head);
+                    return Ok(false);
+                }
+                KeyCode::Right => {
+                    self.annotation_input.move_cursor(CursorMove::End);
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Left => {
+                    self.annotation_input.move_cursor(CursorMove::WordBack);
+                    return Ok(false);
+                }
+                KeyCode::Right => {
+                    self.annotation_input.move_cursor(CursorMove::WordForward);
+                    return Ok(false);
+                }
+                _ => {}
+            }
         }
 
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
-                self.annotation_input.clear();
-                self.annotation_cursor = 0;
+                self.reset_annotation_input();
             }
             KeyCode::Enter => {
                 // Plain Enter (no modifiers) saves
@@ -1740,37 +2062,37 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
-                self.backspace_at_cursor();
+            KeyCode::PageUp => {
+                self.page_up();
             }
-            KeyCode::Delete => {
-                self.delete_at_cursor();
+            KeyCode::PageDown => {
+                self.page_down();
             }
-            KeyCode::Left => {
-                self.move_cursor_left();
+            _ => {
+                self.annotation_input.input(Input::from(key));
             }
-            KeyCode::Right => {
-                self.move_cursor_right();
-            }
-            KeyCode::Up => {
-                self.move_cursor_up();
-            }
-            KeyCode::Down => {
-                self.move_cursor_down();
-            }
-            KeyCode::Home => {
-                self.move_cursor_line_start();
-            }
-            KeyCode::End => {
-                self.move_cursor_line_end();
-            }
-            KeyCode::Char(c) => {
-                self.insert_at_cursor(c);
-            }
-            _ => {}
         }
 
         Ok(false)
+    }
+
+    fn scroll_by_lines(&mut self, delta: i32) {
+        if self.display_lines.is_empty() {
+            return;
+        }
+        let max_offset = self
+            .display_lines
+            .len()
+            .saturating_sub(self.visible_height)
+            .max(0);
+        let mut offset = self.scroll_offset as i32 + delta;
+        if offset < 0 {
+            offset = 0;
+        }
+        if offset as usize > max_offset {
+            offset = max_offset as i32;
+        }
+        self.scroll_offset = offset as usize;
     }
 
     fn handle_search_input(&mut self, key: KeyEvent) -> Result<bool> {
@@ -1861,7 +2183,7 @@ impl App {
             }
             KeyCode::Char('e') => {
                 if let Some(entry) = entries.get(self.annotation_list_idx) {
-                    self.annotation_input = entry.content.clone();
+                    self.set_annotation_input(&entry.content);
                     self.annotation_type = entry.annotation_type.clone();
                     self.mode = Mode::EditAnnotation(entry.id);
                 }
@@ -2245,6 +2567,12 @@ impl App {
             self.message = Some("File not found".to_string());
             return Ok(());
         };
+        let _file_path = file
+            .new_path
+            .as_ref()
+            .or(file.old_path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
 
         let Some(hunk) = file.hunks.get(hunk_idx) else {
             self.message = Some("Hunk not found".to_string());
@@ -2253,14 +2581,14 @@ impl App {
 
         let patch = Self::build_hunk_patch(file, hunk);
 
-        match self.apply_patch_to_index(&patch, reverse) {
+        match self.apply_patch_to_index(&patch, reverse, file.status) {
             Ok(()) => {
                 self.message = Some(if reverse {
                     "Unstaged hunk".to_string()
                 } else {
                     "Staged hunk".to_string()
                 });
-                self.reload_diff()?;
+                self.apply_stage_local(file_idx, hunk_idx)?;
             }
             Err(err) => {
                 self.message = Some(format!("Stage/unstage failed: {}", err));
@@ -2268,6 +2596,100 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn apply_stage_local(&mut self, file_idx: usize, hunk_idx: usize) -> Result<()> {
+        if file_idx >= self.files.len() {
+            return Ok(());
+        }
+        let (old_path, new_path, status, moved_hunk) = match self.files.get(file_idx) {
+            Some(file) => match file.hunks.get(hunk_idx) {
+                Some(hunk) => (
+                    file.old_path.clone(),
+                    file.new_path.clone(),
+                    file.status,
+                    hunk.clone(),
+                ),
+                None => return Ok(()),
+            },
+            None => return Ok(()),
+        };
+
+        if let Some(file) = self.files.get_mut(file_idx) {
+            if hunk_idx < file.hunks.len() {
+                file.hunks.remove(hunk_idx);
+            }
+        }
+        let empty = self.files.get(file_idx).map(|f| f.hunks.is_empty()).unwrap_or(true);
+        if empty {
+            self.files.remove(file_idx);
+            self.diff_file_index
+                .retain(|_, idx| *idx != file_idx);
+            for idx in self.diff_file_index.values_mut() {
+                if *idx > file_idx {
+                    *idx -= 1;
+                }
+            }
+            self.file_line_ranges.remove(file_idx);
+            self.build_display_lines();
+            self.ensure_cursor_on_navigable();
+            self.adjust_scroll();
+            return Ok(());
+        }
+
+        self.update_display_lines_for_file(file_idx);
+        self.ensure_cursor_on_navigable();
+        self.adjust_scroll();
+        self.apply_stage_other_cache(old_path, new_path, status, moved_hunk);
+        Ok(())
+    }
+
+    fn apply_stage_other_cache(
+        &mut self,
+        old_path: Option<PathBuf>,
+        new_path: Option<PathBuf>,
+        status: FileStatus,
+        hunk: DiffHunk,
+    ) {
+        let target = match self.diff_mode {
+            DiffMode::Unstaged => &mut self.cached_staged,
+            DiffMode::Staged => &mut self.cached_unstaged,
+            _ => return,
+        };
+
+        let Some(files) = target.as_mut() else {
+            return;
+        };
+
+        let key = new_path
+            .as_ref()
+            .or(old_path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+
+        if let Some(file) = files.iter_mut().find(|f| {
+            let fkey = f
+                .new_path
+                .as_ref()
+                .or(f.old_path.as_ref())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            fkey == key
+        }) {
+            let insert_at = file
+                .hunks
+                .iter()
+                .position(|h| h.new_start > hunk.new_start)
+                .unwrap_or(file.hunks.len());
+            file.hunks.insert(insert_at, hunk);
+        } else {
+            files.push(DiffFile {
+                old_path,
+                new_path,
+                status,
+                hunks: vec![hunk],
+            });
+        }
     }
 
     fn spawn_ai_for_current_annotation(&mut self) -> Result<()> {
@@ -2364,36 +2786,9 @@ impl App {
 
     fn switch_diff_mode(&mut self, target: DiffMode) -> Result<()> {
         self.save_collapsed_state();
-        let files = self.diff_engine.diff(&target, &self.diff_paths)?;
-
         self.diff_mode = target;
-        self.files = files;
-        self.display_lines.clear();
-        self.current_line_idx = 0;
-        self.scroll_offset = 0;
-        self.expanded_file = None;
         self.load_collapsed_state();
-        self.clear_syntax_cache();
-        self.load_all_annotations()?;
-        self.prepare_lazy_highlighting();
-        self.build_display_lines();
-
-        if self.files.is_empty() {
-            let msg = match self.diff_mode {
-                DiffMode::Unstaged => "No unstaged changes",
-                DiffMode::Staged => "No staged changes",
-                _ => "No changes",
-            };
-            self.message = Some(msg.to_string());
-            return Ok(());
-        }
-
-        while self.current_line_idx < self.display_lines.len().saturating_sub(1)
-            && self.is_skippable_line(self.current_line_idx)
-        {
-            self.current_line_idx += 1;
-        }
-        self.adjust_scroll();
+        self.start_diff_stream(None)?;
 
         Ok(())
     }
@@ -2449,11 +2844,19 @@ impl App {
         patch
     }
 
-    fn apply_patch_to_index(&self, patch: &str, reverse: bool) -> Result<(), String> {
+    fn apply_patch_to_index(
+        &self,
+        patch: &str,
+        reverse: bool,
+        status: FileStatus,
+    ) -> Result<(), String> {
         let mut cmd = Command::new("git");
         cmd.arg("apply").arg("--cached");
         if reverse {
             cmd.arg("-R");
+        } else if matches!(status, FileStatus::Added) {
+            // Allow staging hunks for new files not yet in the index.
+            cmd.arg("--intent-to-add");
         }
         cmd.current_dir(&self.repo_path)
             .stdin(Stdio::piped())
@@ -2476,48 +2879,242 @@ impl App {
 
     fn reload_diff(&mut self) -> Result<()> {
         let target = self.current_target_position();
-        let files = self.diff_engine.diff(&self.diff_mode, &self.diff_paths)?;
-        self.files = files;
-        self.display_lines.clear();
-        self.current_line_idx = 0;
-        self.scroll_offset = 0;
-        self.expanded_file = None;
-        self.clear_syntax_cache();
-        self.load_all_annotations()?;
-        self.prepare_lazy_highlighting();
-        self.build_display_lines();
-
-        if self.files.is_empty() {
-            let msg = match self.diff_mode {
-                DiffMode::Unstaged => "No unstaged changes",
-                DiffMode::Staged => "No staged changes",
-                _ => "No changes",
-            };
-            self.message = Some(msg.to_string());
-            return Ok(());
-        }
-
-        if let Some((file_path, line_no)) = target {
-            if let Some(idx) = self.find_best_line_match(&file_path, line_no) {
-                self.current_line_idx = idx;
-            }
-        } else {
-            while self.current_line_idx < self.display_lines.len().saturating_sub(1)
-                && self.is_skippable_line(self.current_line_idx)
-            {
-                self.current_line_idx += 1;
-            }
-        }
-        self.adjust_scroll();
-
+        self.start_diff_stream(target)?;
         Ok(())
     }
 
     fn clear_syntax_cache(&mut self) {
         self.syntax_cache_old.clear();
         self.syntax_cache_new.clear();
+        self.eager_highlight_files.clear();
+        self.eager_hunks_remaining = INITIAL_HUNK_HIGHLIGHT_COUNT;
         self.highlight_pending.clear();
         self.highlight_generation = self.highlight_generation.wrapping_add(1);
+    }
+
+    fn start_diff_stream(&mut self, target: Option<(String, u32)>) -> Result<()> {
+        let generation = self.diff_generation.wrapping_add(1);
+        self.diff_generation = generation;
+        self.diff_loading = true;
+        // Keep current position while streaming the new diff.
+        self.clear_syntax_cache();
+        self.load_all_annotations()?;
+        self.selection_active = false;
+        self.selection_start = None;
+        self.selection_file_idx = None;
+        self.selection_hunk_idx = None;
+        self.annotation_range = None;
+
+        let diff_engine = self.diff_engine.clone();
+        let diff_mode = self.diff_mode.clone();
+        let diff_paths = self.diff_paths.clone();
+        let tx = self.diff_tx.clone();
+
+        thread::spawn(move || {
+            let mut on_file = |file: DiffFile| -> Result<()> {
+                let _ = tx.send(DiffStreamEvent::File { generation, file });
+                Ok(())
+            };
+            let result = diff_engine.diff_stream(&diff_mode, &diff_paths, &mut on_file);
+            let error = result.err().map(|e| e.to_string());
+            let _ = tx.send(DiffStreamEvent::Done { generation, error });
+        });
+
+        self.message = Some("Loading diff...".to_string());
+
+        self.diff_target = target;
+        self.diff_pending_reset = true;
+
+        Ok(())
+    }
+
+    fn handle_diff_event(&mut self, evt: DiffStreamEvent) -> Result<()> {
+        match evt {
+            DiffStreamEvent::File { generation, file } => {
+                if generation != self.diff_generation {
+                    return Ok(());
+                }
+                if self.diff_pending_reset {
+                    self.files.clear();
+                    self.diff_file_index.clear();
+                    self.display_lines.clear();
+                    self.file_line_ranges.clear();
+                    self.diff_pending_reset = false;
+                }
+                let (file_key, _, _) = Self::file_highlight_keys(&file);
+                if self.config.syntax_highlighting && self.eager_hunks_remaining > 0 {
+                    if self.eager_highlight_files.insert(file_key.clone()) {
+                        let hunk_count = file.hunks.len();
+                        self.eager_hunks_remaining =
+                            self.eager_hunks_remaining.saturating_sub(hunk_count.max(1));
+                    }
+                }
+                if let Some(idx) = self.diff_file_index.get(&file_key).copied() {
+                    if let Some(slot) = self.files.get_mut(idx) {
+                        *slot = file;
+                    }
+                    self.update_display_lines_for_file(idx);
+                } else {
+                    let idx = self.files.len();
+                    self.files.push(file);
+                    self.diff_file_index.insert(file_key, idx);
+                    self.update_display_lines_for_file(idx);
+                }
+                if !self.diff_loading {
+                    self.prepare_lazy_highlighting();
+                }
+                if let Some(search) = &mut self.search {
+                    if !search.query.is_empty() {
+                        self.execute_search();
+                    }
+                }
+                if let Some((file_path, line_no)) = self.diff_target.take() {
+                    if let Some(idx) = self.find_best_line_match(&file_path, line_no) {
+                        self.current_line_idx = idx;
+                        self.ensure_cursor_on_navigable();
+                        self.adjust_scroll();
+                    }
+                } else if self.current_line_idx == 0 {
+                    self.ensure_cursor_on_navigable();
+                    self.adjust_scroll();
+                } else if self.current_line_idx >= self.display_lines.len().saturating_sub(1) {
+                    self.current_line_idx = self.display_lines.len().saturating_sub(1);
+                    self.ensure_cursor_on_navigable();
+                    self.adjust_scroll();
+                }
+            }
+            DiffStreamEvent::Done { generation, error } => {
+                if generation != self.diff_generation {
+                    return Ok(());
+                }
+                self.diff_loading = false;
+                if let Some(err) = error {
+                    self.message = Some(format!("Diff load failed: {}", err));
+                } else if self.files.is_empty() {
+                    let msg = match self.diff_mode {
+                        DiffMode::Unstaged => "No unstaged changes",
+                        DiffMode::Staged => "No staged changes",
+                        _ => "No changes",
+                    };
+                    self.message = Some(msg.to_string());
+                } else {
+                    self.message = None;
+                }
+                if !self.files.is_empty() {
+                    self.prepare_lazy_highlighting();
+                    if self.display_lines.is_empty() {
+                        self.build_display_lines();
+                    } else {
+                        let eager_files: Vec<String> =
+                            self.eager_highlight_files.iter().cloned().collect();
+                        for key in eager_files {
+                            if let Some(idx) = self.diff_file_index.get(&key).copied() {
+                                self.update_display_lines_for_file(idx);
+                            }
+                        }
+                    }
+                }
+                match self.diff_mode {
+                    DiffMode::Unstaged => self.cached_unstaged = Some(self.files.clone()),
+                    DiffMode::Staged => self.cached_staged = Some(self.files.clone()),
+                    _ => {}
+                }
+                if self.diff_pending_reset {
+                    self.files.clear();
+                    self.diff_file_index.clear();
+                    self.display_lines.clear();
+                    self.file_line_ranges.clear();
+                    self.diff_pending_reset = false;
+                }
+                if let Some((file_path, line_no)) = self.diff_target.take() {
+                    if let Some(idx) = self.find_best_line_match(&file_path, line_no) {
+                        self.current_line_idx = idx;
+                        self.ensure_cursor_on_navigable();
+                        self.adjust_scroll();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn update_display_lines_for_file(&mut self, file_idx: usize) {
+        if file_idx >= self.files.len() {
+            return;
+        }
+        if self.file_line_ranges.len() < self.files.len() {
+            self.file_line_ranges
+                .resize(self.files.len(), None);
+        }
+
+        if let Some(expanded_idx) = self.expanded_file {
+            if expanded_idx != file_idx {
+                return;
+            }
+            let file = self.files[file_idx].clone();
+            let file_path = file
+                .new_path
+                .as_ref()
+                .or(file.old_path.as_ref())
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let lines = self.build_file_lines(file_idx, &file, &file_path, false);
+            self.display_lines = lines;
+            self.file_line_ranges = vec![None; self.files.len()];
+            let len = self.display_lines.len();
+            if len > 0 {
+                self.file_line_ranges[file_idx] = Some((0, len));
+            }
+            return;
+        }
+
+        let file = self.files[file_idx].clone();
+        let file_path = file
+            .new_path
+            .as_ref()
+            .or(file.old_path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let include_spacer = self.file_line_ranges.iter().take(file_idx).any(|r| r.is_some());
+        let new_lines = self.build_file_lines(file_idx, &file, &file_path, include_spacer);
+        let new_len = new_lines.len();
+
+        if let Some((start, len)) = self.file_line_ranges.get(file_idx).copied().flatten() {
+            let end = start + len;
+            self.display_lines.splice(start..end, new_lines);
+            let delta = new_len as isize - len as isize;
+            self.file_line_ranges[file_idx] = Some((start, new_len));
+            if delta != 0 {
+                for idx in (file_idx + 1)..self.file_line_ranges.len() {
+                    if let Some((s, l)) = self.file_line_ranges[idx] {
+                        let new_start = (s as isize + delta).max(0) as usize;
+                        self.file_line_ranges[idx] = Some((new_start, l));
+                    }
+                }
+            }
+        } else {
+            let mut insert_at = 0usize;
+            for idx in 0..file_idx {
+                if let Some((s, l)) = self.file_line_ranges[idx] {
+                    insert_at = s + l;
+                }
+            }
+            self.display_lines.splice(insert_at..insert_at, new_lines);
+            self.file_line_ranges[file_idx] = Some((insert_at, new_len));
+            for idx in (file_idx + 1)..self.file_line_ranges.len() {
+                if let Some((s, l)) = self.file_line_ranges[idx] {
+                    self.file_line_ranges[idx] = Some((s + new_len, l));
+                }
+            }
+        }
+
+        if self.current_line_idx >= self.display_lines.len() && !self.display_lines.is_empty() {
+            self.current_line_idx = self.display_lines.len().saturating_sub(1);
+        }
+        if self.current_line_idx == 0 {
+            self.ensure_cursor_on_navigable();
+        }
+        self.adjust_scroll();
     }
 
     fn save_collapsed_state(&mut self) {
@@ -2618,6 +3215,10 @@ impl App {
             self.ensure_cursor_on_navigable();
             self.adjust_scroll();
         }
+        self.selection_active = false;
+        self.selection_start = None;
+        self.selection_file_idx = None;
+        self.selection_hunk_idx = None;
     }
 
     fn ensure_cursor_on_navigable(&mut self) {
@@ -2672,128 +3273,39 @@ impl App {
         entries
     }
 
+    fn annotation_text(&self) -> String {
+        self.annotation_input.lines().join("\n")
+    }
+
+    fn reset_annotation_input(&mut self) {
+        self.annotation_input = TextArea::default();
+    }
+
+    fn set_annotation_input(&mut self, content: &str) {
+        self.annotation_input = TextArea::from(content.lines());
+        self.annotation_input.move_cursor(CursorMove::Bottom);
+        self.annotation_input.move_cursor(CursorMove::End);
+    }
+
     fn render_input_with_cursor(&self) -> String {
-        let mut chars: Vec<char> = self.annotation_input.chars().collect();
-        let cursor = self.annotation_cursor.min(chars.len());
-        chars.insert(cursor, '|');
-        chars.into_iter().collect()
-    }
+        let (row, col) = self.annotation_input.cursor();
+        let lines = self.annotation_input.lines();
+        let mut out = String::new();
 
-    fn insert_at_cursor(&mut self, ch: char) {
-        let mut chars: Vec<char> = self.annotation_input.chars().collect();
-        let cursor = self.annotation_cursor.min(chars.len());
-        chars.insert(cursor, ch);
-        self.annotation_cursor = cursor + 1;
-        self.annotation_input = chars.into_iter().collect();
-    }
-
-    fn backspace_at_cursor(&mut self) {
-        let mut chars: Vec<char> = self.annotation_input.chars().collect();
-        if self.annotation_cursor == 0 || chars.is_empty() {
-            return;
-        }
-        let idx = self.annotation_cursor.min(chars.len()) - 1;
-        chars.remove(idx);
-        self.annotation_cursor = idx;
-        self.annotation_input = chars.into_iter().collect();
-    }
-
-    fn delete_at_cursor(&mut self) {
-        let mut chars: Vec<char> = self.annotation_input.chars().collect();
-        if chars.is_empty() {
-            return;
-        }
-        let idx = self.annotation_cursor.min(chars.len());
-        if idx >= chars.len() {
-            return;
-        }
-        chars.remove(idx);
-        self.annotation_input = chars.into_iter().collect();
-    }
-
-    fn move_cursor_left(&mut self) {
-        if self.annotation_cursor > 0 {
-            self.annotation_cursor -= 1;
-        }
-    }
-
-    fn move_cursor_right(&mut self) {
-        let len = self.annotation_input.chars().count();
-        if self.annotation_cursor < len {
-            self.annotation_cursor += 1;
-        }
-    }
-
-    fn move_cursor_line_start(&mut self) {
-        let (line_start, _) = self.current_line_bounds();
-        self.annotation_cursor = line_start;
-    }
-
-    fn move_cursor_line_end(&mut self) {
-        let (_, line_end) = self.current_line_bounds();
-        self.annotation_cursor = line_end;
-    }
-
-    fn move_cursor_up(&mut self) {
-        let (line_start, _line_end, col) = self.current_line_bounds_with_col();
-        if line_start == 0 {
-            return;
-        }
-        let prev_end = line_start.saturating_sub(1);
-        let prev_start = self.line_start_at(prev_end);
-        let prev_len = prev_end.saturating_sub(prev_start);
-        self.annotation_cursor = prev_start + col.min(prev_len);
-    }
-
-    fn move_cursor_down(&mut self) {
-        let (_line_start, line_end, col) = self.current_line_bounds_with_col();
-        let len = self.annotation_input.chars().count();
-        if line_end >= len {
-            return;
-        }
-        let next_start = line_end + 1;
-        let next_end = self.line_end_at(next_start);
-        let next_len = next_end.saturating_sub(next_start);
-        self.annotation_cursor = next_start + col.min(next_len);
-    }
-
-    fn current_line_bounds(&self) -> (usize, usize) {
-        let (start, end, _) = self.current_line_bounds_with_col();
-        (start, end)
-    }
-
-    fn current_line_bounds_with_col(&self) -> (usize, usize, usize) {
-        let chars: Vec<char> = self.annotation_input.chars().collect();
-        let len = chars.len();
-        let cursor = self.annotation_cursor.min(len);
-        let line_start = self.line_start_at(cursor);
-        let line_end = self.line_end_at(cursor);
-        let col = cursor.saturating_sub(line_start);
-        (line_start, line_end, col)
-    }
-
-    fn line_start_at(&self, idx: usize) -> usize {
-        let chars: Vec<char> = self.annotation_input.chars().collect();
-        let mut i = idx.min(chars.len());
-        while i > 0 {
-            if chars[i - 1] == '\n' {
-                break;
+        for (idx, line) in lines.iter().enumerate() {
+            if idx == row {
+                let mut chars: Vec<char> = line.chars().collect();
+                let cursor = col.min(chars.len());
+                chars.insert(cursor, '|');
+                out.push_str(&chars.into_iter().collect::<String>());
+            } else {
+                out.push_str(line);
             }
-            i -= 1;
-        }
-        i
-    }
-
-    fn line_end_at(&self, idx: usize) -> usize {
-        let chars: Vec<char> = self.annotation_input.chars().collect();
-        let mut i = idx.min(chars.len());
-        while i < chars.len() {
-            if chars[i] == '\n' {
-                break;
+            if idx + 1 < lines.len() {
+                out.push('\n');
             }
-            i += 1;
         }
-        i
+        out
     }
 
     /// Adjust scroll to keep cursor visible with vim-like margins
@@ -2828,6 +3340,7 @@ pub fn run(
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -2841,9 +3354,7 @@ pub fn run(
         diff_mode,
         diff_paths,
     )?;
-    app.load_all_annotations()?;
-    app.prepare_lazy_highlighting();
-    app.build_display_lines();
+    app.start_diff_stream(None)?;
 
     // Skip to first navigable line
     while app.current_line_idx < app.display_lines.len().saturating_sub(1)
@@ -2856,6 +3367,7 @@ pub fn run(
 
     // Restore terminal
     disable_raw_mode()?;
+    execute!(terminal.backend_mut(), DisableMouseCapture)?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
     result
@@ -2871,12 +3383,23 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
         while let Ok(evt) = app.highlight_rx.try_recv() {
             app.handle_highlight_event(evt)?;
         }
+        while let Ok(evt) = app.diff_rx.try_recv() {
+            app.handle_diff_event(evt)?;
+        }
 
         if event::poll(std::time::Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if app.handle_input(key)? {
-                    return Ok(());
+            match event::read()? {
+                Event::Key(key) => {
+                    if app.handle_input(key)? {
+                        return Ok(());
+                    }
                 }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => app.scroll_by_lines(-3),
+                    MouseEventKind::ScrollDown => app.scroll_by_lines(3),
+                    _ => {}
+                },
+                _ => {}
             }
         }
     }
@@ -2912,6 +3435,7 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_sticky_file_header(f, app, chunks[0], theme);
 
     // Diff content
+    f.render_widget(Clear, chunks[1]);
     if app.side_by_side {
         render_diff_side_by_side(f, app, chunks[1], theme);
     } else {
@@ -3040,6 +3564,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
         .map(|(idx, display_line)| {
             let is_current = idx == app.current_line_idx;
 
+            let selection_range = app.selection_range();
             match display_line {
                 DisplayLine::Spacer => {
                     ListItem::new(Line::from(""))
@@ -3145,15 +3670,14 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         Side::Old
                     };
 
-                    // Check for annotation
-                    let has_annotation = app.all_annotations.iter().any(|a| {
-                        a.file_path == *file_path
-                            && a.side == side
-                            && a.start_line <= line_no
-                            && a.end_line.map_or(a.start_line == line_no, |e| e >= line_no)
-                    });
-                    let annotation_marker = if has_annotation { "●" } else { " " };
+                    let annotation_marker = app
+                        .annotation_marker_for_line(file_path, side, line_no)
+                        .unwrap_or(' ')
+                        .to_string();
 
+                    let is_selected = selection_range
+                        .map(|(s, e)| idx >= s && idx <= e)
+                        .unwrap_or(false);
                     let line_num_fg = match line.kind {
                         LineKind::Addition => theme.added_fg,
                         LineKind::Deletion => theme.deleted_fg,
@@ -3161,12 +3685,14 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                     };
                     let line_num_style = if is_current {
                         Style::default().fg(line_num_fg).bg(theme.current_line_bg)
+                    } else if is_selected {
+                        Style::default().fg(line_num_fg).bg(theme.selection_bg)
                     } else {
                         Style::default().fg(line_num_fg)
                     };
                     let line_num = format!("{:>4}", line_no);
 
-                    let (prefix, content_style) = match line.kind {
+                    let (prefix, mut content_style) = match line.kind {
                         LineKind::Addition => (
                             "+",
                             Style::default().fg(theme.added_fg).bg(theme.added_bg),
@@ -3180,12 +3706,19 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                             Style::default().fg(theme.context_fg),
                         ),
                     };
+                    if is_selected && !is_current {
+                        content_style = content_style.bg(theme.selection_bg);
+                    }
 
                     // Build spans with syntax highlighting
                     let marker_style = if is_current {
                         Style::default()
                             .fg(theme.annotation_marker)
                             .bg(theme.current_line_bg)
+                    } else if is_selected {
+                        Style::default()
+                            .fg(theme.annotation_marker)
+                            .bg(theme.selection_bg)
                     } else {
                         Style::default().fg(theme.annotation_marker)
                     };
@@ -3202,7 +3735,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         &line.highlights,
                         content_style,
                         is_current,
-                        theme.current_line_bg,
+                        if is_selected { theme.selection_bg } else { theme.current_line_bg },
                     );
 
                     let lines = wrap_spans_with_prefix(
@@ -3321,6 +3854,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
     let mut left_items: Vec<ListItem> = Vec::new();
     let mut right_items: Vec<ListItem> = Vec::new();
 
+    let selection_range = app.selection_range();
     for (idx, display_line) in app.display_lines.iter().enumerate().skip(scroll_offset).take(visible_height) {
         let is_current = idx == app.current_line_idx;
 
@@ -3428,6 +3962,9 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                 right_items.push(ListItem::new(Line::from(Span::styled("╰".to_string() + &"─".repeat(20), style))));
             }
             DisplayLine::Diff { line, file_path, .. } => {
+                let is_selected = selection_range
+                    .map(|(s, e)| idx >= s && idx <= e)
+                    .unwrap_or(false);
                 let line_no = line.new_line_no.or(line.old_line_no).unwrap_or(0);
                 let side = if line.new_line_no.is_some() {
                     Side::New
@@ -3435,21 +3972,21 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     Side::Old
                 };
 
-                // Check for annotation
-                let has_annotation = app.all_annotations.iter().any(|a| {
-                    a.file_path == *file_path
-                        && a.side == side
-                        && a.start_line <= line_no
-                        && a.end_line.map_or(a.start_line == line_no, |e| e >= line_no)
-                });
+                let marker_char = app
+                    .annotation_marker_for_line(file_path, side, line_no)
+                    .unwrap_or(' ');
                 let marker_style = if is_current {
                     Style::default()
                         .fg(theme.annotation_marker)
                         .bg(theme.current_line_bg)
+                } else if is_selected {
+                    Style::default()
+                        .fg(theme.annotation_marker)
+                        .bg(theme.selection_bg)
                 } else {
                     Style::default().fg(theme.annotation_marker)
                 };
-                let marker = if has_annotation { "●" } else { " " };
+                let marker = marker_char.to_string();
 
                 match line.kind {
                     LineKind::Deletion => {
@@ -3459,11 +3996,18 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         let content_style = Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg);
                         let line_num_style = if is_current {
                             Style::default().fg(theme.deleted_fg).bg(theme.current_line_bg)
+                        } else if is_selected {
+                            Style::default().fg(theme.deleted_fg).bg(theme.selection_bg)
                         } else {
                             Style::default().fg(theme.deleted_fg)
                         };
+                        let content_style = if is_selected && !is_current {
+                            content_style.bg(theme.selection_bg)
+                        } else {
+                            content_style
+                        };
                         let left_spans = vec![
-                            Span::styled(marker, marker_style),
+                            Span::styled(marker.clone(), marker_style),
                             Span::styled(old_no, line_num_style),
                             Span::styled("- ", content_style),
                         ];
@@ -3472,7 +4016,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             &line.highlights,
                             content_style,
                             is_current,
-                            theme.current_line_bg,
+                            if is_selected { theme.selection_bg } else { theme.current_line_bg },
                         );
                         let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
                         left_items.push(ListItem::new(lines));
@@ -3485,12 +4029,19 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         let content_style = Style::default().fg(theme.added_fg).bg(theme.added_bg);
                         let line_num_style = if is_current {
                             Style::default().fg(theme.added_fg).bg(theme.current_line_bg)
+                        } else if is_selected {
+                            Style::default().fg(theme.added_fg).bg(theme.selection_bg)
                         } else {
                             Style::default().fg(theme.added_fg)
                         };
+                        let content_style = if is_selected && !is_current {
+                            content_style.bg(theme.selection_bg)
+                        } else {
+                            content_style
+                        };
                         left_items.push(ListItem::new(Line::from("")));
                         let right_spans = vec![
-                            Span::styled(marker, marker_style),
+                            Span::styled(marker.clone(), marker_style),
                             Span::styled(new_no, line_num_style),
                             Span::styled("+ ", content_style),
                         ];
@@ -3499,7 +4050,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             &line.highlights,
                             content_style,
                             is_current,
-                            theme.current_line_bg,
+                            if is_selected { theme.selection_bg } else { theme.current_line_bg },
                         );
                         let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
                         right_items.push(ListItem::new(lines));
@@ -3514,11 +4065,18 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         let content_style = Style::default().fg(theme.context_fg);
                         let line_num_style = if is_current {
                             Style::default().fg(theme.line_num).bg(theme.current_line_bg)
+                        } else if is_selected {
+                            Style::default().fg(theme.line_num).bg(theme.selection_bg)
                         } else {
                             Style::default().fg(theme.line_num)
                         };
+                        let content_style = if is_selected && !is_current {
+                            content_style.bg(theme.selection_bg)
+                        } else {
+                            content_style
+                        };
                         let left_spans = vec![
-                            Span::styled(marker, marker_style),
+                            Span::styled(marker.clone(), marker_style),
                             Span::styled(old_no, line_num_style),
                             Span::styled("  ", content_style),
                         ];
@@ -3527,13 +4085,13 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             &line.highlights,
                             content_style,
                             is_current,
-                            theme.current_line_bg,
+                            if is_selected { theme.selection_bg } else { theme.current_line_bg },
                         );
                         let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
                         left_items.push(ListItem::new(lines));
 
                         let right_spans = vec![
-                            Span::styled(marker, marker_style),
+                            Span::styled(marker.clone(), marker_style),
                             Span::styled(new_no, line_num_style),
                             Span::styled("  ", content_style),
                         ];
@@ -3542,7 +4100,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             &line.highlights,
                             content_style,
                             is_current,
-                            theme.current_line_bg,
+                            if is_selected { theme.selection_bg } else { theme.current_line_bg },
                         );
                         let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
                         right_items.push(ListItem::new(lines));
@@ -3683,11 +4241,16 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             } else {
                 String::new()
             };
+            let loading_suffix = if app.diff_loading {
+                format!("  Loading… ({})", app.files.len())
+            } else {
+                String::new()
+            };
             let shortcuts = " j/k:nav  n/N:chunk  c:collapse  a:add  e:edit  r:resolve  ?:help";
             let content = if let Some(msg) = &app.message {
-                format!("{}{}{}", mode_label, msg, ai_suffix)
+                format!("{}{}{}{}", mode_label, msg, ai_suffix, loading_suffix)
             } else {
-                format!("{}{}{}", mode_label, shortcuts, ai_suffix)
+                format!("{}{}{}{}", mode_label, shortcuts, ai_suffix, loading_suffix)
             };
             let status = Paragraph::new(content)
                 .style(Style::default().fg(theme.status_fg).bg(theme.status_bg));
