@@ -392,9 +392,6 @@ impl DiffEngine {
                 if let Some(h) = current_hunk.take() {
                     if let Some(ref mut f) = current_file {
                         f.hunks.push(h);
-                        if !f.hunks.is_empty() {
-                            on_file(f.clone())?;
-                        }
                     }
                 }
                 if let Some(header) = parse_hunk_header(&line) {

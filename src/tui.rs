@@ -29,12 +29,13 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::mem;
 use tui_textarea::{CursorMove, Input, TextArea};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use similar::{ChangeTag, TextDiff};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
-const INITIAL_HUNK_HIGHLIGHT_COUNT: usize = 5;
+const STREAM_BATCH_FILES: usize = 3;
 
 const HELP_TEXT: &[&str] = &[
     "",
@@ -165,12 +166,6 @@ pub struct App {
     syntax_highlighter: SyntaxHighlighter,
     syntax_cache_old: HashMap<String, Vec<Vec<HighlightRange>>>,
     syntax_cache_new: HashMap<String, Vec<Vec<HighlightRange>>>,
-    eager_highlight_files: HashSet<String>,
-    eager_hunks_remaining: usize,
-    highlight_pending: HashSet<String>,
-    highlight_generation: u64,
-    highlight_rx: Receiver<HighlightEvent>,
-    highlight_tx: Sender<HighlightEvent>,
     diff_generation: u64,
     diff_loading: bool,
     diff_rx: Receiver<DiffStreamEvent>,
@@ -179,6 +174,7 @@ pub struct App {
     diff_pending_reset: bool,
     cached_unstaged: Option<Vec<DiffFile>>,
     cached_staged: Option<Vec<DiffFile>>,
+    pending_stream_files: Vec<DiffFile>,
 
     // UI state
     mode: Mode,
@@ -236,18 +232,6 @@ enum DiffStreamEvent {
 enum AiStatus {
     Running,
     Done { ok: bool },
-}
-
-#[derive(Debug, Clone)]
-enum HighlightEvent {
-    Ready {
-        generation: u64,
-        file_key: String,
-        old_key: String,
-        new_key: String,
-        old_map: Vec<Vec<HighlightRange>>,
-        new_map: Vec<Vec<HighlightRange>>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -385,7 +369,6 @@ impl App {
         let show_annotations = config.show_annotations;
         let side_by_side = config.side_by_side;
         let (ai_tx, ai_rx) = mpsc::channel();
-        let (highlight_tx, highlight_rx) = mpsc::channel();
         let (diff_tx, diff_rx) = mpsc::channel();
 
         let syntax_theme = config.syntax_theme.clone();
@@ -408,12 +391,6 @@ impl App {
             syntax_highlighter: SyntaxHighlighter::new(syntax_theme.as_deref())?,
             syntax_cache_old: HashMap::new(),
             syntax_cache_new: HashMap::new(),
-            eager_highlight_files: HashSet::new(),
-            eager_hunks_remaining: INITIAL_HUNK_HIGHLIGHT_COUNT,
-            highlight_pending: HashSet::new(),
-            highlight_generation: 0,
-            highlight_rx,
-            highlight_tx,
             diff_generation: 0,
             diff_loading: false,
             diff_rx,
@@ -422,6 +399,7 @@ impl App {
             diff_pending_reset: false,
             cached_unstaged: None,
             cached_staged: None,
+            pending_stream_files: Vec::new(),
             mode: Mode::Normal,
             annotation_input: TextArea::default(),
             annotation_type: AnnotationType::Comment,
@@ -480,132 +458,6 @@ impl App {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         (file_key, old_key, new_key)
-    }
-
-    fn highlight_file_keys_for_first_hunks(&self, max_hunks: usize) -> Vec<String> {
-        let mut keys: Vec<String> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut hunk_count = 0usize;
-
-        for file in &self.files {
-            let (file_path, _, _) = Self::file_highlight_keys(file);
-            if seen.insert(file_path.clone()) {
-                keys.push(file_path.clone());
-            }
-
-            if !file.hunks.is_empty() {
-                hunk_count += file.hunks.len();
-            }
-            if hunk_count >= max_hunks {
-                break;
-            }
-        }
-
-        if keys.is_empty() {
-            if let Some(file) = self.files.first() {
-                let (file_path, _, _) = Self::file_highlight_keys(file);
-                keys.push(file_path);
-            }
-        }
-
-        keys
-    }
-
-    fn prepare_lazy_highlighting(&mut self) {
-        if !self.config.syntax_highlighting {
-            return;
-        }
-
-        let eager_files = self.highlight_file_keys_for_first_hunks(INITIAL_HUNK_HIGHLIGHT_COUNT);
-        self.eager_highlight_files = eager_files.iter().cloned().collect();
-
-        let mut jobs: Vec<(String, String, String, DiffFile)> = Vec::new();
-        let files: Vec<DiffFile> = self.files.clone();
-        for file in files {
-            let (file_key, old_key, new_key) = Self::file_highlight_keys(&file);
-            if self.eager_highlight_files.contains(&file_key) {
-                let (old_map, new_map) = self.load_highlight_maps(
-                    &file,
-                    if old_key.is_empty() { None } else { Some(old_key.as_str()) },
-                    if new_key.is_empty() { None } else { Some(new_key.as_str()) },
-                );
-                if !old_key.is_empty() {
-                    self.syntax_cache_old.insert(old_key.clone(), old_map);
-                }
-                if !new_key.is_empty() {
-                    self.syntax_cache_new.insert(new_key.clone(), new_map);
-                }
-            } else {
-                if self.highlight_pending.insert(file_key.clone()) {
-                    jobs.push((file_key, old_key, new_key, file));
-                }
-            }
-        }
-
-        if jobs.is_empty() {
-            return;
-        }
-
-        let generation = self.highlight_generation;
-        let repo_path = self.repo_path.clone();
-        let diff_mode = self.diff_mode.clone();
-        let theme_name = self.config.syntax_theme.clone();
-        let tx = self.highlight_tx.clone();
-
-        thread::spawn(move || {
-            let mut highlighter = match SyntaxHighlighter::new(theme_name.as_deref()) {
-                Ok(h) => h,
-                Err(_) => return,
-            };
-            for (file_key, old_key, new_key, file) in jobs {
-                let (old_map, new_map) = compute_highlight_maps_for_file(
-                    &mut highlighter,
-                    &repo_path,
-                    &diff_mode,
-                    &file,
-                    if old_key.is_empty() { None } else { Some(old_key.as_str()) },
-                    if new_key.is_empty() { None } else { Some(new_key.as_str()) },
-                );
-                let _ = tx.send(HighlightEvent::Ready {
-                    generation,
-                    file_key,
-                    old_key,
-                    new_key,
-                    old_map,
-                    new_map,
-                });
-            }
-        });
-    }
-
-    fn handle_highlight_event(&mut self, evt: HighlightEvent) -> Result<()> {
-        match evt {
-            HighlightEvent::Ready {
-                generation,
-                file_key,
-                old_key,
-                new_key,
-                old_map,
-                new_map,
-            } => {
-                if generation != self.highlight_generation {
-                    return Ok(());
-                }
-                if !old_key.is_empty() {
-                    self.syntax_cache_old.insert(old_key, old_map);
-                }
-                if !new_key.is_empty() {
-                    self.syntax_cache_new.insert(new_key, new_map);
-                }
-                self.highlight_pending.remove(&file_key);
-                if let Some(idx) = self.diff_file_index.get(&file_key).copied() {
-                    self.update_display_lines_for_file(idx);
-                } else if self.display_lines.is_empty() {
-                    self.build_display_lines();
-                }
-            }
-        }
-        Ok(())
     }
 
     fn build_anchor(lines: &[String], line_no: u32) -> (u32, String, String, String) {
@@ -743,6 +595,27 @@ impl App {
 
     fn build_highlight_map(&mut self, content: &str, file_path: &str) -> Vec<Vec<HighlightRange>> {
         let per_line = self.syntax_highlighter.highlight_file(content, file_path);
+        per_line
+            .into_iter()
+            .map(|line_hl| {
+                line_hl
+                    .into_iter()
+                    .map(|h| HighlightRange {
+                        start: h.start,
+                        end: h.end,
+                        style: h.style,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn highlight_hunk_lines(&mut self, file_path: &str, lines: &[DiffLine]) -> Vec<Vec<HighlightRange>> {
+        if !self.config.syntax_highlighting {
+            return vec![Vec::new(); lines.len()];
+        }
+        let line_refs: Vec<&str> = lines.iter().map(|line| line.content.as_str()).collect();
+        let per_line = self.syntax_highlighter.highlight_lines(&line_refs, file_path);
         per_line
             .into_iter()
             .map(|line_hl| {
@@ -933,26 +806,13 @@ impl App {
         file: &DiffFile,
         file_path: &str,
     ) {
-        let old_path = file
-            .old_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string());
-        let new_path = file
-            .new_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string());
-        let allow_compute = self.eager_highlight_files.contains(file_path)
-            || self.syntax_cache_new.contains_key(file_path)
-            || self.syntax_cache_old.contains_key(file_path);
-        let (old_map, new_map) = self.cached_highlight_maps(
-            file,
-            old_path.as_deref(),
-            new_path.as_deref().or(old_path.as_deref()),
-            allow_compute,
-        );
-
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-            let inline_ranges = compute_intraline_ranges(&hunk.lines);
+            let inline_ranges = if self.diff_loading {
+                vec![Vec::new(); hunk.lines.len()]
+            } else {
+                compute_intraline_ranges(&hunk.lines)
+            };
+            let hunk_highlights = self.highlight_hunk_lines(file_path, &hunk.lines);
             // Count additions and deletions in this hunk
             let additions = hunk.lines.iter().filter(|l| l.kind == LineKind::Addition).count();
             let deletions = hunk.lines.iter().filter(|l| l.kind == LineKind::Deletion).count();
@@ -962,7 +822,7 @@ impl App {
 
             if let Some(text) = hunk.header.as_ref().filter(|t| !t.trim().is_empty()) {
                 let clean = text.trim().trim_start_matches("@@").trim().to_string();
-                let highlights = if allow_compute && self.config.syntax_highlighting {
+                let highlights = if self.config.syntax_highlighting {
                     let mut lines = self.syntax_highlighter.highlight_file(
                         &format!("{}\n", clean),
                         file_path,
@@ -1001,7 +861,9 @@ impl App {
                 if let Some(ranges) = inline_ranges.get(line_idx) {
                     highlighted_line.inline_ranges = ranges.clone();
                 }
-                self.highlight_from_maps(&mut highlighted_line, &old_map, &new_map);
+                if let Some(ranges) = hunk_highlights.get(line_idx) {
+                    highlighted_line.highlights = ranges.clone();
+                }
 
                 out.push(DisplayLine::Diff {
                     line: highlighted_line.clone(),
@@ -1037,7 +899,11 @@ impl App {
         let mut hunk_ranges: Vec<(std::ops::RangeInclusive<u32>, std::ops::RangeInclusive<u32>)> =
             Vec::new();
         for hunk in &file.hunks {
-            let inline_ranges = compute_intraline_ranges(&hunk.lines);
+            let inline_ranges = if self.diff_loading {
+                vec![Vec::new(); hunk.lines.len()]
+            } else {
+                compute_intraline_ranges(&hunk.lines)
+            };
             let old_range = hunk.old_start..=hunk.old_start.saturating_add(hunk.old_lines.saturating_sub(1));
             let new_range = hunk.new_start..=hunk.new_start.saturating_add(hunk.new_lines.saturating_sub(1));
             hunk_ranges.push((old_range, new_range));
@@ -2917,10 +2783,6 @@ impl App {
     fn clear_syntax_cache(&mut self) {
         self.syntax_cache_old.clear();
         self.syntax_cache_new.clear();
-        self.eager_highlight_files.clear();
-        self.eager_hunks_remaining = INITIAL_HUNK_HIGHLIGHT_COUNT;
-        self.highlight_pending.clear();
-        self.highlight_generation = self.highlight_generation.wrapping_add(1);
     }
 
     fn start_diff_stream(&mut self, target: Option<(String, u32)>) -> Result<()> {
@@ -2970,54 +2832,21 @@ impl App {
                     self.diff_file_index.clear();
                     self.display_lines.clear();
                     self.file_line_ranges.clear();
+                    self.pending_stream_files.clear();
                     self.diff_pending_reset = false;
                 }
-                let (file_key, _, _) = Self::file_highlight_keys(&file);
-                if self.config.syntax_highlighting && self.eager_hunks_remaining > 0 {
-                    if self.eager_highlight_files.insert(file_key.clone()) {
-                        let hunk_count = file.hunks.len();
-                        self.eager_hunks_remaining =
-                            self.eager_hunks_remaining.saturating_sub(hunk_count.max(1));
-                    }
-                }
-                if let Some(idx) = self.diff_file_index.get(&file_key).copied() {
-                    if let Some(slot) = self.files.get_mut(idx) {
-                        *slot = file;
-                    }
-                    self.update_display_lines_for_file(idx);
-                } else {
-                    let idx = self.files.len();
-                    self.files.push(file);
-                    self.diff_file_index.insert(file_key, idx);
-                    self.update_display_lines_for_file(idx);
-                }
-                if !self.diff_loading {
-                    self.prepare_lazy_highlighting();
-                }
-                if let Some(search) = &mut self.search {
-                    if !search.query.is_empty() {
-                        self.execute_search();
-                    }
-                }
-                if let Some((file_path, line_no)) = self.diff_target.take() {
-                    if let Some(idx) = self.find_best_line_match(&file_path, line_no) {
-                        self.current_line_idx = idx;
-                        self.ensure_cursor_on_navigable();
-                        self.adjust_scroll();
-                    }
-                } else if self.current_line_idx == 0 {
-                    self.ensure_cursor_on_navigable();
-                    self.adjust_scroll();
-                } else if self.current_line_idx >= self.display_lines.len().saturating_sub(1) {
-                    self.current_line_idx = self.display_lines.len().saturating_sub(1);
-                    self.ensure_cursor_on_navigable();
-                    self.adjust_scroll();
+                self.pending_stream_files.push(file);
+                let should_flush =
+                    self.files.is_empty() || self.pending_stream_files.len() >= STREAM_BATCH_FILES;
+                if should_flush {
+                    self.flush_streamed_files();
                 }
             }
             DiffStreamEvent::Done { generation, error } => {
                 if generation != self.diff_generation {
                     return Ok(());
                 }
+                self.flush_streamed_files();
                 self.diff_loading = false;
                 if let Some(err) = error {
                     self.message = Some(format!("Diff load failed: {}", err));
@@ -3032,17 +2861,13 @@ impl App {
                     self.message = None;
                 }
                 if !self.files.is_empty() {
-                    self.prepare_lazy_highlighting();
                     if self.display_lines.is_empty() {
                         self.build_display_lines();
-                    } else {
-                        let eager_files: Vec<String> =
-                            self.eager_highlight_files.iter().cloned().collect();
-                        for key in eager_files {
-                            if let Some(idx) = self.diff_file_index.get(&key).copied() {
-                                self.update_display_lines_for_file(idx);
-                            }
-                        }
+                    }
+                }
+                if let Some(search) = &mut self.search {
+                    if !search.query.is_empty() {
+                        self.execute_search();
                     }
                 }
                 match self.diff_mode {
@@ -3067,6 +2892,55 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn flush_streamed_files(&mut self) {
+        if self.pending_stream_files.is_empty() {
+            return;
+        }
+        let mut updated_indices = Vec::new();
+        let files = mem::take(&mut self.pending_stream_files);
+        for file in files {
+            let (file_key, _, _) = Self::file_highlight_keys(&file);
+            if let Some(idx) = self.diff_file_index.get(&file_key).copied() {
+                if let Some(slot) = self.files.get_mut(idx) {
+                    *slot = file;
+                }
+                updated_indices.push(idx);
+            } else {
+                let idx = self.files.len();
+                self.files.push(file);
+                self.diff_file_index.insert(file_key, idx);
+                updated_indices.push(idx);
+            }
+        }
+
+        for idx in updated_indices {
+            self.update_display_lines_for_file(idx);
+        }
+
+        if !self.diff_loading {
+            if let Some(search) = &mut self.search {
+                if !search.query.is_empty() {
+                    self.execute_search();
+                }
+            }
+        }
+
+        if let Some((file_path, line_no)) = self.diff_target.take() {
+            if let Some(idx) = self.find_best_line_match(&file_path, line_no) {
+                self.current_line_idx = idx;
+                self.ensure_cursor_on_navigable();
+                self.adjust_scroll();
+            }
+        } else if self.current_line_idx == 0 {
+            self.ensure_cursor_on_navigable();
+            self.adjust_scroll();
+        } else if self.current_line_idx >= self.display_lines.len().saturating_sub(1) {
+            self.current_line_idx = self.display_lines.len().saturating_sub(1);
+            self.ensure_cursor_on_navigable();
+            self.adjust_scroll();
+        }
     }
 
     fn update_display_lines_for_file(&mut self, file_idx: usize) {
@@ -3410,9 +3284,6 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
 
         while let Ok(evt) = app.ai_rx.try_recv() {
             app.handle_ai_event(evt)?;
-        }
-        while let Ok(evt) = app.highlight_rx.try_recv() {
-            app.handle_highlight_event(evt)?;
         }
         while let Ok(evt) = app.diff_rx.try_recv() {
             app.handle_diff_event(evt)?;
@@ -4551,181 +4422,6 @@ where
     } else {
         Err(anyhow!("AI process failed"))
     }
-}
-
-fn read_working_file_at(repo_path: &PathBuf, path: &str) -> Option<String> {
-    let full_path = repo_path.join(path);
-    std::fs::read(&full_path)
-        .ok()
-        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-}
-
-fn git_show_at(repo_path: &PathBuf, spec: &str) -> Option<String> {
-    let output = Command::new("git")
-        .arg("show")
-        .arg(spec)
-        .current_dir(repo_path)
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        None
-    }
-}
-
-fn git_merge_base_at(repo_path: &PathBuf, from: &str, to: &str) -> Option<String> {
-    let output = Command::new("git")
-        .arg("merge-base")
-        .arg(from)
-        .arg(to)
-        .current_dir(repo_path)
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        None
-    }
-}
-
-fn build_highlight_map_with(
-    highlighter: &mut SyntaxHighlighter,
-    content: &str,
-    file_path: &str,
-) -> Vec<Vec<HighlightRange>> {
-    let per_line = highlighter.highlight_file(content, file_path);
-    per_line
-        .into_iter()
-        .map(|line_hl| {
-            line_hl
-                .into_iter()
-                .map(|h| HighlightRange {
-                    start: h.start,
-                    end: h.end,
-                    style: h.style,
-                })
-                .collect()
-        })
-        .collect()
-}
-
-fn compute_highlight_maps_for_file(
-    highlighter: &mut SyntaxHighlighter,
-    repo_path: &PathBuf,
-    diff_mode: &DiffMode,
-    file: &DiffFile,
-    old_path: Option<&str>,
-    new_path: Option<&str>,
-) -> (Vec<Vec<HighlightRange>>, Vec<Vec<HighlightRange>>) {
-    let mut need_old = matches!(file.status, FileStatus::Deleted);
-    let mut need_new = matches!(file.status, FileStatus::Added);
-    if !need_old || !need_new {
-        for hunk in &file.hunks {
-            for line in &hunk.lines {
-                match line.kind {
-                    LineKind::Deletion => need_old = true,
-                    LineKind::Addition | LineKind::Context => need_new = true,
-                }
-                if need_old && need_new {
-                    break;
-                }
-            }
-            if need_old && need_new {
-                break;
-            }
-        }
-    }
-
-    let (mut old_content, mut new_content) = (None, None);
-    match diff_mode {
-        DiffMode::Unstaged => {
-            if need_old {
-                if let Some(path) = old_path {
-                    old_content = git_show_at(repo_path, &format!(":{}", path));
-                }
-            }
-            if need_new {
-                if let Some(path) = new_path {
-                    new_content = read_working_file_at(repo_path, path);
-                }
-            }
-        }
-        DiffMode::Staged => {
-            if need_old {
-                if let Some(path) = old_path {
-                    old_content = git_show_at(repo_path, &format!("HEAD:{}", path));
-                }
-            }
-            if need_new {
-                if let Some(path) = new_path {
-                    new_content = git_show_at(repo_path, &format!(":{}", path));
-                }
-            }
-        }
-        DiffMode::WorkingTree { base } => {
-            if need_old {
-                if let Some(path) = old_path {
-                    old_content = git_show_at(repo_path, &format!("{}:{}", base, path));
-                }
-            }
-            if need_new {
-                if let Some(path) = new_path {
-                    new_content = read_working_file_at(repo_path, path);
-                }
-            }
-        }
-        DiffMode::Commits { from, to } => {
-            if need_old {
-                if let Some(path) = old_path {
-                    old_content = git_show_at(repo_path, &format!("{}:{}", from, path));
-                }
-            }
-            if need_new {
-                if let Some(path) = new_path {
-                    new_content = git_show_at(repo_path, &format!("{}:{}", to, path));
-                }
-            }
-        }
-        DiffMode::MergeBase { from, to } => {
-            let base = git_merge_base_at(repo_path, from, to);
-            if need_old {
-                if let (Some(path), Some(base)) = (old_path, base.as_deref()) {
-                    old_content = git_show_at(repo_path, &format!("{}:{}", base, path));
-                }
-            }
-            if need_new {
-                if let Some(path) = new_path {
-                    new_content = git_show_at(repo_path, &format!("{}:{}", to, path));
-                }
-            }
-        }
-        _ => {
-            if need_new {
-                if let Some(path) = new_path.or(old_path) {
-                    new_content = read_working_file_at(repo_path, path);
-                }
-            }
-        }
-    }
-
-    if file.status == FileStatus::Added {
-        old_content = None;
-    }
-    if file.status == FileStatus::Deleted {
-        new_content = None;
-    }
-
-    let old_map = old_content
-        .as_ref()
-        .map(|c| build_highlight_map_with(highlighter, c, old_path.unwrap_or("")))
-        .unwrap_or_default();
-    let new_map = new_content
-        .as_ref()
-        .map(|c| build_highlight_map_with(highlighter, c, new_path.or(old_path).unwrap_or("")))
-        .unwrap_or_default();
-
-    (old_map, new_map)
 }
 
 fn extract_claude_text(line: &str) -> Option<String> {
