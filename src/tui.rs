@@ -23,6 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Stdout, Write};
 use std::path::PathBuf;
@@ -36,6 +37,7 @@ use similar::{ChangeTag, TextDiff};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
 const STREAM_BATCH_FILES: usize = 3;
+const INTRALINE_PAIR_RATIO_THRESHOLD: f32 = 0.6;
 
 const HELP_TEXT: &[&str] = &[
     "",
@@ -166,6 +168,7 @@ pub struct App {
     syntax_highlighter: SyntaxHighlighter,
     syntax_cache_old: HashMap<String, Vec<Vec<HighlightRange>>>,
     syntax_cache_new: HashMap<String, Vec<Vec<HighlightRange>>>,
+    expanded_highlight_files: HashSet<String>,
     diff_generation: u64,
     diff_loading: bool,
     diff_rx: Receiver<DiffStreamEvent>,
@@ -391,6 +394,7 @@ impl App {
             syntax_highlighter: SyntaxHighlighter::new(syntax_theme.as_deref())?,
             syntax_cache_old: HashMap::new(),
             syntax_cache_new: HashMap::new(),
+            expanded_highlight_files: HashSet::new(),
             diff_generation: 0,
             diff_loading: false,
             diff_rx,
@@ -631,58 +635,12 @@ impl App {
             .collect()
     }
 
-    fn cached_highlight_maps(
-        &mut self,
-        file: &DiffFile,
-        old_path: Option<&str>,
-        new_path: Option<&str>,
-        allow_compute: bool,
-    ) -> (Vec<Vec<HighlightRange>>, Vec<Vec<HighlightRange>>) {
-        if !self.config.syntax_highlighting {
-            return (Vec::new(), Vec::new());
-        }
-
-        let old_key = old_path.unwrap_or("").to_string();
-        let new_key = new_path.or(old_path).unwrap_or("").to_string();
-
-        let has_old = !old_key.is_empty() && self.syntax_cache_old.contains_key(&old_key);
-        let has_new = !new_key.is_empty() && self.syntax_cache_new.contains_key(&new_key);
-
-        if (!has_old || !has_new) && allow_compute {
-            let (old_map, new_map) = self.load_highlight_maps(file, old_path, new_path);
-            if !old_key.is_empty() && !has_old {
-                self.syntax_cache_old.insert(old_key.clone(), old_map);
-            }
-            if !new_key.is_empty() && !has_new {
-                self.syntax_cache_new.insert(new_key.clone(), new_map);
-            }
-        }
-
-        let old_map = if old_key.is_empty() {
-            Vec::new()
-        } else {
-            self.syntax_cache_old
-                .get(&old_key)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let new_map = if new_key.is_empty() {
-            Vec::new()
-        } else {
-            self.syntax_cache_new
-                .get(&new_key)
-                .cloned()
-                .unwrap_or_default()
-        };
-
-        (old_map, new_map)
-    }
-
     fn load_highlight_maps(
         &mut self,
         file: &DiffFile,
         old_path: Option<&str>,
         new_path: Option<&str>,
+        full_file: bool,
     ) -> (Vec<Vec<HighlightRange>>, Vec<Vec<HighlightRange>>) {
         if !self.config.syntax_highlighting {
             return (Vec::new(), Vec::new());
@@ -690,7 +648,10 @@ impl App {
 
         let mut need_old = matches!(file.status, FileStatus::Deleted);
         let mut need_new = matches!(file.status, FileStatus::Added);
-        if !need_old || !need_new {
+        if full_file {
+            need_old = !matches!(file.status, FileStatus::Added) && old_path.is_some();
+            need_new = !matches!(file.status, FileStatus::Deleted) && new_path.or(old_path).is_some();
+        } else if !need_old || !need_new {
             for hunk in &file.hunks {
                 for line in &hunk.lines {
                     match line.kind {
@@ -939,12 +900,37 @@ impl App {
         let full_path = self.repo_path.join(file_path);
         let file_content = std::fs::read_to_string(&full_path).unwrap_or_default();
         let file_lines: Vec<&str> = file_content.lines().collect();
-        let (old_map, new_map) = self.cached_highlight_maps(
-            file,
-            file.old_path.as_ref().map(|p| p.to_string_lossy().to_string()).as_deref(),
-            file.new_path.as_ref().map(|p| p.to_string_lossy().to_string()).as_deref(),
-            true,
-        );
+        let (file_key, old_key, _new_key) = Self::file_highlight_keys(file);
+        let old_path = file.old_path.as_ref().map(|p| p.to_string_lossy().to_string());
+        let new_path = file.new_path.as_ref().map(|p| p.to_string_lossy().to_string());
+
+        let new_map = if self.config.syntax_highlighting {
+            if !self.expanded_highlight_files.contains(&file_key) {
+                let map = self.build_highlight_map(&file_content, file_path);
+                self.syntax_cache_new.insert(file_key.clone(), map.clone());
+                self.expanded_highlight_files.insert(file_key.clone());
+                map
+            } else {
+                self.syntax_cache_new
+                    .get(&file_key)
+                    .cloned()
+                    .unwrap_or_default()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let mut old_map = Vec::new();
+        if self.config.syntax_highlighting && !deletions.is_empty() && !old_key.is_empty() {
+            if let Some(cached) = self.syntax_cache_old.get(&old_key).cloned() {
+                old_map = cached;
+            } else {
+                let (computed_old, _computed_new) =
+                    self.load_highlight_maps(file, old_path.as_deref(), new_path.as_deref(), true);
+                self.syntax_cache_old.insert(old_key.clone(), computed_old.clone());
+                old_map = computed_old;
+            }
+        }
 
         // Show all lines with changes highlighted
         for (idx, content) in file_lines.iter().enumerate() {
@@ -2783,6 +2769,7 @@ impl App {
     fn clear_syntax_cache(&mut self) {
         self.syntax_cache_old.clear();
         self.syntax_cache_new.clear();
+        self.expanded_highlight_files.clear();
     }
 
     fn start_diff_stream(&mut self, target: Option<(String, u32)>) -> Result<()> {
@@ -4752,7 +4739,7 @@ fn span_width(span: &Span) -> usize {
 }
 
 fn compute_inline_ranges(old: &str, new: &str) -> (Vec<InlineRange>, Vec<InlineRange>) {
-    let diff = TextDiff::from_words(old, new);
+    let diff = TextDiff::from_chars(old, new);
     let mut old_pos = 0usize;
     let mut new_pos = 0usize;
     let mut old_ranges = Vec::new();
@@ -4786,6 +4773,10 @@ fn compute_inline_ranges(old: &str, new: &str) -> (Vec<InlineRange>, Vec<InlineR
     }
 
     (merge_inline_ranges(old_ranges), merge_inline_ranges(new_ranges))
+}
+
+fn line_similarity(old: &str, new: &str) -> f32 {
+    TextDiff::from_chars(old, new).ratio()
 }
 
 fn merge_inline_ranges(mut ranges: Vec<InlineRange>) -> Vec<InlineRange> {
@@ -4822,14 +4813,48 @@ fn compute_intraline_ranges(lines: &[DiffLine]) -> Vec<Vec<InlineRange>> {
             }
             let del_count = add_start - del_start;
             let add_count = i - add_start;
-            let pair_count = del_count.min(add_count);
-            for k in 0..pair_count {
-                let (del_ranges, add_ranges) = compute_inline_ranges(
-                    &lines[del_start + k].content,
-                    &lines[add_start + k].content,
-                );
-                per_line[del_start + k] = del_ranges;
-                per_line[add_start + k] = add_ranges;
+            if del_count == 0 || add_count == 0 {
+                continue;
+            }
+
+            let mut candidates: Vec<(f32, usize, usize, usize)> = Vec::new();
+            for d in del_start..add_start {
+                let old_line = lines[d].content.as_str();
+                for a in add_start..i {
+                    let new_line = lines[a].content.as_str();
+                    let score = line_similarity(old_line, new_line);
+                    if score >= INTRALINE_PAIR_RATIO_THRESHOLD {
+                        let rel_d = d - del_start;
+                        let rel_a = a - add_start;
+                        let distance = rel_d.abs_diff(rel_a);
+                        candidates.push((score, distance, d, a));
+                    }
+                }
+            }
+
+            candidates.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.2.cmp(&b.2))
+                    .then_with(|| a.3.cmp(&b.3))
+            });
+
+            let mut used_del = vec![false; del_count];
+            let mut used_add = vec![false; add_count];
+
+            for (_score, _distance, d, a) in candidates {
+                let rel_d = d - del_start;
+                let rel_a = a - add_start;
+                if used_del[rel_d] || used_add[rel_a] {
+                    continue;
+                }
+                let (del_ranges, add_ranges) =
+                    compute_inline_ranges(&lines[d].content, &lines[a].content);
+                per_line[d] = del_ranges;
+                per_line[a] = add_ranges;
+                used_del[rel_d] = true;
+                used_add[rel_a] = true;
             }
         } else {
             i += 1;
