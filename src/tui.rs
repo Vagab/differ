@@ -9,7 +9,7 @@ use crate::diff::{
 };
 use crate::storage::{Annotation, AnnotationType, Side, Storage};
 use crate::syntax::SyntaxHighlighter;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind, DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -50,13 +50,15 @@ const HELP_TEXT: &[&str] = &[
     "    Ctrl+d    Half page down",
     "    Ctrl+u    Half page up",
     "    g         Go to start",
+    "    :         Go to line (expanded view)",
     "    G         Go to end",
     "",
-    "  Search:",
+    "  Search & Copy:",
     "    f         Search by filename (regex)",
     "    /         Search in content (regex)",
     "    n / N     Next / previous match (when searching)",
     "    Esc       Clear search",
+    "    y         Copy selection/current line",
     "",
     "  View:",
     "    x         Expand/collapse current file (full view)",
@@ -207,6 +209,7 @@ pub struct App {
     // Position to restore when collapsing expanded view
     pre_expand_position: Option<(usize, usize)>, // (line_idx, scroll_offset)
     annotation_list_idx: usize,
+    goto_line_input: String,
 
     // Search state
     search: Option<SearchState>,
@@ -226,6 +229,7 @@ enum Mode {
     SearchFile,          // searching by filename
     SearchContent,       // searching within content
     AnnotationList,
+    GotoLine,
 }
 
 #[derive(Debug)]
@@ -444,6 +448,7 @@ impl App {
             pre_expand_position: None,
             search: None,
             annotation_list_idx: 0,
+            goto_line_input: String::new(),
             ai_jobs: Vec::new(),
             ai_next_id: 1,
             ai_rx,
@@ -1218,6 +1223,51 @@ impl App {
         }
     }
 
+    fn selected_text_for_copy(&self) -> Option<String> {
+        let (start_idx, end_idx) = self.selection_range()?;
+        let mut lines: Vec<String> = Vec::new();
+        for idx in start_idx..=end_idx {
+            if let Some(DisplayLine::Diff { line, .. }) = self.display_lines.get(idx) {
+                lines.push(line.content.clone());
+            }
+        }
+        if lines.is_empty() {
+            None
+        } else {
+            Some(lines.join("\n"))
+        }
+    }
+
+    fn copy_to_clipboard(&self, text: &str) -> Result<()> {
+        let mut child = Command::new("pbcopy")
+            .stdin(Stdio::piped())
+            .spawn()
+            .context("Failed to start pbcopy")?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let status = child.wait()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(anyhow!("pbcopy failed"))
+        }
+    }
+
+    fn find_line_in_expanded(&self, line_no: u32) -> Option<usize> {
+        if self.expanded_file.is_none() {
+            return None;
+        }
+        for (idx, line) in self.display_lines.iter().enumerate() {
+            if let DisplayLine::Diff { line, .. } = line {
+                if line.new_line_no == Some(line_no) {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
     fn highlight_from_maps(
         &self,
         line: &mut DiffLine,
@@ -1646,6 +1696,7 @@ impl App {
             Mode::AddAnnotation | Mode::EditAnnotation(_) => self.handle_annotation_input(key),
             Mode::SearchFile | Mode::SearchContent => self.handle_search_input(key),
             Mode::AnnotationList => self.handle_annotation_list_input(key),
+            Mode::GotoLine => self.handle_goto_line_input(key),
         }
     }
 
@@ -1786,6 +1837,14 @@ impl App {
                 }
                 self.adjust_scroll();
             }
+            KeyCode::Char(':') => {
+                if self.expanded_file.is_some() {
+                    self.mode = Mode::GotoLine;
+                    self.goto_line_input.clear();
+                } else {
+                    self.message = Some("Line jump is available in expanded view (x)".to_string());
+                }
+            }
 
 
             // Toggle views
@@ -1878,6 +1937,18 @@ impl App {
                         }
                         self.message = Some("Expanded file view (]/[: next/prev change, x: collapse)".to_string());
                     }
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(text) = self.selected_text_for_copy() {
+                    self.copy_to_clipboard(&text)?;
+                    let lines = text.lines().count().max(1);
+                    self.message = Some(format!("Copied {} line{}", lines, if lines == 1 { "" } else { "s" }));
+                } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line() {
+                    self.copy_to_clipboard(&line.content)?;
+                    self.message = Some("Copied line".to_string());
+                } else {
+                    self.message = Some("Move to a diff line or make a selection".to_string());
                 }
             }
 
@@ -2103,6 +2174,43 @@ impl App {
             _ => {}
         }
 
+        Ok(false)
+    }
+
+    fn handle_goto_line_input(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.goto_line_input.clear();
+            }
+            KeyCode::Enter => {
+                let line_no = self.goto_line_input.trim().parse::<u32>().ok();
+                self.mode = Mode::Normal;
+                if let Some(line_no) = line_no {
+                    if self.expanded_file.is_some() {
+                        if let Some(idx) = self.find_line_in_expanded(line_no) {
+                            self.current_line_idx = idx;
+                            self.ensure_cursor_on_navigable();
+                            self.adjust_scroll();
+                        } else {
+                            self.message = Some(format!("Line {} not found", line_no));
+                        }
+                    } else {
+                        self.message = Some("Line jump is available in expanded view (x)".to_string());
+                    }
+                } else {
+                    self.message = Some("Enter a line number".to_string());
+                }
+                self.goto_line_input.clear();
+            }
+            KeyCode::Backspace => {
+                self.goto_line_input.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                self.goto_line_input.push(c);
+            }
+            _ => {}
+        }
         Ok(false)
     }
 
@@ -4345,6 +4453,13 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             let query = app.search.as_ref().map(|s| s.query.as_str()).unwrap_or("");
             let content = format!(" Search {}: {}_{}  (Enter: confirm, Esc: cancel)", search_type, query, match_info);
 
+            let status = Paragraph::new(content)
+                .style(Style::default().fg(theme.search_fg).bg(theme.search_bg));
+            f.render_widget(status, area);
+        }
+        Mode::GotoLine => {
+            let query = app.goto_line_input.as_str();
+            let content = format!(" Go to line: {}_  (Enter: go, Esc: cancel)", query);
             let status = Paragraph::new(content)
                 .style(Style::default().fg(theme.search_fg).bg(theme.search_bg));
             f.render_widget(status, area);
