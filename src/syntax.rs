@@ -4,9 +4,12 @@
 
 use anyhow::Result;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::FontStyle;
+use syntect::highlighting::{FontStyle, Highlighter, HighlightState, ScopeSelectors};
+use syntect::highlighting::HighlightIterator;
+use syntect::parsing::{ParseState, ScopeStack};
 use syntect::util::LinesWithEndings;
 use syntect_assets::assets::HighlightingAssets;
+use std::str::FromStr;
 
 /// A simple style used for diff highlighting (foreground + modifiers).
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +32,7 @@ pub struct SyntaxHighlight {
 pub struct SyntaxHighlighter {
     assets: HighlightingAssets,
     theme_name: String,
+    string_selector: ScopeSelectors,
 }
 
 impl SyntaxHighlighter {
@@ -39,9 +43,12 @@ impl SyntaxHighlighter {
             .map(|s| s.to_string())
             .or_else(|| std::env::var("BAT_THEME").ok())
             .unwrap_or_else(|| HighlightingAssets::default_theme().to_string());
+        let string_selector =
+            ScopeSelectors::from_str("string").unwrap_or_else(|_| ScopeSelectors::from_str("text").unwrap());
         Ok(Self {
             assets,
             theme_name,
+            string_selector,
         })
     }
 
@@ -97,11 +104,15 @@ impl SyntaxHighlighter {
         per_line
     }
 
-    /// Highlight a list of lines, preserving syntax state across the lines.
-    pub fn highlight_lines(&mut self, lines: &[&str], file_path: &str) -> Vec<Vec<SyntaxHighlight>> {
+    /// Highlight lines and report whether any line ended inside a string scope.
+    pub fn highlight_lines_with_string_state(
+        &mut self,
+        lines: &[&str],
+        file_path: &str,
+    ) -> (Vec<Vec<SyntaxHighlight>>, bool) {
         let theme = self.assets.get_theme(&self.theme_name);
         let Ok(syntax_set) = self.assets.get_syntax_set() else {
-            return Vec::new();
+            return (Vec::new(), false);
         };
         let syntax = syntax_set
             .find_syntax_for_file(file_path)
@@ -115,25 +126,30 @@ impl SyntaxHighlighter {
             })
             .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
 
-        let mut highlighter = HighlightLines::new(syntax, theme);
+        let highlighter = Highlighter::new(theme);
+        let mut highlight_state = HighlightState::new(&highlighter, ScopeStack::new());
+        let mut parse_state = ParseState::new(syntax);
+
         let mut per_line: Vec<Vec<SyntaxHighlight>> = Vec::with_capacity(lines.len());
+        let mut ends_in_string = false;
 
         for line in lines {
             let mut text = String::with_capacity(line.len() + 1);
             text.push_str(line);
             text.push('\n');
 
-            let ranges = match highlighter.highlight_line(&text, syntax_set) {
-                Ok(r) => r,
+            let ops = match parse_state.parse_line(&text, syntax_set) {
+                Ok(o) => o,
                 Err(_) => {
                     per_line.push(Vec::new());
                     continue;
                 }
             };
 
+            let iter = HighlightIterator::new(&mut highlight_state, &ops[..], &text, &highlighter);
             let mut line_highlights: Vec<SyntaxHighlight> = Vec::new();
             let mut offset = 0usize;
-            for (style, segment) in ranges {
+            for (style, segment) in iter {
                 let mut len = segment.len();
                 if len == 0 {
                     continue;
@@ -152,11 +168,18 @@ impl SyntaxHighlighter {
                 line_highlights.push(h);
                 offset += len;
             }
-
             per_line.push(line_highlights);
+
+            if self
+                .string_selector
+                .does_match(highlight_state.path.as_slice())
+                .is_some()
+            {
+                ends_in_string = true;
+            }
         }
 
-        per_line
+        (per_line, ends_in_string)
     }
 
     fn to_text_style(style: syntect::highlighting::Style) -> TextStyle {

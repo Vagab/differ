@@ -169,6 +169,9 @@ pub struct App {
     syntax_cache_old: HashMap<String, Vec<Vec<HighlightRange>>>,
     syntax_cache_new: HashMap<String, Vec<Vec<HighlightRange>>>,
     expanded_highlight_files: HashSet<String>,
+    full_highlight_pending: HashSet<String>,
+    full_highlight_rx: Receiver<HighlightEvent>,
+    full_highlight_tx: Sender<HighlightEvent>,
     diff_generation: u64,
     diff_loading: bool,
     diff_rx: Receiver<DiffStreamEvent>,
@@ -235,6 +238,15 @@ enum DiffStreamEvent {
 enum AiStatus {
     Running,
     Done { ok: bool },
+}
+
+#[derive(Debug, Clone)]
+enum HighlightEvent {
+    FullFile {
+        generation: u64,
+        file_key: String,
+        map: Vec<Vec<HighlightRange>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +384,7 @@ impl App {
         let show_annotations = config.show_annotations;
         let side_by_side = config.side_by_side;
         let (ai_tx, ai_rx) = mpsc::channel();
+        let (full_highlight_tx, full_highlight_rx) = mpsc::channel();
         let (diff_tx, diff_rx) = mpsc::channel();
 
         let syntax_theme = config.syntax_theme.clone();
@@ -395,6 +408,9 @@ impl App {
             syntax_cache_old: HashMap::new(),
             syntax_cache_new: HashMap::new(),
             expanded_highlight_files: HashSet::new(),
+            full_highlight_pending: HashSet::new(),
+            full_highlight_rx,
+            full_highlight_tx,
             diff_generation: 0,
             diff_loading: false,
             diff_rx,
@@ -614,13 +630,19 @@ impl App {
             .collect()
     }
 
-    fn highlight_hunk_lines(&mut self, file_path: &str, lines: &[DiffLine]) -> Vec<Vec<HighlightRange>> {
+    fn highlight_hunk_lines(
+        &mut self,
+        file_path: &str,
+        lines: &[DiffLine],
+    ) -> (Vec<Vec<HighlightRange>>, bool) {
         if !self.config.syntax_highlighting {
-            return vec![Vec::new(); lines.len()];
+            return (vec![Vec::new(); lines.len()], false);
         }
         let line_refs: Vec<&str> = lines.iter().map(|line| line.content.as_str()).collect();
-        let per_line = self.syntax_highlighter.highlight_lines(&line_refs, file_path);
-        per_line
+        let (per_line, ends_in_string) =
+            self.syntax_highlighter
+                .highlight_lines_with_string_state(&line_refs, file_path);
+        let converted = per_line
             .into_iter()
             .map(|line_hl| {
                 line_hl
@@ -632,7 +654,51 @@ impl App {
                     })
                     .collect()
             })
-            .collect()
+            .collect();
+        (converted, ends_in_string)
+    }
+
+    fn maybe_schedule_full_file_highlight(&mut self, file_idx: usize, file_path: &str) {
+        if !self.config.syntax_highlighting {
+            return;
+        }
+        if self.expanded_highlight_files.contains(file_path) {
+            return;
+        }
+        if !self
+            .full_highlight_pending
+            .insert(file_path.to_string())
+        {
+            return;
+        }
+
+        let Some(file) = self.files.get(file_idx).cloned() else {
+            return;
+        };
+
+        let repo_path = self.repo_path.clone();
+        let diff_mode = self.diff_mode.clone();
+        let theme_name = self.config.syntax_theme.clone();
+        let tx = self.full_highlight_tx.clone();
+        let generation = self.diff_generation;
+        let file_key = file_path.to_string();
+
+        thread::spawn(move || {
+            let mut highlighter = match SyntaxHighlighter::new(theme_name.as_deref()) {
+                Ok(h) => h,
+                Err(_) => return,
+            };
+            let content = load_new_file_content_for_highlight(&repo_path, &diff_mode, &file, &file_key);
+            let map = content
+                .as_ref()
+                .map(|c| build_highlight_map_with(&mut highlighter, c, &file_key))
+                .unwrap_or_default();
+            let _ = tx.send(HighlightEvent::FullFile {
+                generation,
+                file_key,
+                map,
+            });
+        });
     }
 
     fn load_highlight_maps(
@@ -767,13 +833,19 @@ impl App {
         file: &DiffFile,
         file_path: &str,
     ) {
+        let full_map = self.syntax_cache_new.get(file_path).cloned();
+        let mut needs_full_highlight = false;
+
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             let inline_ranges = if self.diff_loading {
                 vec![Vec::new(); hunk.lines.len()]
             } else {
                 compute_intraline_ranges(&hunk.lines)
             };
-            let hunk_highlights = self.highlight_hunk_lines(file_path, &hunk.lines);
+            let (hunk_highlights, hunk_needs_full) = self.highlight_hunk_lines(file_path, &hunk.lines);
+            if hunk_needs_full {
+                needs_full_highlight = true;
+            }
             // Count additions and deletions in this hunk
             let additions = hunk.lines.iter().filter(|l| l.kind == LineKind::Addition).count();
             let deletions = hunk.lines.iter().filter(|l| l.kind == LineKind::Deletion).count();
@@ -822,8 +894,18 @@ impl App {
                 if let Some(ranges) = inline_ranges.get(line_idx) {
                     highlighted_line.inline_ranges = ranges.clone();
                 }
-                if let Some(ranges) = hunk_highlights.get(line_idx) {
-                    highlighted_line.highlights = ranges.clone();
+                let mut applied = false;
+                if let (Some(map), Some(line_no)) = (full_map.as_ref(), highlighted_line.new_line_no)
+                {
+                    if let Some(line_hl) = map.get(line_no.saturating_sub(1) as usize) {
+                        highlighted_line.highlights = line_hl.clone();
+                        applied = true;
+                    }
+                }
+                if !applied {
+                    if let Some(ranges) = hunk_highlights.get(line_idx) {
+                        highlighted_line.highlights = ranges.clone();
+                    }
                 }
 
                 out.push(DisplayLine::Diff {
@@ -838,6 +920,10 @@ impl App {
 
             // Add hunk end marker
             out.push(DisplayLine::HunkEnd { file_idx, hunk_idx });
+        }
+
+        if needs_full_highlight {
+            self.maybe_schedule_full_file_highlight(file_idx, file_path);
         }
     }
 
@@ -2770,6 +2856,7 @@ impl App {
         self.syntax_cache_old.clear();
         self.syntax_cache_new.clear();
         self.expanded_highlight_files.clear();
+        self.full_highlight_pending.clear();
     }
 
     fn start_diff_stream(&mut self, target: Option<(String, u32)>) -> Result<()> {
@@ -2928,6 +3015,27 @@ impl App {
             self.ensure_cursor_on_navigable();
             self.adjust_scroll();
         }
+    }
+
+    fn handle_full_highlight_event(&mut self, evt: HighlightEvent) -> Result<()> {
+        match evt {
+            HighlightEvent::FullFile {
+                generation,
+                file_key,
+                map,
+            } => {
+                if generation != self.diff_generation {
+                    return Ok(());
+                }
+                self.syntax_cache_new.insert(file_key.clone(), map);
+                self.expanded_highlight_files.insert(file_key.clone());
+                self.full_highlight_pending.remove(&file_key);
+                if let Some(idx) = self.diff_file_index.get(&file_key).copied() {
+                    self.update_display_lines_for_file(idx);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn update_display_lines_for_file(&mut self, file_idx: usize) {
@@ -3271,6 +3379,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
 
         while let Ok(evt) = app.ai_rx.try_recv() {
             app.handle_ai_event(evt)?;
+        }
+        while let Ok(evt) = app.full_highlight_rx.try_recv() {
+            app.handle_full_highlight_event(evt)?;
         }
         while let Ok(evt) = app.diff_rx.try_recv() {
             app.handle_diff_event(evt)?;
@@ -4439,6 +4550,74 @@ fn extract_claude_text(line: &str) -> Option<String> {
         return Some(text.to_string());
     }
     None
+}
+
+fn read_working_file_at(repo_path: &PathBuf, path: &str) -> Option<String> {
+    let full_path = repo_path.join(path);
+    std::fs::read(&full_path)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn git_show_at(repo_path: &PathBuf, spec: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("show")
+        .arg(spec)
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        None
+    }
+}
+
+fn load_new_file_content_for_highlight(
+    repo_path: &PathBuf,
+    diff_mode: &DiffMode,
+    file: &DiffFile,
+    file_path: &str,
+) -> Option<String> {
+    if matches!(file.status, FileStatus::Deleted) {
+        return None;
+    }
+    let path = file
+        .new_path
+        .as_ref()
+        .or(file.old_path.as_ref())
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.to_string());
+
+    match diff_mode {
+        DiffMode::Unstaged => read_working_file_at(repo_path, &path),
+        DiffMode::Staged => git_show_at(repo_path, &format!(":{}", path)),
+        DiffMode::WorkingTree { .. } => read_working_file_at(repo_path, &path),
+        DiffMode::Commits { to, .. } => git_show_at(repo_path, &format!("{}:{}", to, path)),
+        DiffMode::MergeBase { to, .. } => git_show_at(repo_path, &format!("{}:{}", to, path)),
+        DiffMode::ExternalDiff { .. } => read_working_file_at(repo_path, &path),
+    }
+}
+
+fn build_highlight_map_with(
+    highlighter: &mut SyntaxHighlighter,
+    content: &str,
+    file_path: &str,
+) -> Vec<Vec<HighlightRange>> {
+    let per_line = highlighter.highlight_file(content, file_path);
+    per_line
+        .into_iter()
+        .map(|line_hl| {
+            line_hl
+                .into_iter()
+                .map(|h| HighlightRange {
+                    start: h.start,
+                    end: h.end,
+                    style: h.style,
+                })
+                .collect()
+        })
+        .collect()
 }
 
 #[derive(Clone)]
