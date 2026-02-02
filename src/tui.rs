@@ -197,6 +197,7 @@ pub struct App {
     show_annotations: bool,
     side_by_side: bool,
     visible_height: usize,
+    content_width: usize,
     expanded_file: Option<usize>, // When Some, only show this file
     collapsed_files: HashSet<String>,
     collapsed_files_unstaged: HashSet<String>,
@@ -436,6 +437,7 @@ impl App {
             show_annotations,
             side_by_side,
             visible_height: 20, // Will be updated on first render
+            content_width: 80,
             expanded_file: None,
             collapsed_files: HashSet::new(),
             collapsed_files_unstaged: HashSet::new(),
@@ -1268,6 +1270,20 @@ impl App {
         None
     }
 
+    fn find_old_line_in_expanded(&self, line_no: u32) -> Option<usize> {
+        if self.expanded_file.is_none() {
+            return None;
+        }
+        for (idx, line) in self.display_lines.iter().enumerate() {
+            if let DisplayLine::Diff { line, .. } = line {
+                if line.old_line_no == Some(line_no) {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
     fn highlight_from_maps(
         &self,
         line: &mut DiffLine,
@@ -1924,17 +1940,58 @@ impl App {
                 } else {
                     // Expand current file - save position first
                     if let Some((_, file_idx)) = self.current_file_info() {
+                        let mut target_new: Option<u32> = None;
+                        let mut target_old: Option<u32> = None;
+                        if let Some(line) = self.current_display_line() {
+                            match line {
+                                DisplayLine::Diff { line, .. } => {
+                                    target_new = line.new_line_no;
+                                    target_old = line.old_line_no;
+                                }
+                                DisplayLine::HunkHeader { line_no, .. } => {
+                                    target_new = Some(*line_no);
+                                }
+                                DisplayLine::HunkContext { line_no, .. } => {
+                                    target_new = Some(*line_no);
+                                }
+                                DisplayLine::HunkEnd { file_idx, hunk_idx } => {
+                                    target_new = self
+                                        .files
+                                        .get(*file_idx)
+                                        .and_then(|f| f.hunks.get(*hunk_idx))
+                                        .map(|h| h.new_start);
+                                }
+                                _ => {}
+                            }
+                        }
+
                         self.pre_expand_position = Some((self.current_line_idx, self.scroll_offset));
                         self.expanded_file = Some(file_idx);
                         self.build_display_lines();
-                        self.current_line_idx = 0;
-                        self.scroll_offset = 0;
-                        // Skip to first navigable line
-                        while self.current_line_idx < self.display_lines.len().saturating_sub(1)
-                            && self.is_skippable_line(self.current_line_idx)
-                        {
-                            self.current_line_idx += 1;
+                        if let Some(line_no) = target_new {
+                            if let Some(idx) = self.find_line_in_expanded(line_no) {
+                                self.current_line_idx = idx;
+                            }
+                        } else if let Some(line_no) = target_old {
+                            if let Some(idx) = self.find_old_line_in_expanded(line_no) {
+                                self.current_line_idx = idx;
+                            }
                         }
+                        if self.current_line_idx >= self.display_lines.len() {
+                            self.current_line_idx = 0;
+                        }
+                        if self.current_line_idx == 0 {
+                            // Skip to first navigable line
+                            while self.current_line_idx < self.display_lines.len().saturating_sub(1)
+                                && self.is_skippable_line(self.current_line_idx)
+                            {
+                                self.current_line_idx += 1;
+                            }
+                            self.scroll_offset = 0;
+                        } else {
+                            self.center_on_current_line();
+                        }
+                        self.adjust_scroll();
                         self.message = Some("Expanded file view (]/[: next/prev change, x: collapse)".to_string());
                     }
                 }
@@ -2382,9 +2439,7 @@ impl App {
         // Jump to first match
         search.current_match = 0;
         if let Some(&idx) = search.matches.first() {
-            self.current_line_idx = idx;
-            self.ensure_cursor_on_navigable();
-            self.adjust_scroll();
+            self.jump_to_line(idx);
         }
     }
 
@@ -2402,8 +2457,7 @@ impl App {
             (search.matches[search.current_match], search.current_match + 1, search.matches.len())
         };
 
-        self.current_line_idx = new_idx;
-        self.adjust_scroll();
+        self.jump_to_line(new_idx);
         self.message = Some(format!("Match {}/{}", current, total));
     }
 
@@ -2425,8 +2479,7 @@ impl App {
             (search.matches[search.current_match], search.current_match + 1, search.matches.len())
         };
 
-        self.current_line_idx = new_idx;
-        self.adjust_scroll();
+        self.jump_to_line(new_idx);
         self.message = Some(format!("Match {}/{}", current, total));
     }
 
@@ -2458,8 +2511,7 @@ impl App {
         }
 
         if idx < total {
-            self.current_line_idx = idx;
-            self.adjust_scroll();
+            self.jump_to_line(idx);
             return;
         }
 
@@ -2469,8 +2521,7 @@ impl App {
             idx += 1;
         }
         if idx < self.current_line_idx && self.is_change_line(idx) {
-            self.current_line_idx = idx;
-            self.adjust_scroll();
+            self.jump_to_line(idx);
         }
     }
 
@@ -2503,8 +2554,7 @@ impl App {
         }
 
         if self.is_change_line(idx) {
-            self.current_line_idx = idx;
-            self.adjust_scroll();
+            self.jump_to_line(idx);
             return;
         }
 
@@ -2519,8 +2569,7 @@ impl App {
             idx -= 1;
         }
         if self.is_change_line(idx) {
-            self.current_line_idx = idx;
-            self.adjust_scroll();
+            self.jump_to_line(idx);
         }
     }
 
@@ -2535,8 +2584,7 @@ impl App {
         while idx < total {
             if let Some(DisplayLine::Diff { hunk_idx: Some(h), .. }) = self.display_lines.get(idx) {
                 if current_hunk.map_or(true, |ch| ch != *h) {
-                    self.current_line_idx = idx;
-                    self.adjust_scroll();
+                    self.jump_to_line(idx);
                     return;
                 }
             }
@@ -2547,8 +2595,7 @@ impl App {
         idx = 0;
         while idx < total {
             if let Some(DisplayLine::Diff { hunk_idx: Some(_), .. }) = self.display_lines.get(idx) {
-                self.current_line_idx = idx;
-                self.adjust_scroll();
+                self.jump_to_line(idx);
                 return;
             }
             idx += 1;
@@ -2579,8 +2626,7 @@ impl App {
                         }
                         break;
                     }
-                    self.current_line_idx = start;
-                    self.adjust_scroll();
+                    self.jump_to_line(start);
                     return;
                 }
             }
@@ -2602,8 +2648,7 @@ impl App {
                     }
                     break;
                 }
-                self.current_line_idx = start;
-                self.adjust_scroll();
+                self.jump_to_line(start);
                 return;
             }
             idx -= 1;
@@ -2889,6 +2934,7 @@ impl App {
 
         match file.status {
             FileStatus::Added => {
+                patch.push_str("new file mode 100644\n");
                 patch.push_str("--- /dev/null\n");
                 patch.push_str(&format!("+++ b/{}\n", new_path));
             }
@@ -2925,14 +2971,15 @@ impl App {
         &self,
         patch: &str,
         reverse: bool,
-        status: FileStatus,
+        _status: FileStatus,
     ) -> Result<(), String> {
         let mut cmd = Command::new("git");
         cmd.arg("apply").arg("--cached");
         if reverse {
             cmd.arg("-R");
-        } else if matches!(status, FileStatus::Added) {
-            // Allow staging hunks for new files not yet in the index.
+        } else if patch.contains("--- /dev/null\n") && !patch.contains("new file mode") {
+            // Allow staging hunks for new files not yet in the index when
+            // the patch doesn't already declare a new file.
             cmd.arg("--intent-to-add");
         }
         cmd.current_dir(&self.repo_path)
@@ -3420,16 +3467,185 @@ impl App {
     fn adjust_scroll(&mut self) {
         let scroll_margin = 5; // Keep 5 lines of padding
 
-        // If cursor is above the visible area (with margin)
-        if self.current_line_idx < self.scroll_offset + scroll_margin {
-            self.scroll_offset = self.current_line_idx.saturating_sub(scroll_margin);
+        if self.display_lines.is_empty() || self.visible_height == 0 {
+            return;
         }
 
-        // If cursor is below the visible area (with margin)
-        let bottom_threshold = self.scroll_offset + self.visible_height.saturating_sub(scroll_margin);
-        if self.current_line_idx > bottom_threshold {
-            self.scroll_offset = self.current_line_idx.saturating_sub(self.visible_height.saturating_sub(scroll_margin));
+        if self.current_line_idx < self.scroll_offset {
+            self.scroll_offset = self.current_line_idx;
         }
+
+        let current_height = self.display_line_height(self.current_line_idx);
+        let bottom_limit = self
+            .visible_height
+            .saturating_sub(scroll_margin + current_height);
+        let limit = self
+            .visible_height
+            .saturating_add(scroll_margin + current_height);
+        let row_pos = self.rows_between_limited(self.scroll_offset, self.current_line_idx, limit);
+
+        if row_pos < scroll_margin {
+            self.scroll_offset = self.scroll_offset_for_top(scroll_margin);
+        } else if row_pos > bottom_limit {
+            self.scroll_offset = self.scroll_offset_for_bottom(bottom_limit);
+        }
+
+        self.clamp_scroll();
+    }
+
+    fn jump_to_line(&mut self, idx: usize) {
+        if self.display_lines.is_empty() {
+            return;
+        }
+        self.current_line_idx = idx.min(self.display_lines.len().saturating_sub(1));
+        self.ensure_cursor_on_navigable();
+        self.adjust_scroll();
+    }
+
+    fn rows_between_limited(&self, start: usize, end: usize, limit: usize) -> usize {
+        if start >= end {
+            return 0;
+        }
+        let mut rows = 0usize;
+        for idx in start..end {
+            rows = rows.saturating_add(self.display_line_height(idx));
+            if rows > limit {
+                break;
+            }
+        }
+        rows
+    }
+
+    fn scroll_offset_for_top(&self, target_top: usize) -> usize {
+        let mut cum = 0usize;
+        let mut idx = self.current_line_idx;
+        while idx > 0 && cum < target_top {
+            idx -= 1;
+            cum = cum.saturating_add(self.display_line_height(idx));
+        }
+        idx
+    }
+
+    fn scroll_offset_for_bottom(&self, target_bottom: usize) -> usize {
+        let mut cum = 0usize;
+        let mut idx = self.current_line_idx;
+        while idx > 0 {
+            let prev = idx - 1;
+            let h = self.display_line_height(prev);
+            if cum.saturating_add(h) > target_bottom {
+                break;
+            }
+            idx = prev;
+            cum = cum.saturating_add(h);
+        }
+        idx
+    }
+
+    fn display_line_height(&self, idx: usize) -> usize {
+        let Some(line) = self.display_lines.get(idx) else {
+            return 1;
+        };
+        let content_width = self.content_width.max(1);
+        match line {
+            DisplayLine::Spacer
+            | DisplayLine::FileHeader { .. }
+            | DisplayLine::HunkHeader { .. }
+            | DisplayLine::HunkEnd { .. } => 1,
+            DisplayLine::HunkContext { .. } => {
+                if content_width < 4 { 1 } else { 3 }
+            }
+            DisplayLine::Diff { line, .. } => {
+                let prefix_width = if self.side_by_side { 7 } else { 8 };
+                let content_width = content_width.saturating_sub(prefix_width).max(1);
+                let width = UnicodeWidthStr::width(line.content.as_str());
+                if width == 0 {
+                    1
+                } else {
+                    (width + content_width - 1) / content_width
+                }
+            }
+            DisplayLine::Annotation { annotation, orphaned, .. } => {
+                let resolved = annotation.resolved_at.is_some();
+                let prefix = match annotation.annotation_type {
+                    AnnotationType::Comment => {
+                        if resolved {
+                            if self.side_by_side { "   ✓ RESOLVED " } else { "    ✓ RESOLVED " }
+                        } else if *orphaned {
+                            if self.side_by_side { "   ⚠ ORPHANED " } else { "    ⚠ ORPHANED " }
+                        } else if self.side_by_side {
+                            "   💬 "
+                        } else {
+                            "    💬 "
+                        }
+                    }
+                    AnnotationType::Todo => {
+                        if resolved {
+                            if self.side_by_side { "   ✓ RESOLVED " } else { "    ✓ RESOLVED " }
+                        } else if *orphaned {
+                            if self.side_by_side { "   ⚠ ORPHANED " } else { "    ⚠ ORPHANED " }
+                        } else if self.side_by_side {
+                            "   📌 "
+                        } else {
+                            "    📌 "
+                        }
+                    }
+                };
+                let prefix_width = UnicodeWidthStr::width(prefix);
+                let content_width = content_width.saturating_sub(prefix_width).max(1);
+                let content = if annotation.content.is_empty() {
+                    ""
+                } else {
+                    annotation.content.as_str()
+                };
+                let mut total = 0usize;
+                for line in content.split('\n') {
+                    let width = UnicodeWidthStr::width(line);
+                    let lines = if width == 0 {
+                        1
+                    } else {
+                        (width + content_width - 1) / content_width
+                    };
+                    total = total.saturating_add(lines);
+                }
+                if total == 0 { 1 } else { total }
+            }
+        }
+    }
+
+    fn clamp_scroll(&mut self) {
+        if self.display_lines.is_empty() || self.visible_height == 0 {
+            return;
+        }
+        let max_scroll = self.max_scroll_offset();
+        if self.scroll_offset > max_scroll {
+            self.scroll_offset = max_scroll;
+        }
+    }
+
+    fn max_scroll_offset(&self) -> usize {
+        if self.display_lines.is_empty() || self.visible_height == 0 {
+            return 0;
+        }
+        let mut cum = 0usize;
+        let mut idx = self.display_lines.len();
+        while idx > 0 && cum < self.visible_height {
+            idx -= 1;
+            cum = cum.saturating_add(self.display_line_height(idx));
+        }
+        if cum < self.visible_height {
+            0
+        } else {
+            idx
+        }
+    }
+
+    fn center_on_current_line(&mut self) {
+        if self.visible_height == 0 {
+            return;
+        }
+        let half = self.visible_height / 2;
+        self.scroll_offset = self.current_line_idx.saturating_sub(half);
+        self.clamp_scroll();
     }
 }
 
@@ -3671,8 +3887,9 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
 }
 
 
-fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
+fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let visible_height = area.height as usize;
+    app.content_width = area.width as usize;
     let scroll_offset = app.scroll_offset;
 
     let items: Vec<ListItem> = app
@@ -3973,7 +4190,7 @@ fn render_diff_unified(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
     f.render_widget(diff_list, area);
 }
 
-fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
+fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     // Split the area into two columns with a small gap
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -3983,6 +4200,8 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
             Constraint::Percentage(49),
         ])
         .split(area);
+    let content_width = columns[0].width.min(columns[2].width) as usize;
+    app.content_width = content_width;
 
     let visible_height = area.height as usize;
     let scroll_offset = app.scroll_offset;
@@ -3990,6 +4209,33 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
     // Build left (old) and right (new) items
     let mut left_items: Vec<ListItem> = Vec::new();
     let mut right_items: Vec<ListItem> = Vec::new();
+    let mut divider_items: Vec<ListItem> = Vec::new();
+    let mut push_pair =
+        |mut left: Vec<Line<'static>>, mut right: Vec<Line<'static>>, divider_style: Option<Style>| {
+        let max_len = left.len().max(right.len()).max(1);
+        while left.len() < max_len {
+            left.push(Line::from(""));
+        }
+        while right.len() < max_len {
+            right.push(Line::from(""));
+        }
+        let div_style = divider_style.unwrap_or_default();
+        let divider_line = Line::from(Span::styled("  ", div_style));
+        let mut divider_lines = Vec::with_capacity(max_len);
+        for _ in 0..max_len {
+            divider_lines.push(divider_line.clone());
+        }
+        left_items.push(ListItem::new(left));
+        right_items.push(ListItem::new(right));
+        divider_items.push(ListItem::new(divider_lines));
+    };
+    let blank_lines = |count: usize| {
+        let mut out = Vec::with_capacity(count.max(1));
+        for _ in 0..count.max(1) {
+            out.push(Line::from(""));
+        }
+        out
+    };
 
     let selection_range = app.selection_range();
     for (idx, display_line) in app.display_lines.iter().enumerate().skip(scroll_offset).take(visible_height) {
@@ -3997,8 +4243,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
 
         match display_line {
             DisplayLine::Spacer => {
-                left_items.push(ListItem::new(Line::from("")));
-                right_items.push(ListItem::new(Line::from("")));
+                push_pair(vec![Line::from("")], vec![Line::from("")], None);
             }
             DisplayLine::FileHeader { path, file_idx } => {
                 // Show file header prominently
@@ -4054,8 +4299,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     Span::styled(format!("+{} ", adds), Style::default().fg(theme.added_fg).bg(stats_bg)),
                     Span::styled(format!("-{} ", dels), Style::default().fg(theme.deleted_fg).bg(stats_bg)),
                 ]);
-                left_items.push(ListItem::new(header));
-                right_items.push(ListItem::new(Line::from("")));
+                push_pair(vec![header], blank_lines(1), None);
             }
             DisplayLine::HunkContext { text, line_no, highlights } => {
                 let style = Style::default()
@@ -4068,13 +4312,14 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     .fg(theme.hunk_ctx_fg)
                     .bg(theme.hunk_ctx_bg)
                     .add_modifier(Modifier::BOLD);
-                left_items.push(ListItem::new(build_context_box(
+                let lines = build_context_box(
                     vec![Span::styled(line_num, line_num_style)],
                     content_spans,
-                    columns[0].width as usize,
+                    content_width,
                     style,
-                )));
-                right_items.push(ListItem::new(Line::from("")));
+                );
+                let right_fill = blank_lines(lines.len());
+                push_pair(lines, right_fill, None);
             }
             DisplayLine::HunkHeader { line_no, additions, deletions, .. } => {
                 // Hunk header - prominent with stats
@@ -4089,14 +4334,14 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                     Span::styled(format!(" +{} -{} ", additions, deletions), stats_style),
                     Span::styled(format!("starting at line {} ", line_no), style),
                 ];
-                left_items.push(ListItem::new(Line::from(line)));
-                right_items.push(ListItem::new(Line::from("")));
+                let line = Line::from(line);
+                push_pair(vec![line], blank_lines(1), None);
             }
             DisplayLine::HunkEnd { .. } => {
                 // End of hunk - subtle bottom border
                 let style = Style::default().fg(theme.hunk_border);
-                left_items.push(ListItem::new(Line::from(Span::styled("╰".to_string() + &"─".repeat(20), style))));
-                right_items.push(ListItem::new(Line::from(Span::styled("╰".to_string() + &"─".repeat(20), style))));
+                let line = Line::from(Span::styled("╰".to_string() + &"─".repeat(20), style));
+                push_pair(vec![line], vec![Line::from("")], None);
             }
             DisplayLine::Diff { line, file_path, .. } => {
                 let is_selected = selection_range
@@ -4158,9 +4403,8 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             if is_selected { theme.selection_bg } else { theme.current_line_bg },
                             Some(theme.intraline_deleted_bg),
                         );
-                        let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
-                        left_items.push(ListItem::new(lines));
-                        right_items.push(ListItem::new(Line::from("")));
+                        let lines = wrap_spans_with_prefix(left_spans, content_spans, content_width, content_style);
+                        push_pair(lines, Vec::new(), None);
                     }
                     LineKind::Addition => {
                         let new_no = line
@@ -4180,7 +4424,6 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                         } else {
                             content_style
                         };
-                        left_items.push(ListItem::new(Line::from("")));
                         let right_spans = vec![
                             Span::styled(marker.clone(), marker_style),
                             Span::styled(new_no, line_num_style),
@@ -4195,8 +4438,8 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             if is_selected { theme.selection_bg } else { theme.current_line_bg },
                             Some(theme.intraline_added_bg),
                         );
-                        let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
-                        right_items.push(ListItem::new(lines));
+                        let lines = wrap_spans_with_prefix(right_spans, content_spans, content_width, content_style);
+                        push_pair(Vec::new(), lines, None);
                     }
                     LineKind::Context => {
                         let old_no = line
@@ -4232,8 +4475,8 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             if is_selected { theme.selection_bg } else { theme.current_line_bg },
                             None,
                         );
-                        let lines = wrap_spans_with_prefix(left_spans, content_spans, columns[0].width as usize, content_style);
-                        left_items.push(ListItem::new(lines));
+                        let left_lines =
+                            wrap_spans_with_prefix(left_spans, content_spans, content_width, content_style);
 
                         let right_spans = vec![
                             Span::styled(marker.clone(), marker_style),
@@ -4249,8 +4492,9 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             if is_selected { theme.selection_bg } else { theme.current_line_bg },
                             None,
                         );
-                        let lines = wrap_spans_with_prefix(right_spans, content_spans, columns[2].width as usize, content_style);
-                        right_items.push(ListItem::new(lines));
+                        let right_lines =
+                            wrap_spans_with_prefix(right_spans, content_spans, content_width, content_style);
+                        push_pair(left_lines, right_lines, None);
                     }
                 }
             }
@@ -4324,19 +4568,13 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             };
                             let prefix_spans = vec![Span::styled(line_prefix, style)];
                             let content_spans = vec![Span::styled(line.to_string(), style)];
-                            let wrapped = wrap_spans_with_prefix(
-                                prefix_spans,
-                                content_spans,
-                                columns[0].width as usize,
-                                style,
-                            );
+                            let wrapped =
+                                wrap_spans_with_prefix(prefix_spans, content_spans, content_width, style);
                             lines.extend(wrapped);
                         }
-                        left_items.push(ListItem::new(lines));
-                        right_items.push(ListItem::new(Line::from("")));
+                        push_pair(lines, Vec::new(), None);
                     }
                     Side::New => {
-                        left_items.push(ListItem::new(Line::from("")));
                         let mut right_lines: Vec<Line> = Vec::new();
                         let content_lines: Vec<&str> = if annotation.content.is_empty() {
                             vec![""]
@@ -4351,15 +4589,11 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
                             };
                             let prefix_spans = vec![Span::styled(line_prefix, style)];
                             let content_spans = vec![Span::styled(line.to_string(), style)];
-                            let wrapped = wrap_spans_with_prefix(
-                                prefix_spans,
-                                content_spans,
-                                columns[2].width as usize,
-                                style,
-                            );
+                            let wrapped =
+                                wrap_spans_with_prefix(prefix_spans, content_spans, content_width, style);
                             right_lines.extend(wrapped);
                         }
-                        right_items.push(ListItem::new(right_lines));
+                        push_pair(Vec::new(), right_lines, None);
                     }
                 }
             }
@@ -4368,9 +4602,11 @@ fn render_diff_side_by_side(f: &mut Frame, app: &App, area: Rect, theme: Theme) 
 
     // No borders, cleaner look
     let left_list = List::new(left_items);
+    let divider_list = List::new(divider_items);
     let right_list = List::new(right_items);
 
     f.render_widget(left_list, columns[0]);
+    f.render_widget(divider_list, columns[1]);
     f.render_widget(right_list, columns[2]);
 }
 
