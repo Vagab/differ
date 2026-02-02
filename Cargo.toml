@@ -21,6 +21,7 @@ clap = { version = "4.0", features = ["derive"] }
 dirs = "5.0"
 git2 = "0.19"
 anyhow = "1.0"
+notify = "6.1"
 
 # Syntax highlighting
 syntect = "5.2"

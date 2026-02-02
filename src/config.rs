@@ -5,6 +5,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use toml::Value;
 
 /// Application configuration
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -20,6 +21,8 @@ pub struct Config {
     /// Syntax theme name (syntect/bat theme)
     pub syntax_theme: Option<String>,
     pub ai_target: AiTarget,
+    /// Ignore paths for filesystem watcher
+    pub watch_ignore_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -44,6 +47,12 @@ impl Default for Config {
             syntax_highlighting: true,
             syntax_theme: None,
             ai_target: AiTarget::default(),
+            watch_ignore_paths: vec![
+                ".git".to_string(),
+                "target".to_string(),
+                "_build".to_string(),
+                "deps".to_string(),
+            ],
         }
     }
 }
@@ -56,6 +65,7 @@ impl Config {
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
             let config: Config = toml::from_str(&contents)?;
+            Self::sync_missing_fields(&config_path, &contents);
             Ok(config)
         } else {
             Ok(Config::default())
@@ -99,5 +109,56 @@ impl Config {
             .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
 
         Ok(())
+    }
+
+    fn sync_missing_fields(config_path: &PathBuf, contents: &str) {
+        let Ok(mut value) = toml::from_str::<Value>(contents) else {
+            return;
+        };
+        let Value::Table(ref mut table) = value else {
+            return;
+        };
+        let mut updated = false;
+
+        let defaults = Config::default();
+
+        let mut insert_if_missing = |key: &str, value: Value| {
+            if !table.contains_key(key) {
+                table.insert(key.to_string(), value);
+                updated = true;
+            }
+        };
+
+        insert_if_missing("side_by_side", Value::Boolean(defaults.side_by_side));
+        insert_if_missing("context_lines", Value::Integer(defaults.context_lines as i64));
+        insert_if_missing("show_annotations", Value::Boolean(defaults.show_annotations));
+        insert_if_missing(
+            "syntax_highlighting",
+            Value::Boolean(defaults.syntax_highlighting),
+        );
+        if let Some(theme) = defaults.syntax_theme {
+            insert_if_missing("syntax_theme", Value::String(theme));
+        }
+        let ai_target = match defaults.ai_target {
+            AiTarget::Claude => "claude",
+            AiTarget::Codex => "codex",
+        };
+        insert_if_missing("ai_target", Value::String(ai_target.to_string()));
+        insert_if_missing(
+            "watch_ignore_paths",
+            Value::Array(
+                defaults
+                    .watch_ignore_paths
+                    .into_iter()
+                    .map(Value::String)
+                    .collect::<Vec<_>>(),
+            ),
+        );
+
+        if updated {
+            if let Ok(updated_contents) = toml::to_string_pretty(&value) {
+                let _ = std::fs::write(config_path, updated_contents);
+            }
+        }
     }
 }

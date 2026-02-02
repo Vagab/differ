@@ -15,6 +15,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use notify::{event::ModifyKind, Event as FsEventRaw, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -26,11 +27,12 @@ use ratatui::{
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::mem;
+use std::time::{Duration, Instant};
 use tui_textarea::{CursorMove, Input, TextArea};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use similar::{ChangeTag, TextDiff};
@@ -183,6 +185,10 @@ pub struct App {
     cached_unstaged: Option<Vec<DiffFile>>,
     cached_staged: Option<Vec<DiffFile>>,
     pending_stream_files: Vec<DiffFile>,
+    fs_rx: Receiver<FsEvent>,
+    fs_tx: Sender<FsEvent>,
+    fs_pending: bool,
+    fs_last_event: Option<Instant>,
 
     // UI state
     mode: Mode,
@@ -237,6 +243,11 @@ enum Mode {
 enum DiffStreamEvent {
     File { generation: u64, file: DiffFile },
     Done { generation: u64, error: Option<String> },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FsEvent {
+    Changed,
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +402,7 @@ impl App {
         let (ai_tx, ai_rx) = mpsc::channel();
         let (full_highlight_tx, full_highlight_rx) = mpsc::channel();
         let (diff_tx, diff_rx) = mpsc::channel();
+        let (fs_tx, fs_rx) = mpsc::channel();
 
         let syntax_theme = config.syntax_theme.clone();
 
@@ -425,6 +437,10 @@ impl App {
             cached_unstaged: None,
             cached_staged: None,
             pending_stream_files: Vec::new(),
+            fs_rx,
+            fs_tx,
+            fs_pending: false,
+            fs_last_event: None,
             mode: Mode::Normal,
             annotation_input: TextArea::default(),
             annotation_type: AnnotationType::Comment,
@@ -1638,8 +1654,7 @@ impl App {
         for (idx, line) in self.display_lines.iter().enumerate().skip(current + 1) {
             if let DisplayLine::FileHeader { .. } = line {
                 self.current_line_idx = idx;
-                // Skip to first diff line after header
-                self.navigate_down();
+                self.ensure_cursor_on_navigable();
                 self.adjust_scroll();
                 return;
             }
@@ -1662,8 +1677,7 @@ impl App {
             for i in (0..current_file_header).rev() {
                 if let Some(DisplayLine::FileHeader { .. }) = self.display_lines.get(i) {
                     self.current_line_idx = i;
-                    // Skip to first diff line after header
-                    self.navigate_down();
+                    self.ensure_cursor_on_navigable();
                     self.adjust_scroll();
                     return;
                 }
@@ -3007,6 +3021,26 @@ impl App {
         Ok(())
     }
 
+    fn handle_fs_pending(&mut self) -> Result<()> {
+        if !self.fs_pending {
+            return Ok(());
+        }
+        let Some(last) = self.fs_last_event else {
+            return Ok(());
+        };
+        if last.elapsed() < Duration::from_millis(300) {
+            return Ok(());
+        }
+        if self.diff_loading || !matches!(self.mode, Mode::Normal) {
+            return Ok(());
+        }
+        self.fs_pending = false;
+        self.fs_last_event = None;
+        self.reload_diff()?;
+        self.message = Some("Diff reloaded".to_string());
+        Ok(())
+    }
+
     fn clear_syntax_cache(&mut self) {
         self.syntax_cache_old.clear();
         self.syntax_cache_new.clear();
@@ -3111,8 +3145,9 @@ impl App {
                     self.file_line_ranges.clear();
                     self.diff_pending_reset = false;
                 }
-                if let Some((file_path, line_no)) = self.diff_target.take() {
-                    if let Some(idx) = self.find_best_line_match(&file_path, line_no) {
+                if let Some((file_path, line_no)) = self.diff_target.as_ref() {
+                    if let Some(idx) = self.find_best_line_match(file_path, *line_no) {
+                        self.diff_target = None;
                         self.current_line_idx = idx;
                         self.ensure_cursor_on_navigable();
                         self.adjust_scroll();
@@ -3156,8 +3191,9 @@ impl App {
             }
         }
 
-        if let Some((file_path, line_no)) = self.diff_target.take() {
-            if let Some(idx) = self.find_best_line_match(&file_path, line_no) {
+        if let Some((file_path, line_no)) = self.diff_target.as_ref() {
+            if let Some(idx) = self.find_best_line_match(file_path, *line_no) {
+                self.diff_target = None;
                 self.current_line_idx = idx;
                 self.ensure_cursor_on_navigable();
                 self.adjust_scroll();
@@ -3679,6 +3715,17 @@ pub fn run(
         diff_paths,
     )?;
     app.start_diff_stream(None)?;
+    let _watcher = match start_fs_watcher(
+        app.repo_path.clone(),
+        app.fs_tx.clone(),
+        app.config.watch_ignore_paths.clone(),
+    ) {
+        Ok(watcher) => Some(watcher),
+        Err(err) => {
+            app.message = Some(format!("Watcher disabled: {}", err));
+            None
+        }
+    };
 
     // Skip to first navigable line
     while app.current_line_idx < app.display_lines.len().saturating_sub(1)
@@ -3710,6 +3757,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
         while let Ok(evt) = app.diff_rx.try_recv() {
             app.handle_diff_event(evt)?;
         }
+        while let Ok(_) = app.fs_rx.try_recv() {
+            app.fs_pending = true;
+            app.fs_last_event = Some(Instant::now());
+        }
+        app.handle_fs_pending()?;
 
         if event::poll(std::time::Duration::from_millis(50))? {
             match event::read()? {
@@ -3739,6 +3791,50 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> 
             }
         }
     }
+}
+
+fn start_fs_watcher(
+    repo_path: PathBuf,
+    tx: Sender<FsEvent>,
+    ignore_paths: Vec<String>,
+) -> Result<RecommendedWatcher> {
+    let ignore_paths = ignore_paths;
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<FsEventRaw>| {
+        if let Ok(event) = res {
+            if should_ignore_fs_event(&event, &ignore_paths) {
+                return;
+            }
+            let _ = tx.send(FsEvent::Changed);
+        }
+    })
+    .context("Failed to create filesystem watcher")?;
+    watcher
+        .watch(&repo_path, RecursiveMode::Recursive)
+        .context("Failed to watch repo path")?;
+    Ok(watcher)
+}
+
+fn should_ignore_fs_event(event: &FsEventRaw, ignore_paths: &[String]) -> bool {
+    match event.kind {
+        EventKind::Access(_) => return true,
+        EventKind::Modify(ModifyKind::Metadata(_)) => return true,
+        _ => {}
+    }
+    if event
+        .paths
+        .iter()
+        .all(|p| is_ignored_fs_path(p, ignore_paths))
+    {
+        return true;
+    }
+    false
+}
+
+fn is_ignored_fs_path(path: &Path, ignore_paths: &[String]) -> bool {
+    path.components().any(|component| {
+        let part = component.as_os_str().to_string_lossy();
+        ignore_paths.iter().any(|ignore| ignore == &part)
+    })
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
