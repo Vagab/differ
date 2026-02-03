@@ -33,6 +33,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::mem;
 use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 use tui_textarea::{CursorMove, Input, TextArea};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use similar::{ChangeTag, TextDiff};
@@ -40,6 +41,7 @@ use similar::{ChangeTag, TextDiff};
 const REATTACH_CONTEXT_LINES: usize = 2;
 const STREAM_BATCH_FILES: usize = 3;
 const INTRALINE_PAIR_RATIO_THRESHOLD: f32 = 0.6;
+const FULL_HIGHLIGHT_MAX_INFLIGHT: usize = 2;
 
 const HELP_TEXT: &[&str] = &[
     "",
@@ -64,9 +66,11 @@ const HELP_TEXT: &[&str] = &[
     "",
     "  View:",
     "    x         Expand/collapse current file (full view)",
+    "    h         Toggle deletions in expanded view",
     "    c         Collapse/expand current file",
     "    v         Toggle side-by-side view",
     "    s         Stage/unstage current hunk",
+    "    D         Discard current hunk (unstaged)",
     "    u         Toggle staged/unstaged view",
     "    R         Reload diff",
     "    Ctrl+r    Reload diff (global)",
@@ -174,6 +178,8 @@ pub struct App {
     syntax_cache_new: HashMap<String, Vec<Vec<HighlightRange>>>,
     expanded_highlight_files: HashSet<String>,
     full_highlight_pending: HashSet<String>,
+    full_highlight_queue: VecDeque<String>,
+    full_highlight_inflight: usize,
     full_highlight_rx: Receiver<HighlightEvent>,
     full_highlight_tx: Sender<HighlightEvent>,
     diff_generation: u64,
@@ -204,6 +210,7 @@ pub struct App {
     side_by_side: bool,
     visible_height: usize,
     content_width: usize,
+    show_old_in_expanded: bool,
     expanded_file: Option<usize>, // When Some, only show this file
     collapsed_files: HashSet<String>,
     collapsed_files_unstaged: HashSet<String>,
@@ -426,6 +433,8 @@ impl App {
             syntax_cache_new: HashMap::new(),
             expanded_highlight_files: HashSet::new(),
             full_highlight_pending: HashSet::new(),
+            full_highlight_queue: VecDeque::new(),
+            full_highlight_inflight: 0,
             full_highlight_rx,
             full_highlight_tx,
             diff_generation: 0,
@@ -454,6 +463,7 @@ impl App {
             side_by_side,
             visible_height: 20, // Will be updated on first render
             content_width: 80,
+            show_old_in_expanded: true,
             expanded_file: None,
             collapsed_files: HashSet::new(),
             collapsed_files_unstaged: HashSet::new(),
@@ -588,6 +598,7 @@ impl App {
             self.build_expanded_file_lines_into(&mut lines, file_idx, file, file_path);
         } else {
             self.build_diff_hunk_lines_into(&mut lines, file_idx, file, file_path);
+            self.maybe_schedule_full_file_highlight(file_idx, file_path);
         }
 
         lines
@@ -681,8 +692,11 @@ impl App {
         (converted, ends_in_string)
     }
 
-    fn maybe_schedule_full_file_highlight(&mut self, file_idx: usize, file_path: &str) {
+    fn maybe_schedule_full_file_highlight(&mut self, _file_idx: usize, file_path: &str) {
         if !self.config.syntax_highlighting {
+            return;
+        }
+        if self.syntax_cache_new.contains_key(file_path) {
             return;
         }
         if self.expanded_highlight_files.contains(file_path) {
@@ -694,34 +708,62 @@ impl App {
         {
             return;
         }
+        if let Some((current_path, _)) = self.current_file_info() {
+            if current_path == file_path {
+                self.full_highlight_queue
+                    .push_front(file_path.to_string());
+            } else {
+                self.full_highlight_queue.push_back(file_path.to_string());
+            }
+        } else {
+            self.full_highlight_queue.push_back(file_path.to_string());
+        }
+        self.kick_full_highlight_jobs();
+    }
 
-        let Some(file) = self.files.get(file_idx).cloned() else {
-            return;
-        };
-
-        let repo_path = self.repo_path.clone();
-        let diff_mode = self.diff_mode.clone();
-        let theme_name = self.config.syntax_theme.clone();
-        let tx = self.full_highlight_tx.clone();
-        let generation = self.diff_generation;
-        let file_key = file_path.to_string();
-
-        thread::spawn(move || {
-            let mut highlighter = match SyntaxHighlighter::new(theme_name.as_deref()) {
-                Ok(h) => h,
-                Err(_) => return,
+    fn kick_full_highlight_jobs(&mut self) {
+        while self.full_highlight_inflight < FULL_HIGHLIGHT_MAX_INFLIGHT {
+            let Some(file_key) = self.full_highlight_queue.pop_front() else {
+                break;
             };
-            let content = load_new_file_content_for_highlight(&repo_path, &diff_mode, &file, &file_key);
-            let map = content
-                .as_ref()
-                .map(|c| build_highlight_map_with(&mut highlighter, c, &file_key))
-                .unwrap_or_default();
-            let _ = tx.send(HighlightEvent::FullFile {
-                generation,
-                file_key,
-                map,
+            if !self.full_highlight_pending.contains(&file_key) {
+                continue;
+            }
+            let Some(idx) = self.diff_file_index.get(&file_key).copied() else {
+                self.full_highlight_pending.remove(&file_key);
+                continue;
+            };
+            let Some(file) = self.files.get(idx).cloned() else {
+                self.full_highlight_pending.remove(&file_key);
+                continue;
+            };
+
+            self.full_highlight_inflight += 1;
+            let repo_path = self.repo_path.clone();
+            let diff_mode = self.diff_mode.clone();
+            let theme_name = self.config.syntax_theme.clone();
+            let tx = self.full_highlight_tx.clone();
+            let generation = self.diff_generation;
+            let file_key_clone = file_key.clone();
+
+            thread::spawn(move || {
+                let mut highlighter = match SyntaxHighlighter::new(theme_name.as_deref()) {
+                    Ok(h) => h,
+                    Err(_) => return,
+                };
+                let content =
+                    load_new_file_content_for_highlight(&repo_path, &diff_mode, &file, &file_key_clone);
+                let map = content
+                    .as_ref()
+                    .map(|c| build_highlight_map_with(&mut highlighter, c, &file_key_clone))
+                    .unwrap_or_default();
+                let _ = tx.send(HighlightEvent::FullFile {
+                    generation,
+                    file_key: file_key_clone,
+                    map,
+                });
             });
-        });
+        }
     }
 
     fn load_highlight_maps(
@@ -1045,28 +1087,30 @@ impl App {
         for (idx, content) in file_lines.iter().enumerate() {
             let line_no = (idx + 1) as u32;
 
-            // First, show any deletions that come before this line
-            for (insert_after, old_no, del_content) in &deletions {
-                let effective_insert_after = if *insert_after == 0 { 1 } else { *insert_after };
-                if effective_insert_after == line_no.saturating_sub(1) {
-                    let mut del_line = DiffLine {
-                        kind: LineKind::Deletion,
-                        old_line_no: Some(*old_no),
-                        new_line_no: None,
-                        content: del_content.clone(),
-                        highlights: Vec::new(),
-                        inline_ranges: Vec::new(),
-                    };
-                    self.highlight_from_maps(&mut del_line, &old_map, &[]);
-                    let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
-                        old_range.contains(old_no)
-                    });
-                    out.push(DisplayLine::Diff {
-                        line: del_line,
-                        file_idx,
-                        file_path: file_path.to_string(),
-                        hunk_idx,
-                    });
+            if self.show_old_in_expanded {
+                // First, show any deletions that come before this line
+                for (insert_after, old_no, del_content) in &deletions {
+                    let effective_insert_after = if *insert_after == 0 { 1 } else { *insert_after };
+                    if effective_insert_after == line_no.saturating_sub(1) {
+                        let mut del_line = DiffLine {
+                            kind: LineKind::Deletion,
+                            old_line_no: Some(*old_no),
+                            new_line_no: None,
+                            content: del_content.clone(),
+                            highlights: Vec::new(),
+                            inline_ranges: Vec::new(),
+                        };
+                        self.highlight_from_maps(&mut del_line, &old_map, &[]);
+                        let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
+                            old_range.contains(old_no)
+                        });
+                        out.push(DisplayLine::Diff {
+                            line: del_line,
+                            file_idx,
+                            file_path: file_path.to_string(),
+                            hunk_idx,
+                        });
+                    }
                 }
             }
 
@@ -1112,29 +1156,31 @@ impl App {
             self.add_annotations_for_line(out, file_idx, file_path, &diff_line);
         }
 
-        // Show any trailing deletions
-        let last_line = file_lines.len() as u32;
-        for (insert_after, old_no, del_content) in &deletions {
-            let effective_insert_after = if *insert_after == 0 { 1 } else { *insert_after };
-            if effective_insert_after >= last_line {
-                let mut del_line = DiffLine {
-                    kind: LineKind::Deletion,
-                    old_line_no: Some(*old_no),
-                    new_line_no: None,
-                    content: del_content.clone(),
-                    highlights: Vec::new(),
-                    inline_ranges: Vec::new(),
-                };
-                self.highlight_from_maps(&mut del_line, &old_map, &[]);
-                let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
-                    old_range.contains(old_no)
-                });
-                out.push(DisplayLine::Diff {
-                    line: del_line,
-                    file_idx,
-                    file_path: file_path.to_string(),
-                    hunk_idx,
-                });
+        if self.show_old_in_expanded {
+            // Show any trailing deletions
+            let last_line = file_lines.len() as u32;
+            for (insert_after, old_no, del_content) in &deletions {
+                let effective_insert_after = if *insert_after == 0 { 1 } else { *insert_after };
+                if effective_insert_after >= last_line {
+                    let mut del_line = DiffLine {
+                        kind: LineKind::Deletion,
+                        old_line_no: Some(*old_no),
+                        new_line_no: None,
+                        content: del_content.clone(),
+                        highlights: Vec::new(),
+                        inline_ranges: Vec::new(),
+                    };
+                    self.highlight_from_maps(&mut del_line, &old_map, &[]);
+                    let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
+                        old_range.contains(old_no)
+                    });
+                    out.push(DisplayLine::Diff {
+                        line: del_line,
+                        file_idx,
+                        file_path: file_path.to_string(),
+                        hunk_idx,
+                    });
+                }
             }
         }
     }
@@ -1881,6 +1927,24 @@ impl App {
             KeyCode::Char('c') => {
                 self.toggle_collapse_current_file();
             }
+            KeyCode::Char('h') => {
+                if self.expanded_file.is_some() {
+                    self.show_old_in_expanded = !self.show_old_in_expanded;
+                    let msg = if self.show_old_in_expanded {
+                        "Showing deletions".to_string()
+                    } else {
+                        "Hiding deletions".to_string()
+                    };
+                    if let Some(file_idx) = self.expanded_file {
+                        self.update_display_lines_for_file(file_idx);
+                    } else {
+                        self.build_display_lines();
+                    }
+                    self.ensure_cursor_on_navigable();
+                    self.adjust_scroll();
+                    self.message = Some(msg);
+                }
+            }
             KeyCode::Char('A') => {
                 self.mode = Mode::AnnotationList;
                 self.annotation_list_idx = 0;
@@ -1908,6 +1972,9 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.toggle_stage_current_hunk()?;
+            }
+            KeyCode::Char('D') => {
+                self.discard_current_hunk()?;
             }
             KeyCode::Char('u') => {
                 self.toggle_diff_view()?;
@@ -2734,6 +2801,41 @@ impl App {
         Ok(())
     }
 
+    fn discard_current_hunk(&mut self) -> Result<()> {
+        if !matches!(self.diff_mode, DiffMode::Unstaged) {
+            self.message = Some("Discard only works for unstaged changes".to_string());
+            return Ok(());
+        }
+
+        let Some((file_idx, hunk_idx)) = self.current_hunk_ref() else {
+            self.message = Some("Move to a diff hunk to discard".to_string());
+            return Ok(());
+        };
+
+        let Some(file) = self.files.get(file_idx) else {
+            self.message = Some("File not found".to_string());
+            return Ok(());
+        };
+        let Some(hunk) = file.hunks.get(hunk_idx) else {
+            self.message = Some("Hunk not found".to_string());
+            return Ok(());
+        };
+
+        let patch = Self::build_hunk_patch(file, hunk);
+
+        match self.apply_patch_to_worktree(&patch, true) {
+            Ok(()) => {
+                self.message = Some("Discarded hunk".to_string());
+                self.apply_discard_local(file_idx, hunk_idx)?;
+            }
+            Err(err) => {
+                self.message = Some(format!("Discard failed: {}", err));
+            }
+        }
+
+        Ok(())
+    }
+
     fn apply_stage_local(&mut self, file_idx: usize, hunk_idx: usize) -> Result<()> {
         if file_idx >= self.files.len() {
             return Ok(());
@@ -2777,6 +2879,42 @@ impl App {
         self.ensure_cursor_on_navigable();
         self.adjust_scroll();
         self.apply_stage_other_cache(old_path, new_path, status, moved_hunk);
+        Ok(())
+    }
+
+    fn apply_discard_local(&mut self, file_idx: usize, hunk_idx: usize) -> Result<()> {
+        if file_idx >= self.files.len() {
+            return Ok(());
+        }
+        if let Some(file) = self.files.get_mut(file_idx) {
+            if hunk_idx < file.hunks.len() {
+                file.hunks.remove(hunk_idx);
+            }
+        }
+
+        let empty = self.files.get(file_idx).map(|f| f.hunks.is_empty()).unwrap_or(true);
+        if empty {
+            self.files.remove(file_idx);
+            self.diff_file_index
+                .retain(|_, idx| *idx != file_idx);
+            for idx in self.diff_file_index.values_mut() {
+                if *idx > file_idx {
+                    *idx -= 1;
+                }
+            }
+            self.file_line_ranges.remove(file_idx);
+            self.build_display_lines();
+            self.ensure_cursor_on_navigable();
+            self.adjust_scroll();
+        } else {
+            self.update_display_lines_for_file(file_idx);
+            self.ensure_cursor_on_navigable();
+            self.adjust_scroll();
+        }
+
+        if matches!(self.diff_mode, DiffMode::Unstaged) {
+            self.cached_unstaged = Some(self.files.clone());
+        }
         Ok(())
     }
 
@@ -3015,6 +3153,31 @@ impl App {
         }
     }
 
+    fn apply_patch_to_worktree(&self, patch: &str, reverse: bool) -> Result<(), String> {
+        let mut cmd = Command::new("git");
+        cmd.arg("apply");
+        if reverse {
+            cmd.arg("-R");
+        }
+        cmd.current_dir(&self.repo_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(patch.as_bytes()).map_err(|e| e.to_string())?;
+        }
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if stderr.is_empty() { "git apply failed".to_string() } else { stderr })
+        }
+    }
+
     fn reload_diff(&mut self) -> Result<()> {
         let target = self.current_target_position();
         self.start_diff_stream(target)?;
@@ -3046,6 +3209,8 @@ impl App {
         self.syntax_cache_new.clear();
         self.expanded_highlight_files.clear();
         self.full_highlight_pending.clear();
+        self.full_highlight_queue.clear();
+        self.full_highlight_inflight = 0;
     }
 
     fn start_diff_stream(&mut self, target: Option<(String, u32)>) -> Result<()> {
@@ -3221,6 +3386,10 @@ impl App {
                 self.syntax_cache_new.insert(file_key.clone(), map);
                 self.expanded_highlight_files.insert(file_key.clone());
                 self.full_highlight_pending.remove(&file_key);
+                if self.full_highlight_inflight > 0 {
+                    self.full_highlight_inflight -= 1;
+                }
+                self.kick_full_highlight_jobs();
                 if let Some(idx) = self.diff_file_index.get(&file_key).copied() {
                     self.update_display_lines_for_file(idx);
                 }
