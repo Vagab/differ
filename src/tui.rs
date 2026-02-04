@@ -68,6 +68,8 @@ const HELP_TEXT: &[&str] = &[
     "    x         Expand/collapse current file (full view)",
     "    h         Toggle deletions in expanded view",
     "    c         Collapse/expand current file",
+    "    B         Toggle sidebar",
+    "    b         Focus sidebar",
     "    v         Toggle side-by-side view",
     "    s         Stage/unstage current hunk",
     "    D         Discard current hunk (unstaged)",
@@ -211,6 +213,10 @@ pub struct App {
     visible_height: usize,
     content_width: usize,
     show_old_in_expanded: bool,
+    sidebar_open: bool,
+    sidebar_focused: bool,
+    sidebar_index: usize,
+    sidebar_scroll: usize,
     expanded_file: Option<usize>, // When Some, only show this file
     collapsed_files: HashSet<String>,
     collapsed_files_unstaged: HashSet<String>,
@@ -464,6 +470,10 @@ impl App {
             visible_height: 20, // Will be updated on first render
             content_width: 80,
             show_old_in_expanded: true,
+            sidebar_open: false,
+            sidebar_focused: false,
+            sidebar_index: 0,
+            sidebar_scroll: 0,
             expanded_file: None,
             collapsed_files: HashSet::new(),
             collapsed_files_unstaged: HashSet::new(),
@@ -1792,6 +1802,31 @@ impl App {
             }
         }
 
+        if key.code == KeyCode::Char('B') {
+            self.sidebar_open = !self.sidebar_open;
+            if self.sidebar_open {
+                self.sidebar_focused = true;
+                if let Some((_, file_idx)) = self.current_file_info() {
+                    self.sidebar_index = file_idx.min(self.files.len().saturating_sub(1));
+                } else {
+                    self.sidebar_index = 0;
+                }
+                self.sidebar_scroll = 0;
+            } else {
+                self.sidebar_focused = false;
+            }
+            return Ok(false);
+        }
+
+        if key.code == KeyCode::Char('b') && self.sidebar_open {
+            self.sidebar_focused = !self.sidebar_focused;
+            return Ok(false);
+        }
+
+        if self.sidebar_open && self.sidebar_focused {
+            return self.handle_sidebar_input(key);
+        }
+
         if self.show_ai_pane {
             match key.code {
                 KeyCode::Char('[') => {
@@ -2156,6 +2191,46 @@ impl App {
         }
 
         Ok(false)
+    }
+
+    fn handle_sidebar_input(&mut self, key: KeyEvent) -> Result<bool> {
+        let entries = self.sidebar_entries();
+        if entries.is_empty() {
+            return Ok(false);
+        }
+
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if self.sidebar_index + 1 < entries.len() {
+                    self.sidebar_index += 1;
+                }
+                self.focus_file_from_sidebar(&entries);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if self.sidebar_index > 0 {
+                    self.sidebar_index -= 1;
+                }
+                self.focus_file_from_sidebar(&entries);
+            }
+            KeyCode::Enter => {
+                self.sidebar_focused = false;
+            }
+            KeyCode::Esc => {
+                self.sidebar_focused = false;
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn focus_file_from_sidebar(&mut self, entries: &[SidebarEntry]) {
+        if let Some(entry) = entries.get(self.sidebar_index) {
+            if let Some(idx) = self.find_file_header_idx(entry.file_idx) {
+                self.current_line_idx = idx;
+                self.ensure_cursor_on_navigable();
+                self.adjust_scroll();
+            }
+        }
     }
 
     fn handle_annotation_input(&mut self, key: KeyEvent) -> Result<bool> {
@@ -3274,6 +3349,15 @@ impl App {
                 if generation != self.diff_generation {
                     return Ok(());
                 }
+                if self.sidebar_open {
+                    let total = self.files.len();
+                    if total == 0 {
+                        self.sidebar_index = 0;
+                        self.sidebar_scroll = 0;
+                    } else if self.sidebar_index >= total {
+                        self.sidebar_index = total.saturating_sub(1);
+                    }
+                }
                 self.flush_streamed_files();
                 self.diff_loading = false;
                 if let Some(err) = error {
@@ -3504,6 +3588,37 @@ impl App {
             }
             _ => self.current_file_info().map(|(path, _)| (path, 1)),
         }
+    }
+
+    fn sidebar_entries(&self) -> Vec<SidebarEntry> {
+        self.files
+            .iter()
+            .enumerate()
+            .map(|(idx, file)| {
+                let path = file
+                    .new_path
+                    .as_ref()
+                    .or(file.old_path.as_ref())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                SidebarEntry {
+                    file_idx: idx,
+                    path,
+                    status: file.status,
+                }
+            })
+            .collect()
+    }
+
+    fn find_file_header_idx(&self, file_idx: usize) -> Option<usize> {
+        for (idx, line) in self.display_lines.iter().enumerate() {
+            if let DisplayLine::FileHeader { file_idx: header_idx, .. } = line {
+                if *header_idx == file_idx {
+                    return Some(idx);
+                }
+            }
+        }
+        None
     }
 
     fn find_best_line_match(&self, file_path: &str, line_no: u32) -> Option<usize> {
@@ -4035,12 +4150,34 @@ fn ui(f: &mut Frame, app: &mut App) {
     // Sticky file header
     render_sticky_file_header(f, app, chunks[0], theme);
 
-    // Diff content
-    f.render_widget(Clear, chunks[1]);
-    if app.side_by_side {
-        render_diff_side_by_side(f, app, chunks[1], theme);
+    // Diff content (optional sidebar)
+    let diff_area = if app.sidebar_open {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(32), Constraint::Min(0)])
+            .split(chunks[1]);
+        render_sidebar(f, app, cols[0], theme);
+        let mut diff_border = Style::default().fg(theme.border);
+        if app.sidebar_focused {
+            diff_border = diff_border.add_modifier(Modifier::DIM);
+        } else {
+            diff_border = diff_border.add_modifier(Modifier::BOLD);
+        }
+        let diff_block = Block::default()
+            .borders(Borders::LEFT)
+            .border_style(diff_border);
+        let inner = diff_block.inner(cols[1]);
+        f.render_widget(diff_block, cols[1]);
+        inner
     } else {
-        render_diff_unified(f, app, chunks[1], theme);
+        chunks[1]
+    };
+
+    f.render_widget(Clear, diff_area);
+    if app.side_by_side {
+        render_diff_side_by_side(f, app, diff_area, theme);
+    } else {
+        render_diff_unified(f, app, diff_area, theme);
     }
 
     // Status bar / input
@@ -4449,8 +4586,14 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
         })
         .collect();
 
+    let dim_diff = app.sidebar_open && app.sidebar_focused;
+    let diff_style = if dim_diff {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
     // No borders for cleaner look
-    let diff_list = List::new(items);
+    let diff_list = List::new(items).style(diff_style);
 
     f.render_widget(diff_list, area);
 }
@@ -4865,10 +5008,16 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
         }
     }
 
+    let dim_diff = app.sidebar_open && app.sidebar_focused;
+    let diff_style = if dim_diff {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
     // No borders, cleaner look
-    let left_list = List::new(left_items);
-    let divider_list = List::new(divider_items);
-    let right_list = List::new(right_items);
+    let left_list = List::new(left_items).style(diff_style);
+    let divider_list = List::new(divider_items).style(diff_style);
+    let right_list = List::new(right_items).style(diff_style);
 
     f.render_widget(left_list, columns[0]);
     f.render_widget(divider_list, columns[1]);
@@ -4894,7 +5043,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             } else {
                 String::new()
             };
-            let shortcuts = " j/k:nav  n/N:chunk  c:collapse  a:add  e:edit  r:resolve  ?:help";
+            let shortcuts = " j/k:nav  n/N:chunk  c:collapse  B:sidebar  a:add  e:edit  r:resolve  ?:help";
             let content = if let Some(msg) = &app.message {
                 format!("{}{}{}{}", mode_label, msg, ai_suffix, loading_suffix)
             } else {
@@ -4971,6 +5120,90 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             f.render_widget(status, area);
         }
     }
+}
+
+fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
+    let entries = app.sidebar_entries();
+    if entries.is_empty() {
+        let empty = Paragraph::new(" No changes")
+            .style(Style::default().fg(theme.status_fg).bg(theme.status_bg))
+            .block(Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(theme.border)));
+        f.render_widget(empty, area);
+        return;
+    }
+
+    if app.sidebar_index >= entries.len() {
+        app.sidebar_index = entries.len().saturating_sub(1);
+    }
+
+    let visible_height = area.height as usize;
+    if app.sidebar_index < app.sidebar_scroll {
+        app.sidebar_scroll = app.sidebar_index;
+    } else if app.sidebar_index >= app.sidebar_scroll + visible_height {
+        app.sidebar_scroll = app.sidebar_index.saturating_sub(visible_height.saturating_sub(1));
+    }
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .skip(app.sidebar_scroll)
+        .take(visible_height)
+        .map(|(idx, entry)| {
+            let status_char = match entry.status {
+                FileStatus::Added => "A",
+                FileStatus::Deleted => "D",
+                FileStatus::Renamed => "R",
+                _ => "M",
+            };
+            let status_color = match entry.status {
+                FileStatus::Added => theme.added_fg,
+                FileStatus::Deleted => theme.deleted_fg,
+                FileStatus::Renamed => theme.hunk_fg,
+                _ => theme.header_fg,
+            };
+            let is_selected = idx == app.sidebar_index;
+            let mut style = Style::default().fg(theme.status_fg);
+            if is_selected {
+                style = if app.sidebar_focused {
+                    style.bg(theme.current_line_bg)
+                } else {
+                    style.bg(theme.selection_bg)
+                };
+            }
+            if !app.sidebar_focused {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            let line = Line::from(vec![
+                Span::styled(format!(" {} ", status_char), Style::default().fg(status_color)),
+                Span::styled(entry.path.clone(), style),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+
+    let title = if app.sidebar_focused { " Files • focused " } else { " Files (b to focus) " };
+    let mut border_style = Style::default().fg(theme.border);
+    if app.sidebar_focused {
+        border_style = border_style.add_modifier(Modifier::BOLD);
+    } else {
+        border_style = border_style.add_modifier(Modifier::DIM);
+    }
+    let list_style = if app.sidebar_focused {
+        Style::default().fg(theme.status_fg)
+    } else {
+        Style::default()
+            .fg(theme.status_fg)
+            .add_modifier(Modifier::DIM)
+    };
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(border_style)
+                .title(title),
+        )
+        .style(list_style);
+    f.render_widget(list, area);
 }
 
 fn build_context_box(
@@ -5247,6 +5480,13 @@ struct AnnotationListEntry {
     display_idx: Option<usize>,
     orphaned: bool,
     resolved: bool,
+}
+
+#[derive(Clone)]
+struct SidebarEntry {
+    file_idx: usize,
+    path: String,
+    status: FileStatus,
 }
 
 fn render_annotation_list(f: &mut Frame, app: &mut App, theme: Theme) {
