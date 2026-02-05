@@ -111,7 +111,12 @@ impl DiffEngine {
     #[allow(dead_code)]
     pub fn diff(&self, mode: &DiffMode, paths: &[String]) -> Result<Vec<DiffFile>> {
         match mode {
-            DiffMode::Unstaged => self.diff_via_git_cmd(&[], paths),
+            DiffMode::Unstaged => {
+                let mut files = self.diff_via_git_cmd(&[], paths)?;
+                let mut untracked = self.diff_untracked_files(paths)?;
+                files.append(&mut untracked);
+                Ok(files)
+            }
             DiffMode::Staged => self.diff_via_git_cmd(&["--staged"], paths),
             DiffMode::WorkingTree { base } => self.diff_via_git_cmd(&[base.as_str()], paths),
             DiffMode::Commits { from, to } => {
@@ -134,7 +139,14 @@ impl DiffEngine {
         F: FnMut(DiffFile) -> Result<()>,
     {
         match mode {
-            DiffMode::Unstaged => self.diff_via_git_cmd_stream(&[], paths, &mut on_file),
+            DiffMode::Unstaged => {
+                self.diff_via_git_cmd_stream(&[], paths, &mut on_file)?;
+                let untracked = self.diff_untracked_files(paths)?;
+                for file in untracked {
+                    on_file(file)?;
+                }
+                Ok(())
+            }
             DiffMode::Staged => self.diff_via_git_cmd_stream(&["--staged"], paths, &mut on_file),
             DiffMode::WorkingTree { base } => {
                 self.diff_via_git_cmd_stream(&[base.as_str()], paths, &mut on_file)
@@ -240,6 +252,77 @@ impl DiffEngine {
         }
 
         Ok(())
+    }
+
+    fn diff_untracked_files(&self, paths: &[String]) -> Result<Vec<DiffFile>> {
+        let untracked = self.list_untracked_files(paths)?;
+        let mut files = Vec::new();
+        for path in untracked {
+            let full_path = self.repo_path.join(&path);
+            let content = std::fs::read(&full_path).unwrap_or_default();
+            let text = String::from_utf8_lossy(&content);
+            let mut lines = Vec::new();
+            for (idx, line) in text.lines().enumerate() {
+                lines.push(DiffLine {
+                    kind: LineKind::Addition,
+                    old_line_no: None,
+                    new_line_no: Some((idx + 1) as u32),
+                    content: line.to_string(),
+                    highlights: Vec::new(),
+                    inline_ranges: Vec::new(),
+                });
+            }
+            let hunk = DiffHunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: lines.len() as u32,
+                header: None,
+                lines,
+            };
+            files.push(DiffFile {
+                old_path: None,
+                new_path: Some(path.clone()),
+                status: FileStatus::Added,
+                hunks: if hunk.lines.is_empty() { Vec::new() } else { vec![hunk] },
+            });
+        }
+        Ok(files)
+    }
+
+    fn list_untracked_files(&self, paths: &[String]) -> Result<Vec<PathBuf>> {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C")
+            .arg(&self.repo_path)
+            .arg("ls-files")
+            .arg("--others")
+            .arg("--exclude-standard");
+
+        if !paths.is_empty() {
+            cmd.arg("--");
+            for path in paths {
+                if !path.is_empty() {
+                    cmd.arg(path);
+                }
+            }
+        }
+
+        let output = cmd.output().context("Failed to run git ls-files")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git ls-files failed: {}", stderr);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut files = Vec::new();
+        for line in stdout.lines() {
+            let path = line.trim();
+            if path.is_empty() {
+                continue;
+            }
+            files.push(PathBuf::from(path));
+        }
+        Ok(files)
     }
 
     /// Parse full unified diff output into DiffFile structs
@@ -548,8 +631,15 @@ fn parse_diff_git_line(line: &str) -> (Option<String>, Option<String>) {
     let line = line.strip_prefix("diff --git ").unwrap_or(line);
     let parts: Vec<&str> = line.splitn(2, " b/").collect();
 
-    let old_path = parts.first().and_then(|p| p.strip_prefix("a/")).map(String::from);
-    let new_path = parts.get(1).map(|p| p.to_string());
+    let mut old_path = parts.first().and_then(|p| p.strip_prefix("a/")).map(String::from);
+    let mut new_path = parts.get(1).map(|p| p.to_string());
+
+    if old_path.as_deref() == Some("dev/null") {
+        old_path = None;
+    }
+    if new_path.as_deref() == Some("dev/null") {
+        new_path = None;
+    }
 
     (old_path, new_path)
 }
