@@ -5,6 +5,10 @@ edition = "2021"
 description = "Syntactic diff viewer with persistent line-level annotations"
 license = "MIT"
 
+[[bin]]
+name = "differ"
+path = "src/main.rs"
+
 [dependencies]
 # TUI
 ratatui = "0.29"
