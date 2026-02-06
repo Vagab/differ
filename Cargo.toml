@@ -1,5 +1,5 @@
 [package]
-name = "differ"
+name = "differ_cli"
 version = "0.1.0"
 edition = "2021"
 description = "Syntactic diff viewer with persistent line-level annotations"
