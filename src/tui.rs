@@ -228,6 +228,9 @@ pub struct App {
     selection_hunk_idx: Option<usize>,
     // Position to restore when collapsing expanded view
     pre_expand_position: Option<(usize, usize)>, // (line_idx, scroll_offset)
+    pre_expand_display_lines: Option<Vec<DisplayLine>>,
+    pre_expand_file_line_ranges: Option<Vec<Option<(usize, usize)>>>,
+    pre_expand_diff_generation: Option<u64>,
     annotation_list_idx: usize,
     goto_line_input: String,
 
@@ -484,6 +487,9 @@ impl App {
             selection_file_idx: None,
             selection_hunk_idx: None,
             pre_expand_position: None,
+            pre_expand_display_lines: None,
+            pre_expand_file_line_ranges: None,
+            pre_expand_diff_generation: None,
             search: None,
             annotation_list_idx: 0,
             goto_line_input: String::new(),
@@ -1503,11 +1509,11 @@ impl App {
             };
 
             let content = self.annotation_text();
-            self.storage.add_annotation(
+            let id = self.storage.add_annotation(
                 self.repo_id,
                 &file_path,
                 None, // commit_sha
-                side,
+                side.clone(),
                 start_line,
                 if start_line == end_line { None } else { Some(end_line) },
                 self.annotation_type.clone(),
@@ -1519,8 +1525,29 @@ impl App {
             )?;
 
             self.message = Some("Annotation added".to_string());
-            self.load_all_annotations()?;
-            self.build_display_lines();
+            self.invalidate_pre_expand_cache();
+            self.all_annotations.push(Annotation {
+                id,
+                repo_id: self.repo_id,
+                file_path: file_path.clone(),
+                commit_sha: None,
+                side,
+                start_line,
+                end_line: if start_line == end_line { None } else { Some(end_line) },
+                annotation_type: self.annotation_type.clone(),
+                content,
+                anchor_line,
+                anchor_text,
+                context_before,
+                context_after,
+                created_at: String::new(),
+                resolved_at: None,
+            });
+            if let Some(file_idx) = self.diff_file_index.get(&file_path).copied() {
+                self.update_display_lines_for_file(file_idx);
+            } else {
+                self.build_display_lines();
+            }
         }
 
         self.reset_annotation_input();
@@ -1539,8 +1566,20 @@ impl App {
         self.storage
             .update_annotation(id, &content, self.annotation_type.clone())?;
         self.message = Some("Annotation updated".to_string());
-        self.load_all_annotations()?;
-        self.build_display_lines();
+        self.invalidate_pre_expand_cache();
+        let mut file_path = None;
+        if let Some(annotation) = self.all_annotations.iter_mut().find(|a| a.id == id) {
+            annotation.content = content;
+            annotation.annotation_type = self.annotation_type.clone();
+            file_path = Some(annotation.file_path.clone());
+        }
+        if let Some(path) = file_path {
+            if let Some(file_idx) = self.diff_file_index.get(&path).copied() {
+                self.update_display_lines_for_file(file_idx);
+            } else {
+                self.build_display_lines();
+            }
+        }
         self.reset_annotation_input();
         self.annotation_range = None;
         self.annotation_side = None;
@@ -1551,10 +1590,16 @@ impl App {
     fn delete_annotation_at_line(&mut self) -> Result<()> {
         if let Some(annotation) = self.get_annotation_for_current_line() {
             let id = annotation.id;
+            let file_path = annotation.file_path.clone();
             self.storage.delete_annotation(id)?;
             self.message = Some("Annotation deleted".to_string());
-            self.load_all_annotations()?;
-            self.build_display_lines();
+            self.invalidate_pre_expand_cache();
+            self.all_annotations.retain(|a| a.id != id);
+            if let Some(file_idx) = self.diff_file_index.get(&file_path).copied() {
+                self.update_display_lines_for_file(file_idx);
+            } else {
+                self.build_display_lines();
+            }
         }
         Ok(())
     }
@@ -2030,7 +2075,24 @@ impl App {
                 if self.expanded_file.is_some() {
                     // Collapse back to all files - restore previous position
                     self.expanded_file = None;
-                    self.build_display_lines();
+                    let can_restore = self
+                        .pre_expand_diff_generation
+                        .map(|gen| gen == self.diff_generation)
+                        .unwrap_or(false);
+                    if can_restore {
+                        if let (Some(lines), Some(ranges)) = (
+                            self.pre_expand_display_lines.take(),
+                            self.pre_expand_file_line_ranges.take(),
+                        ) {
+                            self.display_lines = lines;
+                            self.file_line_ranges = ranges;
+                        } else {
+                            self.build_display_lines();
+                        }
+                    } else {
+                        self.build_display_lines();
+                    }
+                    self.pre_expand_diff_generation = None;
 
                     if let Some((saved_line_idx, saved_scroll)) = self.pre_expand_position.take() {
                         // Restore position, clamping to valid range
@@ -2056,6 +2118,11 @@ impl App {
                 } else {
                     // Expand current file - save position first
                     if let Some((_, file_idx)) = self.current_file_info() {
+                        if !self.diff_loading {
+                            self.pre_expand_display_lines = Some(self.display_lines.clone());
+                            self.pre_expand_file_line_ranges = Some(self.file_line_ranges.clone());
+                            self.pre_expand_diff_generation = Some(self.diff_generation);
+                        }
                         let mut target_new: Option<u32> = None;
                         let mut target_old: Option<u32> = None;
                         if let Some(line) = self.current_display_line() {
@@ -2866,6 +2933,7 @@ impl App {
                 } else {
                     "Staged hunk".to_string()
                 });
+                self.invalidate_pre_expand_cache();
                 self.apply_stage_local(file_idx, hunk_idx)?;
             }
             Err(err) => {
@@ -2901,6 +2969,7 @@ impl App {
         match self.apply_patch_to_worktree(&patch, true) {
             Ok(()) => {
                 self.message = Some("Discarded hunk".to_string());
+                self.invalidate_pre_expand_cache();
                 self.apply_discard_local(file_idx, hunk_idx)?;
             }
             Err(err) => {
@@ -3259,6 +3328,12 @@ impl App {
         Ok(())
     }
 
+    fn invalidate_pre_expand_cache(&mut self) {
+        self.pre_expand_display_lines = None;
+        self.pre_expand_file_line_ranges = None;
+        self.pre_expand_diff_generation = None;
+    }
+
     fn handle_fs_pending(&mut self) -> Result<()> {
         if !self.fs_pending {
             return Ok(());
@@ -3292,6 +3367,7 @@ impl App {
         let generation = self.diff_generation.wrapping_add(1);
         self.diff_generation = generation;
         self.diff_loading = true;
+        self.invalidate_pre_expand_cache();
         // Keep current position while streaming the new diff.
         self.clear_syntax_cache();
         self.load_all_annotations()?;
@@ -3811,6 +3887,7 @@ impl App {
         }
 
         self.clamp_scroll();
+        self.sync_sidebar_to_current_file();
     }
 
     fn jump_to_line(&mut self, idx: usize) {
@@ -3939,6 +4016,15 @@ impl App {
         let max_scroll = self.max_scroll_offset();
         if self.scroll_offset > max_scroll {
             self.scroll_offset = max_scroll;
+        }
+    }
+
+    fn sync_sidebar_to_current_file(&mut self) {
+        if !self.sidebar_open || self.sidebar_focused {
+            return;
+        }
+        if let Some((_, file_idx)) = self.current_file_info() {
+            self.sidebar_index = file_idx.min(self.files.len().saturating_sub(1));
         }
     }
 
