@@ -681,7 +681,33 @@ pub fn find_repo_root(start: &Path) -> Result<PathBuf> {
     let repo = Repository::discover(start)
         .context("Not in a git repository")?;
 
-    repo.workdir()
-        .map(PathBuf::from)
-        .context("Repository has no working directory")
+    if let Some(workdir) = repo.workdir() {
+        if workdir.exists() {
+            return Ok(workdir.to_path_buf());
+        }
+    }
+
+    // Fallback for worktrees or odd repo layouts
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(start)
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .output()
+        .context("Failed to run git rev-parse")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git rev-parse failed: {}", stderr.trim());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let path = stdout.trim();
+    if path.is_empty() {
+        anyhow::bail!("git rev-parse returned empty path");
+    }
+    let workdir = PathBuf::from(path);
+    if workdir.exists() {
+        Ok(workdir)
+    } else {
+        anyhow::bail!("repo path does not exist: {}", workdir.display());
+    }
 }
