@@ -2,13 +2,25 @@
 
 A TUI diff viewer with persistent annotations. Drop-in replacement for `git diff` with the ability to annotate code changes.
 
+```
+    .___.__  _____  _____             
+  __| _/|__|/ ____\/ ____\___________ 
+ / __ | |  \   __\\   __\/ __ \_  __ \
+/ /_/ | |  ||  |   |  | \  ___/|  | \/
+\____ | |__||__|   |__|  \___  >__|   
+     \/                      \/       
+```
+
 ## Features
 
-- **Git-compatible CLI** - accepts same arguments as `git diff`
+- **Git-compatible CLI** (works like `git diff`)
 - **Interactive TUI** with vim-style navigation
-- **Persistent annotations** stored in SQLite
-- **Full file expansion** - view entire file with changes highlighted
-- **Side-by-side view** (optional)
+- **Persistent annotations** stored in SQLite (comment/todo + resolve)
+- **Expanded file view** (full file, with changes highlighted)
+- **Side-by-side view** and syntax highlighting
+- **Staging/unstaging** hunks, **discard** hunk
+- **Sidebar** with modified/added/deleted files
+- **Auto-reload** via filesystem watcher
 - **Export annotations** to Markdown/JSON for AI context
 
 ## Installation
@@ -16,10 +28,16 @@ A TUI diff viewer with persistent annotations. Drop-in replacement for `git diff
 Requires [Rust](https://rustup.rs/). Then:
 
 ```bash
-./install.sh
+cargo install differ_cli --locked
 ```
 
-This builds the binary, installs it to `~/.local/bin`, and adds it to your PATH.
+Binary is installed to `~/.cargo/bin` as `differ` (ensure it’s in your PATH).
+
+Or build locally:
+
+```bash
+./install.sh
+```
 
 ## Git Setup
 
@@ -59,35 +77,13 @@ differ clear                   # clear all annotations
 
 ## Keybindings
 
-### Navigation
-| Key | Action |
-|-----|--------|
-| `j/k` | Move up/down |
-| `n/N` | Next/prev file (or chunk in expanded mode) |
-| `]/[` | Next/prev change |
-| `Ctrl+d/u` | Half page down/up |
-| `g/G` | Go to top/bottom |
+Press `?` in the TUI for the full list. Highlights:
 
-### View
-| Key | Action |
-|-----|--------|
-| `x` | Expand/collapse file (full file view) |
-| `s` | Toggle side-by-side view |
-| `c` | Toggle annotation visibility |
-
-### Annotations
-| Key | Action |
-|-----|--------|
-| `a` | Add annotation |
-| `e` | Edit annotation |
-| `d` | Delete annotation |
-| `t` | Toggle type (comment/todo) |
-
-### Other
-| Key | Action |
-|-----|--------|
-| `?` | Help |
-| `q` | Quit |
+- `j/k`, `n/N`, `Tab`/`Shift+Tab`, `g/G` for navigation
+- `x` expand, `c` collapse, `v` side-by-side, `B` sidebar, `b` focus sidebar
+- `s` stage/unstage hunk, `D` discard hunk (unstaged)
+- `a/e/d/r/t` annotations (add/edit/delete/resolve/type)
+- `R` reload, `@` send annotation to AI
 
 ## Config
 
@@ -97,6 +93,9 @@ differ clear                   # clear all annotations
 side_by_side = false
 context_lines = 3
 show_annotations = true
+syntax_highlighting = true
+ai_target = "claude" # or "codex"
+watch_ignore_paths = [".git", "target", "_build", "deps"]
 ```
 
 ## License
