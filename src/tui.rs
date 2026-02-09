@@ -264,6 +264,7 @@ enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandId {
     Commit,
+    Push,
     GotoLine,
     ReloadDiff,
     ToggleSidebar,
@@ -2626,6 +2627,11 @@ impl App {
                 keywords: "git commit",
             },
             CommandEntry {
+                id: CommandId::Push,
+                label: "Push",
+                keywords: "git push",
+            },
+            CommandEntry {
                 id: CommandId::GotoLine,
                 label: "Go to line",
                 keywords: "goto line jump",
@@ -2891,6 +2897,16 @@ impl App {
             CommandId::Commit => {
                 self.commit_input = TextArea::default();
                 self.mode = Mode::CommitMessage;
+            }
+            CommandId::Push => {
+                match self.run_git_push() {
+                    Ok(()) => {
+                        self.message = Some("Pushed".to_string());
+                    }
+                    Err(err) => {
+                        self.message = Some(format!("Push failed: {}", err));
+                    }
+                }
             }
             CommandId::GotoLine => {
                 self.goto_line_input.clear();
@@ -3158,6 +3174,24 @@ impl App {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if stderr.is_empty() {
                 Err("git commit failed".to_string())
+            } else {
+                Err(stderr)
+            }
+        }
+    }
+
+    fn run_git_push(&self) -> Result<(), String> {
+        let output = Command::new("git")
+            .arg("push")
+            .current_dir(&self.repo_path)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                Err("git push failed".to_string())
             } else {
                 Err(stderr)
             }
