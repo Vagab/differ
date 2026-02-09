@@ -234,6 +234,9 @@ pub struct App {
     pre_expand_diff_generation: Option<u64>,
     annotation_list_idx: usize,
     goto_line_input: String,
+    command_query: String,
+    command_selected_idx: usize,
+    commit_input: TextArea<'static>,
 
     // Search state
     search: Option<SearchState>,
@@ -254,6 +257,52 @@ enum Mode {
     SearchContent,       // searching within content
     AnnotationList,
     GotoLine,
+    CommandPalette,
+    CommitMessage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandId {
+    Commit,
+    GotoLine,
+    ReloadDiff,
+    ToggleSidebar,
+    FocusSidebar,
+    ToggleSideBySide,
+    ToggleDiffView,
+    StageHunk,
+    DiscardHunk,
+    CollapseFile,
+    ExpandFile,
+    AddAnnotation,
+    EditAnnotation,
+    DeleteAnnotation,
+    ResolveAnnotation,
+    ToggleAnnotationType,
+    AnnotationList,
+    SendAnnotationToAi,
+    CopySelection,
+    ToggleSelection,
+    ToggleAiPane,
+    ToggleHelp,
+    ToggleOldDeletions,
+    Quit,
+    SearchFile,
+    SearchContent,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CommandEntry {
+    id: CommandId,
+    label: &'static str,
+    keywords: &'static str,
+}
+
+#[derive(Debug, Clone)]
+struct CommandMatch {
+    entry: CommandEntry,
+    score: usize,
+    enabled: bool,
 }
 
 #[derive(Debug)]
@@ -494,6 +543,9 @@ impl App {
             search: None,
             annotation_list_idx: 0,
             goto_line_input: String::new(),
+            command_query: String::new(),
+            command_selected_idx: 0,
+            commit_input: TextArea::default(),
             ai_jobs: Vec::new(),
             ai_next_id: 1,
             ai_rx,
@@ -1797,6 +1849,14 @@ impl App {
             return Ok(false);
         }
 
+        if key.code == KeyCode::Char(':')
+            && matches!(self.mode, Mode::Normal | Mode::AnnotationList)
+        {
+            self.show_help = false;
+            self.open_command_palette();
+            return Ok(false);
+        }
+
         if key.code == KeyCode::Char('?') {
             if matches!(self.mode, Mode::Normal | Mode::AnnotationList) {
                 self.show_help = !self.show_help;
@@ -1829,6 +1889,8 @@ impl App {
             Mode::SearchFile | Mode::SearchContent => self.handle_search_input(key),
             Mode::AnnotationList => self.handle_annotation_list_input(key),
             Mode::GotoLine => self.handle_goto_line_input(key),
+            Mode::CommandPalette => self.handle_command_palette_input(key),
+            Mode::CommitMessage => self.handle_commit_input(key),
         }
     }
 
@@ -1849,18 +1911,7 @@ impl App {
         }
 
         if key.code == KeyCode::Char('B') {
-            self.sidebar_open = !self.sidebar_open;
-            if self.sidebar_open {
-                self.sidebar_focused = true;
-                if let Some((_, file_idx)) = self.current_file_info() {
-                    self.sidebar_index = file_idx.min(self.files.len().saturating_sub(1));
-                } else {
-                    self.sidebar_index = 0;
-                }
-                self.sidebar_scroll = 0;
-            } else {
-                self.sidebar_focused = false;
-            }
+            self.toggle_sidebar();
             return Ok(false);
         }
 
@@ -1897,25 +1948,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('V') => {
-                if self.selection_active {
-                    self.selection_active = false;
-                    self.selection_start = None;
-                    self.selection_file_idx = None;
-                    self.selection_hunk_idx = None;
-                    self.message = Some("Selection cleared".to_string());
-                } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line() {
-                    if line.new_line_no.is_some() {
-                        self.selection_active = true;
-                        self.selection_start = Some(self.current_line_idx);
-                        self.selection_file_idx = self.file_idx_for_line(self.current_line_idx);
-                        self.selection_hunk_idx = self.hunk_idx_for_line(self.current_line_idx);
-                        self.message = Some("Selecting lines".to_string());
-                    } else {
-                        self.message = Some("Selection only works on new/context lines".to_string());
-                    }
-                } else {
-                    self.message = Some("Move to a diff line to start selection".to_string());
-                }
+                self.toggle_selection();
                 return Ok(false);
             }
             _ => {}
@@ -1944,22 +1977,10 @@ impl App {
             KeyCode::BackTab => self.prev_file(),
             // Search
             KeyCode::Char('f') => {
-                self.mode = Mode::SearchFile;
-                self.search = Some(SearchState {
-                    query: String::new(),
-                    matches: Vec::new(),
-                    current_match: 0,
-                    search_type: SearchType::File,
-                });
+                self.start_search_file();
             }
             KeyCode::Char('/') => {
-                self.mode = Mode::SearchContent;
-                self.search = Some(SearchState {
-                    query: String::new(),
-                    matches: Vec::new(),
-                    current_match: 0,
-                    search_type: SearchType::Content,
-                });
+                self.start_search_content();
             }
             // Clear search
             KeyCode::Esc => {
@@ -1995,12 +2016,7 @@ impl App {
                 self.adjust_scroll();
             }
             KeyCode::Char(':') => {
-                if self.expanded_file.is_some() {
-                    self.mode = Mode::GotoLine;
-                    self.goto_line_input.clear();
-                } else {
-                    self.message = Some("Line jump is available in expanded view (x)".to_string());
-                }
+                self.open_command_palette();
             }
 
 
@@ -2009,26 +2025,10 @@ impl App {
                 self.toggle_collapse_current_file();
             }
             KeyCode::Char('h') => {
-                if self.expanded_file.is_some() {
-                    self.show_old_in_expanded = !self.show_old_in_expanded;
-                    let msg = if self.show_old_in_expanded {
-                        "Showing deletions".to_string()
-                    } else {
-                        "Hiding deletions".to_string()
-                    };
-                    if let Some(file_idx) = self.expanded_file {
-                        self.update_display_lines_for_file(file_idx);
-                    } else {
-                        self.build_display_lines();
-                    }
-                    self.ensure_cursor_on_navigable();
-                    self.adjust_scroll();
-                    self.message = Some(msg);
-                }
+                self.toggle_old_in_expanded();
             }
             KeyCode::Char('A') => {
-                self.mode = Mode::AnnotationList;
-                self.annotation_list_idx = 0;
+                self.open_annotation_list();
             }
             KeyCode::Char('r') => {
                 if let Some(annotation) = self.get_annotation_for_current_line() {
@@ -2072,113 +2072,7 @@ impl App {
                 ));
             }
             KeyCode::Char('x') => {
-                // Toggle expanded/focused file view
-                if self.expanded_file.is_some() {
-                    // Collapse back to all files - restore previous position
-                    self.expanded_file = None;
-                    let can_restore = self
-                        .pre_expand_diff_generation
-                        .map(|gen| gen == self.diff_generation)
-                        .unwrap_or(false);
-                    if can_restore {
-                        if let (Some(lines), Some(ranges)) = (
-                            self.pre_expand_display_lines.take(),
-                            self.pre_expand_file_line_ranges.take(),
-                        ) {
-                            self.display_lines = lines;
-                            self.file_line_ranges = ranges;
-                        } else {
-                            self.build_display_lines();
-                        }
-                    } else {
-                        self.build_display_lines();
-                    }
-                    self.pre_expand_diff_generation = None;
-
-                    if let Some((saved_line_idx, saved_scroll)) = self.pre_expand_position.take() {
-                        // Restore position, clamping to valid range
-                        self.current_line_idx = saved_line_idx.min(self.display_lines.len().saturating_sub(1));
-                        self.scroll_offset = saved_scroll;
-                        // Skip to nearest navigable line if needed
-                        while self.current_line_idx < self.display_lines.len().saturating_sub(1)
-                            && self.is_skippable_line(self.current_line_idx)
-                        {
-                            self.current_line_idx += 1;
-                        }
-                    } else {
-                        self.current_line_idx = 0;
-                        self.scroll_offset = 0;
-                        while self.current_line_idx < self.display_lines.len().saturating_sub(1)
-                            && self.is_skippable_line(self.current_line_idx)
-                        {
-                            self.current_line_idx += 1;
-                        }
-                    }
-                    self.adjust_scroll();
-                    self.message = Some("Showing all files".to_string());
-                } else {
-                    // Expand current file - save position first
-                    if let Some((_, file_idx)) = self.current_file_info() {
-                        if !self.diff_loading {
-                            self.pre_expand_display_lines = Some(self.display_lines.clone());
-                            self.pre_expand_file_line_ranges = Some(self.file_line_ranges.clone());
-                            self.pre_expand_diff_generation = Some(self.diff_generation);
-                        }
-                        let mut target_new: Option<u32> = None;
-                        let mut target_old: Option<u32> = None;
-                        if let Some(line) = self.current_display_line() {
-                            match line {
-                                DisplayLine::Diff { line, .. } => {
-                                    target_new = line.new_line_no;
-                                    target_old = line.old_line_no;
-                                }
-                                DisplayLine::HunkHeader { line_no, .. } => {
-                                    target_new = Some(*line_no);
-                                }
-                                DisplayLine::HunkContext { line_no, .. } => {
-                                    target_new = Some(*line_no);
-                                }
-                                DisplayLine::HunkEnd { file_idx, hunk_idx } => {
-                                    target_new = self
-                                        .files
-                                        .get(*file_idx)
-                                        .and_then(|f| f.hunks.get(*hunk_idx))
-                                        .map(|h| h.new_start);
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        self.pre_expand_position = Some((self.current_line_idx, self.scroll_offset));
-                        self.expanded_file = Some(file_idx);
-                        self.build_display_lines();
-                        if let Some(line_no) = target_new {
-                            if let Some(idx) = self.find_line_in_expanded(line_no) {
-                                self.current_line_idx = idx;
-                            }
-                        } else if let Some(line_no) = target_old {
-                            if let Some(idx) = self.find_old_line_in_expanded(line_no) {
-                                self.current_line_idx = idx;
-                            }
-                        }
-                        if self.current_line_idx >= self.display_lines.len() {
-                            self.current_line_idx = 0;
-                        }
-                        if self.current_line_idx == 0 {
-                            // Skip to first navigable line
-                            while self.current_line_idx < self.display_lines.len().saturating_sub(1)
-                                && self.is_skippable_line(self.current_line_idx)
-                            {
-                                self.current_line_idx += 1;
-                            }
-                            self.scroll_offset = 0;
-                        } else {
-                            self.center_on_current_line();
-                        }
-                        self.adjust_scroll();
-                        self.message = Some("Expanded file view (]/[: next/prev change, x: collapse)".to_string());
-                    }
-                }
+                self.toggle_expanded_view();
             }
             KeyCode::Char('y') => {
                 if let Some(text) = self.selected_text_for_copy() {
@@ -2468,19 +2362,19 @@ impl App {
                 let line_no = self.goto_line_input.trim().parse::<u32>().ok();
                 self.mode = Mode::Normal;
                 if let Some(line_no) = line_no {
-                    if self.expanded_file.is_some() {
-                        if let Some(idx) = self.find_line_in_expanded(line_no) {
-                            self.current_line_idx = idx;
-                            self.ensure_cursor_on_navigable();
-                            self.adjust_scroll();
-                        } else {
+                    if !self.jump_to_line_number(line_no) {
+                        if self.expanded_file.is_some() {
                             self.message = Some(format!("Line {} not found", line_no));
+                        } else {
+                            self.message = Some("Line jump is available in expanded view (x)".to_string());
                         }
-                    } else {
-                        self.message = Some("Line jump is available in expanded view (x)".to_string());
                     }
                 } else {
-                    self.message = Some("Enter a line number".to_string());
+                    if self.expanded_file.is_none() {
+                        self.message = Some("Line jump is available in expanded view (x)".to_string());
+                    } else {
+                        self.message = Some("Enter a line number".to_string());
+                    }
                 }
                 self.goto_line_input.clear();
             }
@@ -2493,6 +2387,781 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    fn open_command_palette(&mut self) {
+        self.mode = Mode::CommandPalette;
+        self.command_query.clear();
+        self.command_selected_idx = 0;
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_open = !self.sidebar_open;
+        if self.sidebar_open {
+            self.sidebar_focused = true;
+            if let Some((_, file_idx)) = self.current_file_info() {
+                self.sidebar_index = file_idx.min(self.files.len().saturating_sub(1));
+            } else {
+                self.sidebar_index = 0;
+            }
+            self.sidebar_scroll = 0;
+        } else {
+            self.sidebar_focused = false;
+        }
+    }
+
+    fn toggle_selection(&mut self) {
+        if self.selection_active {
+            self.selection_active = false;
+            self.selection_start = None;
+            self.selection_file_idx = None;
+            self.selection_hunk_idx = None;
+            self.message = Some("Selection cleared".to_string());
+        } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line() {
+            if line.new_line_no.is_some() {
+                self.selection_active = true;
+                self.selection_start = Some(self.current_line_idx);
+                self.selection_file_idx = self.file_idx_for_line(self.current_line_idx);
+                self.selection_hunk_idx = self.hunk_idx_for_line(self.current_line_idx);
+                self.message = Some("Selecting lines".to_string());
+            } else {
+                self.message = Some("Selection only works on new/context lines".to_string());
+            }
+        } else {
+            self.message = Some("Move to a diff line to start selection".to_string());
+        }
+    }
+
+    fn start_search_file(&mut self) {
+        self.mode = Mode::SearchFile;
+        self.search = Some(SearchState {
+            query: String::new(),
+            matches: Vec::new(),
+            current_match: 0,
+            search_type: SearchType::File,
+        });
+    }
+
+    fn start_search_content(&mut self) {
+        self.mode = Mode::SearchContent;
+        self.search = Some(SearchState {
+            query: String::new(),
+            matches: Vec::new(),
+            current_match: 0,
+            search_type: SearchType::Content,
+        });
+    }
+
+    fn open_annotation_list(&mut self) {
+        self.mode = Mode::AnnotationList;
+        self.annotation_list_idx = 0;
+    }
+
+    fn toggle_old_in_expanded(&mut self) {
+        if self.expanded_file.is_some() {
+            self.show_old_in_expanded = !self.show_old_in_expanded;
+            let msg = if self.show_old_in_expanded {
+                "Showing deletions".to_string()
+            } else {
+                "Hiding deletions".to_string()
+            };
+            if let Some(file_idx) = self.expanded_file {
+                self.update_display_lines_for_file(file_idx);
+            } else {
+                self.build_display_lines();
+            }
+            self.ensure_cursor_on_navigable();
+            self.adjust_scroll();
+            self.message = Some(msg);
+        }
+    }
+
+    fn toggle_expanded_view(&mut self) {
+        if self.expanded_file.is_some() {
+            // Collapse back to all files - restore previous position
+            self.expanded_file = None;
+            let can_restore = self
+                .pre_expand_diff_generation
+                .map(|gen| gen == self.diff_generation)
+                .unwrap_or(false);
+            if can_restore {
+                if let (Some(lines), Some(ranges)) = (
+                    self.pre_expand_display_lines.take(),
+                    self.pre_expand_file_line_ranges.take(),
+                ) {
+                    self.display_lines = lines;
+                    self.file_line_ranges = ranges;
+                } else {
+                    self.build_display_lines();
+                }
+            } else {
+                self.build_display_lines();
+            }
+            self.pre_expand_diff_generation = None;
+
+            if let Some((saved_line_idx, saved_scroll)) = self.pre_expand_position.take() {
+                // Restore position, clamping to valid range
+                self.current_line_idx =
+                    saved_line_idx.min(self.display_lines.len().saturating_sub(1));
+                self.scroll_offset = saved_scroll;
+                // Skip to nearest navigable line if needed
+                while self.current_line_idx < self.display_lines.len().saturating_sub(1)
+                    && self.is_skippable_line(self.current_line_idx)
+                {
+                    self.current_line_idx += 1;
+                }
+            } else {
+                self.current_line_idx = 0;
+                self.scroll_offset = 0;
+                while self.current_line_idx < self.display_lines.len().saturating_sub(1)
+                    && self.is_skippable_line(self.current_line_idx)
+                {
+                    self.current_line_idx += 1;
+                }
+            }
+            self.adjust_scroll();
+            self.message = Some("Showing all files".to_string());
+        } else {
+            // Expand current file - save position first
+            if let Some((_, file_idx)) = self.current_file_info() {
+                if !self.diff_loading {
+                    self.pre_expand_display_lines = Some(self.display_lines.clone());
+                    self.pre_expand_file_line_ranges = Some(self.file_line_ranges.clone());
+                    self.pre_expand_diff_generation = Some(self.diff_generation);
+                }
+                let mut target_new: Option<u32> = None;
+                let mut target_old: Option<u32> = None;
+                if let Some(line) = self.current_display_line() {
+                    match line {
+                        DisplayLine::Diff { line, .. } => {
+                            target_new = line.new_line_no;
+                            target_old = line.old_line_no;
+                        }
+                        DisplayLine::HunkHeader { line_no, .. } => {
+                            target_new = Some(*line_no);
+                        }
+                        DisplayLine::HunkContext { line_no, .. } => {
+                            target_new = Some(*line_no);
+                        }
+                        DisplayLine::HunkEnd { file_idx, hunk_idx } => {
+                            target_new = self
+                                .files
+                                .get(*file_idx)
+                                .and_then(|f| f.hunks.get(*hunk_idx))
+                                .map(|h| h.new_start);
+                        }
+                        _ => {}
+                    }
+                }
+
+                self.pre_expand_position = Some((self.current_line_idx, self.scroll_offset));
+                self.expanded_file = Some(file_idx);
+                self.build_display_lines();
+                if let Some(line_no) = target_new {
+                    if let Some(idx) = self.find_line_in_expanded(line_no) {
+                        self.current_line_idx = idx;
+                    }
+                } else if let Some(line_no) = target_old {
+                    if let Some(idx) = self.find_old_line_in_expanded(line_no) {
+                        self.current_line_idx = idx;
+                    }
+                }
+                if self.current_line_idx >= self.display_lines.len() {
+                    self.current_line_idx = 0;
+                }
+                if self.current_line_idx == 0 {
+                    // Skip to first navigable line
+                    while self.current_line_idx < self.display_lines.len().saturating_sub(1)
+                        && self.is_skippable_line(self.current_line_idx)
+                    {
+                        self.current_line_idx += 1;
+                    }
+                    self.scroll_offset = 0;
+                } else {
+                    self.center_on_current_line();
+                }
+                self.adjust_scroll();
+                self.message =
+                    Some("Expanded file view (]/[: next/prev change, x: collapse)".to_string());
+            }
+        }
+    }
+
+    fn jump_to_line_number(&mut self, line_no: u32) -> bool {
+        if self.expanded_file.is_none() {
+            return false;
+        }
+        if let Some(idx) = self.find_line_in_expanded(line_no) {
+            self.current_line_idx = idx;
+            self.ensure_cursor_on_navigable();
+            self.adjust_scroll();
+            return true;
+        }
+        false
+    }
+
+    fn has_current_annotation(&self) -> bool {
+        self.get_annotation_for_current_line().is_some()
+    }
+
+    fn can_add_annotation(&self) -> bool {
+        if self.selection_active {
+            return self.selection_range_for_new_side().is_some();
+        }
+        matches!(self.current_display_line(), Some(DisplayLine::Diff { .. }))
+    }
+
+    fn can_copy_selection_or_line(&self) -> bool {
+        if self.selection_active {
+            return self.selected_text_for_copy().is_some();
+        }
+        matches!(self.current_display_line(), Some(DisplayLine::Diff { .. }))
+    }
+
+    fn command_entries() -> &'static [CommandEntry] {
+        static COMMANDS: &[CommandEntry] = &[
+            CommandEntry {
+                id: CommandId::Commit,
+                label: "Commit",
+                keywords: "git commit",
+            },
+            CommandEntry {
+                id: CommandId::GotoLine,
+                label: "Go to line",
+                keywords: "goto line jump",
+            },
+            CommandEntry {
+                id: CommandId::SearchFile,
+                label: "Search file",
+                keywords: "search file filename",
+            },
+            CommandEntry {
+                id: CommandId::SearchContent,
+                label: "Search content",
+                keywords: "search content",
+            },
+            CommandEntry {
+                id: CommandId::ReloadDiff,
+                label: "Reload diff",
+                keywords: "reload refresh",
+            },
+            CommandEntry {
+                id: CommandId::ToggleSidebar,
+                label: "Toggle sidebar",
+                keywords: "sidebar files",
+            },
+            CommandEntry {
+                id: CommandId::FocusSidebar,
+                label: "Focus sidebar",
+                keywords: "sidebar focus",
+            },
+            CommandEntry {
+                id: CommandId::ToggleSideBySide,
+                label: "Toggle side-by-side",
+                keywords: "split unified view",
+            },
+            CommandEntry {
+                id: CommandId::ToggleDiffView,
+                label: "Toggle staged/unstaged",
+                keywords: "staged unstaged view",
+            },
+            CommandEntry {
+                id: CommandId::StageHunk,
+                label: "Stage/unstage hunk",
+                keywords: "stage unstage hunk",
+            },
+            CommandEntry {
+                id: CommandId::DiscardHunk,
+                label: "Discard hunk",
+                keywords: "discard hunk",
+            },
+            CommandEntry {
+                id: CommandId::CollapseFile,
+                label: "Collapse/expand file",
+                keywords: "collapse expand file",
+            },
+            CommandEntry {
+                id: CommandId::ExpandFile,
+                label: "Expand/collapse full file",
+                keywords: "expand full file",
+            },
+            CommandEntry {
+                id: CommandId::AnnotationList,
+                label: "Annotation list",
+                keywords: "annotations list",
+            },
+            CommandEntry {
+                id: CommandId::AddAnnotation,
+                label: "Add annotation",
+                keywords: "add comment todo",
+            },
+            CommandEntry {
+                id: CommandId::EditAnnotation,
+                label: "Edit annotation",
+                keywords: "edit annotation",
+            },
+            CommandEntry {
+                id: CommandId::DeleteAnnotation,
+                label: "Delete annotation",
+                keywords: "delete annotation",
+            },
+            CommandEntry {
+                id: CommandId::ResolveAnnotation,
+                label: "Resolve/unresolve annotation",
+                keywords: "resolve annotation",
+            },
+            CommandEntry {
+                id: CommandId::ToggleAnnotationType,
+                label: "Toggle annotation type",
+                keywords: "toggle annotation type",
+            },
+            CommandEntry {
+                id: CommandId::SendAnnotationToAi,
+                label: "Send annotation to AI",
+                keywords: "ai annotation",
+            },
+            CommandEntry {
+                id: CommandId::CopySelection,
+                label: "Copy selection/line",
+                keywords: "copy yank",
+            },
+            CommandEntry {
+                id: CommandId::ToggleSelection,
+                label: "Toggle selection",
+                keywords: "selection visual",
+            },
+            CommandEntry {
+                id: CommandId::ToggleAiPane,
+                label: "Toggle AI pane",
+                keywords: "ai pane",
+            },
+            CommandEntry {
+                id: CommandId::ToggleHelp,
+                label: "Toggle help",
+                keywords: "help",
+            },
+            CommandEntry {
+                id: CommandId::ToggleOldDeletions,
+                label: "Toggle deletions (expanded)",
+                keywords: "deletions old",
+            },
+            CommandEntry {
+                id: CommandId::Quit,
+                label: "Quit",
+                keywords: "quit exit",
+            },
+        ];
+        COMMANDS
+    }
+
+    fn command_enabled(&self, id: CommandId) -> bool {
+        match id {
+            CommandId::GotoLine | CommandId::ToggleOldDeletions => self.expanded_file.is_some(),
+            CommandId::FocusSidebar => self.sidebar_open,
+            CommandId::StageHunk => matches!(self.diff_mode, DiffMode::Unstaged | DiffMode::Staged)
+                && self.current_hunk_ref().is_some(),
+            CommandId::DiscardHunk => matches!(self.diff_mode, DiffMode::Unstaged)
+                && self.current_hunk_ref().is_some(),
+            CommandId::AddAnnotation => self.can_add_annotation(),
+            CommandId::EditAnnotation
+            | CommandId::DeleteAnnotation
+            | CommandId::ResolveAnnotation
+            | CommandId::SendAnnotationToAi => self.has_current_annotation(),
+            CommandId::CopySelection => self.can_copy_selection_or_line(),
+            _ => true,
+        }
+    }
+
+    fn command_matches(&self) -> Vec<CommandMatch> {
+        let query = self.command_query.to_lowercase();
+        let mut matches: Vec<CommandMatch> = Vec::new();
+        for entry in Self::command_entries() {
+            if !self.command_enabled(entry.id) {
+                continue;
+            }
+            let haystack = format!("{} {}", entry.label, entry.keywords).to_lowercase();
+            if let Some(score) = fuzzy_score(&query, &haystack) {
+                matches.push(CommandMatch {
+                    entry: *entry,
+                    score,
+                    enabled: true,
+                });
+            }
+        }
+        matches.sort_by(|a, b| {
+            a.score
+                .cmp(&b.score)
+                .then_with(|| a.entry.label.cmp(b.entry.label))
+        });
+        matches
+    }
+
+    fn handle_command_palette_input(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                let trimmed = self.command_query.trim();
+                if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                    let line_no = trimmed.parse::<u32>().ok();
+                    self.mode = Mode::Normal;
+                    if let Some(line_no) = line_no {
+                        if !self.jump_to_line_number(line_no) {
+                            if self.expanded_file.is_some() {
+                                self.message = Some(format!("Line {} not found", line_no));
+                            } else {
+                                self.message = Some(
+                                    "Line jump is available in expanded view (x)".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    self.command_query.clear();
+                    self.command_selected_idx = 0;
+                    return Ok(false);
+                }
+                let matches = self.command_matches();
+                if matches.is_empty() {
+                    self.mode = Mode::Normal;
+                    return Ok(false);
+                }
+                let idx = self.command_selected_idx.min(matches.len().saturating_sub(1));
+                let cmd = matches[idx].clone();
+                let quit = self.execute_command(cmd.entry, cmd.enabled)?;
+                return Ok(quit);
+            }
+            KeyCode::Down => {
+                let matches_len = self.command_matches().len();
+                if self.command_selected_idx + 1 < matches_len {
+                    self.command_selected_idx += 1;
+                }
+                return Ok(false);
+            }
+            KeyCode::Up => {
+                if self.command_selected_idx > 0 {
+                    self.command_selected_idx -= 1;
+                }
+                return Ok(false);
+            }
+            KeyCode::PageDown => {
+                let matches_len = self.command_matches().len();
+                let jump = 5usize;
+                self.command_selected_idx =
+                    (self.command_selected_idx + jump).min(matches_len.saturating_sub(1));
+                return Ok(false);
+            }
+            KeyCode::PageUp => {
+                let jump = 5usize;
+                self.command_selected_idx = self.command_selected_idx.saturating_sub(jump);
+                return Ok(false);
+            }
+            KeyCode::Backspace => {
+                self.command_query.pop();
+                self.command_selected_idx = 0;
+                return Ok(false);
+            }
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER)
+                {
+                    self.command_query.push(c);
+                    self.command_selected_idx = 0;
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn execute_command(&mut self, entry: CommandEntry, enabled: bool) -> Result<bool> {
+        self.mode = Mode::Normal;
+        self.command_query.clear();
+        self.command_selected_idx = 0;
+
+        if !enabled {
+            self.message = Some(format!("{} is not available in this view", entry.label));
+            return Ok(false);
+        }
+
+        match entry.id {
+            CommandId::Commit => {
+                self.commit_input = TextArea::default();
+                self.mode = Mode::CommitMessage;
+            }
+            CommandId::GotoLine => {
+                self.goto_line_input.clear();
+                self.mode = Mode::GotoLine;
+            }
+            CommandId::SearchFile => {
+                self.start_search_file();
+            }
+            CommandId::SearchContent => {
+                self.start_search_content();
+            }
+            CommandId::ReloadDiff => {
+                self.reload_diff()?;
+                self.message = Some("Diff reloaded".to_string());
+            }
+            CommandId::ToggleSidebar => {
+                self.toggle_sidebar();
+            }
+            CommandId::FocusSidebar => {
+                if self.sidebar_open {
+                    self.sidebar_focused = true;
+                }
+            }
+            CommandId::ToggleSideBySide => {
+                self.side_by_side = !self.side_by_side;
+                self.message = Some(format!(
+                    "View: {}",
+                    if self.side_by_side { "side-by-side" } else { "unified" }
+                ));
+            }
+            CommandId::ToggleDiffView => {
+                self.toggle_diff_view()?;
+            }
+            CommandId::StageHunk => {
+                self.toggle_stage_current_hunk()?;
+            }
+            CommandId::DiscardHunk => {
+                self.discard_current_hunk()?;
+            }
+            CommandId::CollapseFile => {
+                self.toggle_collapse_current_file();
+            }
+            CommandId::ExpandFile => {
+                self.toggle_expanded_view();
+            }
+            CommandId::AnnotationList => {
+                self.open_annotation_list();
+            }
+            CommandId::AddAnnotation => {
+                if self.selection_active {
+                    if let Some((_, start, end)) = self.selection_range_for_new_side() {
+                        self.mode = Mode::AddAnnotation;
+                        self.reset_annotation_input();
+                        self.annotation_range = Some((start, end));
+                        self.annotation_side = Some(Side::New);
+                    } else {
+                        self.message = Some("Selection has no new/context lines".to_string());
+                    }
+                } else if let Some(DisplayLine::Diff { line, .. }) =
+                    self.current_display_line().cloned()
+                {
+                    let side = if line.new_line_no.is_some() {
+                        Side::New
+                    } else {
+                        Side::Old
+                    };
+                    self.mode = Mode::AddAnnotation;
+                    self.reset_annotation_input();
+                    self.annotation_range = None;
+                    self.annotation_side = Some(side);
+                } else {
+                    self.message = Some("Move to a diff line to add annotation".to_string());
+                }
+            }
+            CommandId::EditAnnotation => {
+                if let Some((id, content, a_type)) = self
+                    .get_annotation_for_current_line()
+                    .map(|a| (a.id, a.content.clone(), a.annotation_type.clone()))
+                {
+                    self.set_annotation_input(&content);
+                    self.annotation_type = a_type;
+                    self.mode = Mode::EditAnnotation(id);
+                } else {
+                    self.message = Some("Move to an annotation to edit".to_string());
+                }
+            }
+            CommandId::DeleteAnnotation => {
+                self.delete_annotation_at_line()?;
+            }
+            CommandId::ResolveAnnotation => {
+                if let Some(annotation) = self.get_annotation_for_current_line() {
+                    if annotation.resolved_at.is_some() {
+                        self.storage.unresolve_annotation(annotation.id)?;
+                        self.message = Some("Annotation unresolved".to_string());
+                    } else {
+                        self.storage.resolve_annotation(annotation.id)?;
+                        self.message = Some("Annotation resolved".to_string());
+                    }
+                    self.load_all_annotations()?;
+                    self.build_display_lines();
+                } else {
+                    self.message = Some("Move to an annotation to resolve".to_string());
+                }
+            }
+            CommandId::ToggleAnnotationType => {
+                if let Some(annotation) = self.get_annotation_for_current_line() {
+                    let id = annotation.id;
+                    let content = annotation.content.clone();
+                    let new_type = match annotation.annotation_type {
+                        AnnotationType::Comment => AnnotationType::Todo,
+                        AnnotationType::Todo => AnnotationType::Comment,
+                    };
+                    self.storage.update_annotation(id, &content, new_type.clone())?;
+                    self.message = Some(format!("Annotation type: {}", new_type.as_str()));
+                    self.load_all_annotations()?;
+                    self.build_display_lines();
+                } else {
+                    self.annotation_type = match self.annotation_type {
+                        AnnotationType::Comment => AnnotationType::Todo,
+                        AnnotationType::Todo => AnnotationType::Comment,
+                    };
+                    self.message = Some(format!(
+                        "Annotation type: {}",
+                        self.annotation_type.as_str()
+                    ));
+                }
+            }
+            CommandId::SendAnnotationToAi => {
+                self.spawn_ai_for_current_annotation()?;
+            }
+            CommandId::CopySelection => {
+                if let Some(text) = self.selected_text_for_copy() {
+                    self.copy_to_clipboard(&text)?;
+                    let lines = text.lines().count().max(1);
+                    self.message =
+                        Some(format!("Copied {} line{}", lines, if lines == 1 { "" } else { "s" }));
+                } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line() {
+                    self.copy_to_clipboard(&line.content)?;
+                    self.message = Some("Copied line".to_string());
+                } else {
+                    self.message = Some("Move to a diff line or make a selection".to_string());
+                }
+            }
+            CommandId::ToggleSelection => {
+                self.toggle_selection();
+            }
+            CommandId::ToggleAiPane => {
+                self.show_ai_pane = !self.show_ai_pane;
+            }
+            CommandId::ToggleHelp => {
+                self.show_help = !self.show_help;
+                if self.show_help {
+                    self.help_scroll = 0;
+                }
+            }
+            CommandId::ToggleOldDeletions => {
+                self.toggle_old_in_expanded();
+            }
+            CommandId::Quit => {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn handle_commit_input(&mut self, key: KeyEvent) -> Result<bool> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('j') {
+            self.commit_input.insert_newline();
+            return Ok(false);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('d') => {
+                    self.page_down();
+                    return Ok(false);
+                }
+                KeyCode::Char('u') => {
+                    self.page_up();
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            match key.code {
+                KeyCode::Backspace => {
+                    self.commit_input.delete_line_by_head();
+                    return Ok(false);
+                }
+                KeyCode::Delete => {
+                    self.commit_input.delete_line_by_end();
+                    return Ok(false);
+                }
+                KeyCode::Left => {
+                    self.commit_input.move_cursor(CursorMove::Head);
+                    return Ok(false);
+                }
+                KeyCode::Right => {
+                    self.commit_input.move_cursor(CursorMove::End);
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
+        if key.modifiers.contains(KeyModifiers::ALT) {
+            match key.code {
+                KeyCode::Left => {
+                    self.commit_input.move_cursor(CursorMove::WordBack);
+                    return Ok(false);
+                }
+                KeyCode::Right => {
+                    self.commit_input.move_cursor(CursorMove::WordForward);
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Normal;
+                self.commit_input = TextArea::default();
+            }
+            KeyCode::Enter => {
+                let msg = self.commit_input.lines().join("\n");
+                let msg = msg.trim().to_string();
+                if msg.is_empty() {
+                    self.message = Some("Enter a commit message".to_string());
+                    return Ok(false);
+                }
+                let result = self.run_git_commit(&msg);
+                self.commit_input = TextArea::default();
+                self.mode = Mode::Normal;
+                match result {
+                    Ok(()) => {
+                        self.message = Some("Commit created".to_string());
+                        self.reload_diff()?;
+                    }
+                    Err(err) => {
+                        self.message = Some(format!("Commit failed: {}", err));
+                    }
+                }
+            }
+            _ => {
+                self.commit_input.input(Input::from(key));
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn run_git_commit(&self, message: &str) -> Result<(), String> {
+        let output = Command::new("git")
+            .arg("commit")
+            .arg("-m")
+            .arg(message)
+            .current_dir(&self.repo_path)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                Err("git commit failed".to_string())
+            } else {
+                Err(stderr)
+            }
+        }
     }
 
     fn handle_annotation_list_input(&mut self, key: KeyEvent) -> Result<bool> {
@@ -3860,6 +4529,27 @@ impl App {
         out
     }
 
+    fn render_commit_input_with_cursor(&self) -> String {
+        let (row, col) = self.commit_input.cursor();
+        let lines = self.commit_input.lines();
+        let mut out = String::new();
+
+        for (idx, line) in lines.iter().enumerate() {
+            if idx == row {
+                let mut chars: Vec<char> = line.chars().collect();
+                let cursor = col.min(chars.len());
+                chars.insert(cursor, '|');
+                out.push_str(&chars.into_iter().collect::<String>());
+            } else {
+                out.push_str(line);
+            }
+            if idx + 1 < lines.len() {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     /// Adjust scroll to keep cursor visible with vim-like margins
     fn adjust_scroll(&mut self) {
         let scroll_margin = 5; // Keep 5 lines of padding
@@ -4213,13 +4903,13 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     // Expand input area when in annotation mode
     let input_height = match app.mode {
-        Mode::Normal => 1,
-        _ => {
+        Mode::AddAnnotation | Mode::EditAnnotation(_) => {
             let inner_width = f.area().width.saturating_sub(2) as usize;
             let input_with_cursor = app.render_input_with_cursor();
             let line_count = wrapped_line_count(&input_with_cursor, inner_width.max(1));
             (line_count + 2).min(10) as u16
         }
+        _ => 1,
     };
 
     let chunks = Layout::default()
@@ -4279,6 +4969,14 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     if matches!(app.mode, Mode::AnnotationList) {
         render_annotation_list(f, app, theme);
+    }
+
+    if matches!(app.mode, Mode::CommandPalette) {
+        render_command_palette(f, app, theme);
+    }
+
+    if matches!(app.mode, Mode::CommitMessage) {
+        render_commit_popup(f, app, theme);
     }
 
     if app.show_ai_pane {
@@ -5130,7 +5828,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             } else {
                 String::new()
             };
-            let shortcuts = " j/k:nav  n/N:chunk  c:collapse  B:sidebar  a:add  e:edit  r:resolve  ?:help";
+            let shortcuts = " j/k:nav  n/N:chunk  c:collapse  B:sidebar  :cmd  a:add  e:edit  r:resolve  ?:help";
             let content = if let Some(msg) = &app.message {
                 format!("{}{}{}{}", mode_label, msg, ai_suffix, loading_suffix)
             } else {
@@ -5197,6 +5895,19 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
         Mode::GotoLine => {
             let query = app.goto_line_input.as_str();
             let content = format!(" Go to line: {}_  (Enter: go, Esc: cancel)", query);
+            let status = Paragraph::new(content)
+                .style(Style::default().fg(theme.search_fg).bg(theme.search_bg));
+            f.render_widget(status, area);
+        }
+        Mode::CommandPalette => {
+            let query = app.command_query.as_str();
+            let content = format!(" Command: {}_  (Enter: run, Esc: cancel)", query);
+            let status = Paragraph::new(content)
+                .style(Style::default().fg(theme.search_fg).bg(theme.search_bg));
+            f.render_widget(status, area);
+        }
+        Mode::CommitMessage => {
+            let content = " Commit message (Enter: commit, Esc: cancel, Ctrl+j: newline) ".to_string();
             let status = Paragraph::new(content)
                 .style(Style::default().fg(theme.search_fg).bg(theme.search_bg));
             f.render_widget(status, area);
@@ -5663,6 +6374,73 @@ fn render_annotation_list(f: &mut Frame, app: &mut App, theme: Theme) {
     f.render_widget(list, area);
 }
 
+fn render_command_palette(f: &mut Frame, app: &mut App, theme: Theme) {
+    let matches = app.command_matches();
+    let area = centered_rect(50, 35, f.area());
+
+    let mut lines: Vec<Line> = Vec::new();
+    let query = app.command_query.as_str();
+    lines.push(Line::from(Span::styled(
+        format!(" Command: {}_", query),
+        Style::default().fg(theme.search_fg),
+    )));
+    lines.push(Line::from(""));
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No commands",
+            Style::default().fg(theme.line_num),
+        )));
+    } else {
+        let available_height = area.height.saturating_sub(4) as usize;
+        let list_height = available_height.max(1);
+        let mut selected = app.command_selected_idx;
+        if selected >= matches.len() {
+            selected = matches.len().saturating_sub(1);
+        }
+        let start = selected.saturating_sub(list_height / 2);
+        let end = (start + list_height).min(matches.len());
+
+        for (idx, entry) in matches[start..end].iter().enumerate() {
+            let absolute_idx = start + idx;
+            let is_selected = absolute_idx == selected;
+            let mut style = Style::default().fg(theme.help_fg);
+            if is_selected {
+                style = style.bg(theme.header_focus_bg).add_modifier(Modifier::BOLD);
+            }
+            lines.push(Line::from(Span::styled(entry.entry.label, style)));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Command Palette (↑/↓, Enter, Esc) ")
+        .border_style(Style::default().fg(theme.border));
+
+    let popup = Paragraph::new(lines)
+        .style(Style::default().bg(theme.help_bg))
+        .block(block);
+
+    f.render_widget(Clear, area);
+    f.render_widget(popup, area);
+}
+
+fn render_commit_popup(f: &mut Frame, app: &mut App, theme: Theme) {
+    let area = centered_rect(70, 40, f.area());
+    let input = app.render_commit_input_with_cursor();
+    let paragraph = Paragraph::new(input)
+        .style(Style::default().fg(theme.help_fg).bg(theme.help_bg))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Commit message (Enter: commit, Esc: cancel, Ctrl+j: newline) ")
+                .border_style(Style::default().fg(theme.border)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, area);
+    f.render_widget(paragraph, area);
+}
+
 fn render_ai_pane(f: &mut Frame, app: &mut App, theme: Theme) {
     let area = centered_rect(96, 60, f.area());
     let mut lines: Vec<Line> = Vec::new();
@@ -5899,6 +6677,24 @@ fn compute_inline_ranges(old: &str, new: &str) -> (Vec<InlineRange>, Vec<InlineR
 
 fn line_similarity(old: &str, new: &str) -> f32 {
     TextDiff::from_chars(old, new).ratio()
+}
+
+fn fuzzy_score(query: &str, text: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let mut score = 0usize;
+    let mut pos = 0usize;
+    for qc in query.chars() {
+        if let Some((idx, _)) = text[pos..].char_indices().find(|(_, c)| *c == qc) {
+            let abs = pos + idx;
+            score += abs;
+            pos = abs + qc.len_utf8();
+        } else {
+            return None;
+        }
+    }
+    Some(score)
 }
 
 fn merge_inline_ranges(mut ranges: Vec<InlineRange>) -> Vec<InlineRange> {
