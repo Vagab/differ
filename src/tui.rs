@@ -89,6 +89,7 @@ const HELP_TEXT: &[&str] = &[
         "    V         Select lines for range annotation",
         "",
     "  Other:",
+    "    :         Command palette",
     "    ?         Toggle this help",
     "    q         Quit",
     "",
