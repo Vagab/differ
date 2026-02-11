@@ -1363,7 +1363,21 @@ impl App {
         Some((start.min(end), start.max(end)))
     }
 
-    fn selection_range_for_new_side(&self) -> Option<(String, u32, u32)> {
+    fn selection_start_side(&self) -> Option<Side> {
+        let start_idx = self.selection_start?;
+        let DisplayLine::Diff { line, .. } = self.display_lines.get(start_idx)? else {
+            return None;
+        };
+        if line.new_line_no.is_some() {
+            Some(Side::New)
+        } else if line.old_line_no.is_some() {
+            Some(Side::Old)
+        } else {
+            None
+        }
+    }
+
+    fn selection_range_for_side(&self, side: Side) -> Option<(String, u32, u32)> {
         let (start_idx, end_idx) = self.selection_range()?;
         let file_idx = self.selection_file_idx?;
         let file = self.files.get(file_idx)?;
@@ -1378,7 +1392,11 @@ impl App {
 
         for idx in start_idx..=end_idx {
             if let Some(DisplayLine::Diff { line, .. }) = self.display_lines.get(idx) {
-                if let Some(line_no) = line.new_line_no {
+                let line_no = match side {
+                    Side::New => line.new_line_no,
+                    Side::Old => line.old_line_no,
+                };
+                if let Some(line_no) = line_no {
                     start_line = Some(start_line.map_or(line_no, |s| s.min(line_no)));
                     end_line = Some(end_line.map_or(line_no, |e| e.max(line_no)));
                 }
@@ -1389,6 +1407,12 @@ impl App {
             (Some(start), Some(end)) => Some((file_path, start, end)),
             _ => None,
         }
+    }
+
+    fn selection_range_for_annotation(&self) -> Option<(String, Side, u32, u32)> {
+        let side = self.selection_start_side()?;
+        let (file_path, start, end) = self.selection_range_for_side(side.clone())?;
+        Some((file_path, side, start, end))
     }
 
     fn selected_text_for_copy(&self) -> Option<String> {
@@ -2168,13 +2192,13 @@ impl App {
             // Annotations
             KeyCode::Char('a') => {
                 if self.selection_active {
-                    if let Some((_, start, end)) = self.selection_range_for_new_side() {
+                    if let Some((_, side, start, end)) = self.selection_range_for_annotation() {
                         self.mode = Mode::AddAnnotation;
                         self.reset_annotation_input();
                         self.annotation_range = Some((start, end));
-                        self.annotation_side = Some(Side::New);
+                        self.annotation_side = Some(side);
                     } else {
-                        self.message = Some("Selection has no new/context lines".to_string());
+                        self.message = Some("Selection has no lines for annotation".to_string());
                     }
                 } else if let Some(DisplayLine::Diff { line, .. }) =
                     self.current_display_line().cloned()
@@ -2500,16 +2524,12 @@ impl App {
             self.selection_file_idx = None;
             self.selection_hunk_idx = None;
             self.message = Some("Selection cleared".to_string());
-        } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line() {
-            if line.new_line_no.is_some() {
-                self.selection_active = true;
-                self.selection_start = Some(self.current_line_idx);
-                self.selection_file_idx = self.file_idx_for_line(self.current_line_idx);
-                self.selection_hunk_idx = self.hunk_idx_for_line(self.current_line_idx);
-                self.message = Some("Selecting lines".to_string());
-            } else {
-                self.message = Some("Selection only works on new/context lines".to_string());
-            }
+        } else if matches!(self.current_display_line(), Some(DisplayLine::Diff { .. })) {
+            self.selection_active = true;
+            self.selection_start = Some(self.current_line_idx);
+            self.selection_file_idx = self.file_idx_for_line(self.current_line_idx);
+            self.selection_hunk_idx = self.hunk_idx_for_line(self.current_line_idx);
+            self.message = Some("Selecting lines".to_string());
         } else {
             self.message = Some("Move to a diff line to start selection".to_string());
         }
@@ -2689,7 +2709,7 @@ impl App {
 
     fn can_add_annotation(&self) -> bool {
         if self.selection_active {
-            return self.selection_range_for_new_side().is_some();
+            return self.selection_range_for_annotation().is_some();
         }
         matches!(self.current_display_line(), Some(DisplayLine::Diff { .. }))
     }
@@ -3045,13 +3065,13 @@ impl App {
             }
             CommandId::AddAnnotation => {
                 if self.selection_active {
-                    if let Some((_, start, end)) = self.selection_range_for_new_side() {
+                    if let Some((_, side, start, end)) = self.selection_range_for_annotation() {
                         self.mode = Mode::AddAnnotation;
                         self.reset_annotation_input();
                         self.annotation_range = Some((start, end));
-                        self.annotation_side = Some(Side::New);
+                        self.annotation_side = Some(side);
                     } else {
-                        self.message = Some("Selection has no new/context lines".to_string());
+                        self.message = Some("Selection has no lines for annotation".to_string());
                     }
                 } else if let Some(DisplayLine::Diff { line, .. }) =
                     self.current_display_line().cloned()
