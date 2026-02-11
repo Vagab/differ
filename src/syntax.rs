@@ -3,13 +3,13 @@
 //! Highlights full files and returns per-line highlight ranges.
 
 use anyhow::Result;
+use std::str::FromStr;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, Highlighter, HighlightState, ScopeSelectors};
 use syntect::highlighting::HighlightIterator;
+use syntect::highlighting::{FontStyle, HighlightState, Highlighter, ScopeSelectors};
 use syntect::parsing::{ParseState, ScopeStack};
 use syntect::util::LinesWithEndings;
 use syntect_assets::assets::HighlightingAssets;
-use std::str::FromStr;
 
 /// A simple style used for diff highlighting (foreground + modifiers).
 #[derive(Debug, Clone, Copy)]
@@ -43,8 +43,8 @@ impl SyntaxHighlighter {
             .map(|s| s.to_string())
             .or_else(|| std::env::var("BAT_THEME").ok())
             .unwrap_or_else(|| HighlightingAssets::default_theme().to_string());
-        let string_selector =
-            ScopeSelectors::from_str("string").unwrap_or_else(|_| ScopeSelectors::from_str("text").unwrap());
+        let string_selector = ScopeSelectors::from_str("string")
+            .unwrap_or_else(|_| ScopeSelectors::from_str("text").unwrap());
         Ok(Self {
             assets,
             theme_name,

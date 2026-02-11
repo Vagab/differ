@@ -22,7 +22,11 @@ pub enum DiffMode {
     /// Changes since merge-base - `git diff <from>...<to>`
     MergeBase { from: String, to: String },
     /// External diff mode - git passes old and new file paths directly
-    ExternalDiff { path: String, old_file: String, new_file: String },
+    ExternalDiff {
+        path: String,
+        old_file: String,
+        new_file: String,
+    },
 }
 
 /// Represents a changed file in a diff
@@ -127,9 +131,11 @@ impl DiffEngine {
                 let range = format!("{}...{}", from, to);
                 self.diff_via_git_cmd(&[&range], paths)
             }
-            DiffMode::ExternalDiff { path, old_file, new_file } => {
-                self.diff_external_files(path, old_file, new_file)
-            }
+            DiffMode::ExternalDiff {
+                path,
+                old_file,
+                new_file,
+            } => self.diff_external_files(path, old_file, new_file),
         }
     }
 
@@ -159,7 +165,11 @@ impl DiffEngine {
                 let range = format!("{}...{}", from, to);
                 self.diff_via_git_cmd_stream(&[&range], paths, &mut on_file)
             }
-            DiffMode::ExternalDiff { path, old_file, new_file } => {
+            DiffMode::ExternalDiff {
+                path,
+                old_file,
+                new_file,
+            } => {
                 let files = self.diff_external_files(path, old_file, new_file)?;
                 for file in files {
                     on_file(file)?;
@@ -238,7 +248,10 @@ impl DiffEngine {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = cmd.spawn().context("Failed to run git diff")?;
-        let stdout = child.stdout.take().context("Failed to capture git diff stdout")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Failed to capture git diff stdout")?;
         let mut reader = BufReader::new(stdout);
         self.parse_stream(&mut reader, on_file)?;
 
@@ -284,7 +297,11 @@ impl DiffEngine {
                 old_path: None,
                 new_path: Some(path.clone()),
                 status: FileStatus::Added,
-                hunks: if hunk.lines.is_empty() { Vec::new() } else { vec![hunk] },
+                hunks: if hunk.lines.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![hunk]
+                },
             });
         }
         Ok(files)
@@ -535,7 +552,12 @@ impl DiffEngine {
     }
 
     /// Diff two files directly (for git external diff mode)
-    fn diff_external_files(&self, path: &str, old_file: &str, new_file: &str) -> Result<Vec<DiffFile>> {
+    fn diff_external_files(
+        &self,
+        path: &str,
+        old_file: &str,
+        new_file: &str,
+    ) -> Result<Vec<DiffFile>> {
         let old_content = std::fs::read_to_string(old_file).unwrap_or_default();
         let new_content = std::fs::read_to_string(new_file).unwrap_or_default();
 
@@ -572,7 +594,10 @@ impl DiffEngine {
         let mut new_idx = 0;
 
         while old_idx < old_lines.len() || new_idx < new_lines.len() {
-            if old_idx < old_lines.len() && new_idx < new_lines.len() && old_lines[old_idx] == new_lines[new_idx] {
+            if old_idx < old_lines.len()
+                && new_idx < new_lines.len()
+                && old_lines[old_idx] == new_lines[new_idx]
+            {
                 // Context line
                 lines.push(DiffLine {
                     kind: LineKind::Context,
@@ -584,7 +609,10 @@ impl DiffEngine {
                 });
                 old_idx += 1;
                 new_idx += 1;
-            } else if new_idx < new_lines.len() && (old_idx >= old_lines.len() || !old_lines[old_idx..].contains(&new_lines[new_idx])) {
+            } else if new_idx < new_lines.len()
+                && (old_idx >= old_lines.len()
+                    || !old_lines[old_idx..].contains(&new_lines[new_idx]))
+            {
                 // Addition
                 lines.push(DiffLine {
                     kind: LineKind::Addition,
@@ -622,7 +650,6 @@ impl DiffEngine {
 
         Ok(hunks)
     }
-
 }
 
 /// Parse "diff --git a/path b/path" line
@@ -631,7 +658,10 @@ fn parse_diff_git_line(line: &str) -> (Option<String>, Option<String>) {
     let line = line.strip_prefix("diff --git ").unwrap_or(line);
     let parts: Vec<&str> = line.splitn(2, " b/").collect();
 
-    let mut old_path = parts.first().and_then(|p| p.strip_prefix("a/")).map(String::from);
+    let mut old_path = parts
+        .first()
+        .and_then(|p| p.strip_prefix("a/"))
+        .map(String::from);
     let mut new_path = parts.get(1).map(|p| p.to_string());
 
     if old_path.as_deref() == Some("dev/null") {
@@ -678,8 +708,7 @@ fn parse_range(s: &str) -> Option<(u32, u32)> {
 
 /// Find the git repository root from a path
 pub fn find_repo_root(start: &Path) -> Result<PathBuf> {
-    let repo = Repository::discover(start)
-        .context("Not in a git repository")?;
+    let repo = Repository::discover(start).context("Not in a git repository")?;
 
     if let Some(workdir) = repo.workdir() {
         if workdir.exists() {

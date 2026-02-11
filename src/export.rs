@@ -6,6 +6,54 @@ use crate::storage::{Annotation, AnnotationType, Side, Storage};
 use anyhow::Result;
 use std::collections::BTreeMap;
 
+fn annotation_code_excerpt(annotation: &Annotation) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if !annotation.context_before.is_empty() {
+        lines.extend(
+            annotation
+                .context_before
+                .lines()
+                .map(|line| line.to_string()),
+        );
+    }
+    if !annotation.anchor_text.is_empty() {
+        lines.push(annotation.anchor_text.clone());
+    }
+    if !annotation.context_after.is_empty() {
+        lines.extend(
+            annotation
+                .context_after
+                .lines()
+                .map(|line| line.to_string()),
+        );
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn append_markdown_code_context(output: &mut String, annotation: &Annotation) {
+    let Some(code_excerpt) = annotation_code_excerpt(annotation) else {
+        return;
+    };
+
+    let label = match annotation.side {
+        Side::Old => "Old code context",
+        Side::New => "Code context",
+    };
+
+    output.push_str(&format!("**{}:**\n\n", label));
+    output.push_str("```text\n");
+    output.push_str(&code_excerpt);
+    if !code_excerpt.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str("```\n\n");
+}
+
 /// Exports annotations for a repository in markdown format
 pub fn export_markdown(storage: &Storage, repo_id: i64) -> Result<String> {
     let annotations = storage.list_annotations(repo_id, None)?;
@@ -45,19 +93,21 @@ pub fn export_markdown(storage: &Storage, repo_id: i64) -> Result<String> {
                 AnnotationType::Todo => {
                     let mut lines = annotation.content.lines();
                     let first = lines.next().unwrap_or("");
-                    output.push_str(&format!("- [ ] {}{}: {}\n", line_range, side_indicator, first));
+                    output.push_str(&format!(
+                        "- [ ] {}{}: {}\n",
+                        line_range, side_indicator, first
+                    ));
                     for line in lines {
                         output.push_str(&format!("  {}\n", line));
                     }
                     output.push('\n');
+                    append_markdown_code_context(&mut output, annotation);
                 }
                 AnnotationType::Comment => {
-                    output.push_str(&format!(
-                        "### 💬 {}{}\n\n",
-                        line_range, side_indicator
-                    ));
+                    output.push_str(&format!("### 💬 {}{}\n\n", line_range, side_indicator));
                     output.push_str(&annotation.content);
                     output.push_str("\n\n");
+                    append_markdown_code_context(&mut output, annotation);
                 }
             }
 
@@ -82,19 +132,33 @@ pub fn export_json(storage: &Storage, repo_id: i64) -> Result<String> {
         side: String,
         annotation_type: String,
         content: String,
+        anchor_line: u32,
+        anchor_text: String,
+        context_before: String,
+        context_after: String,
+        code_excerpt: Option<String>,
         commit_sha: Option<String>,
     }
 
     let export: Vec<ExportAnnotation> = annotations
         .into_iter()
-        .map(|a| ExportAnnotation {
-            file_path: a.file_path,
-            line: a.start_line,
-            end_line: a.end_line,
-            side: a.side.as_str().to_string(),
-            annotation_type: a.annotation_type.as_str().to_string(),
-            content: a.content,
-            commit_sha: a.commit_sha,
+        .map(|a| {
+            let code_excerpt = annotation_code_excerpt(&a);
+
+            ExportAnnotation {
+                file_path: a.file_path,
+                line: a.start_line,
+                end_line: a.end_line,
+                side: a.side.as_str().to_string(),
+                annotation_type: a.annotation_type.as_str().to_string(),
+                content: a.content,
+                anchor_line: a.anchor_line,
+                anchor_text: a.anchor_text,
+                context_before: a.context_before,
+                context_after: a.context_after,
+                code_excerpt,
+                commit_sha: a.commit_sha,
+            }
         })
         .collect();
 
@@ -119,11 +183,7 @@ impl ExportFormat {
 }
 
 /// Main export function that handles format selection
-pub fn export(
-    storage: &Storage,
-    repo_id: i64,
-    format: ExportFormat,
-) -> Result<String> {
+pub fn export(storage: &Storage, repo_id: i64, format: ExportFormat) -> Result<String> {
     match format {
         ExportFormat::Markdown => export_markdown(storage, repo_id),
         ExportFormat::Json => export_json(storage, repo_id),
@@ -190,6 +250,41 @@ mod tests {
         assert!(md.contains("- [ ] L10: Refactor this function"));
         assert!(md.contains("Add error handling here"));
         assert!(md.contains("L5-10"));
+        assert!(md.contains("**Code context:**"));
+    }
+
+    #[test]
+    fn test_export_markdown_old_side_context() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = Storage::open(&db_path).unwrap();
+
+        let repo_id = storage
+            .get_or_create_repo(Path::new("/test/repo"), Some("test"))
+            .unwrap();
+
+        storage
+            .add_annotation(
+                repo_id,
+                "src/legacy.rs",
+                None,
+                Side::Old,
+                42,
+                None,
+                AnnotationType::Comment,
+                "Why was this removed?",
+                42,
+                "let removed = true;",
+                "",
+                "",
+            )
+            .unwrap();
+
+        let md = export_markdown(&storage, repo_id).unwrap();
+
+        assert!(md.contains("L42 (deleted code)"));
+        assert!(md.contains("**Old code context:**"));
+        assert!(md.contains("let removed = true;"));
     }
 
     #[test]
@@ -225,5 +320,8 @@ mod tests {
         assert!(parsed.is_array());
         assert_eq!(parsed.as_array().unwrap().len(), 1);
         assert_eq!(parsed[0]["content"], "Test annotation");
+        assert_eq!(parsed[0]["anchor_line"], 1);
+        assert_eq!(parsed[0]["anchor_text"], "Test annotation");
+        assert_eq!(parsed[0]["code_excerpt"], "Test annotation");
     }
 }

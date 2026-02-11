@@ -11,11 +11,16 @@ use crate::storage::{Annotation, AnnotationType, Side, Storage};
 use crate::syntax::SyntaxHighlighter;
 use anyhow::{anyhow, Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind, DisableMouseCapture, EnableMouseCapture},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use notify::{event::ModifyKind, Event as FsEventRaw, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{
+    event::ModifyKind, Event as FsEventRaw, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -24,19 +29,19 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
+use similar::{ChangeTag, TextDiff};
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Stdout, Write};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::mem;
 use std::time::{Duration, Instant};
-use std::collections::VecDeque;
 use tui_textarea::{CursorMove, Input, TextArea};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-use similar::{ChangeTag, TextDiff};
 
 const REATTACH_CONTEXT_LINES: usize = 2;
 const STREAM_BATCH_FILES: usize = 3;
@@ -79,27 +84,27 @@ const HELP_TEXT: &[&str] = &[
     "    @         Send annotation to AI",
     "    P         Toggle AI pane",
     "    A         Annotation list",
-        "",
-        "  Annotations:",
-        "    a         Add annotation at current line",
-        "    e         Edit annotation at current line",
-        "    d         Delete annotation at current line",
-        "    r         Resolve annotation at current line",
-        "    t         Toggle annotation type (comment/todo)",
-        "    V         Select lines for range annotation",
-        "",
+    "",
+    "  Annotations:",
+    "    a         Add annotation at current line",
+    "    e         Edit annotation at current line",
+    "    d         Delete annotation at current line",
+    "    r         Resolve annotation at current line",
+    "    t         Toggle annotation type (comment/todo)",
+    "    V         Select lines for range annotation",
+    "",
     "  Other:",
     "    :         Command palette",
     "    ?         Toggle this help",
     "    q         Quit",
     "",
-        "  In annotation mode:",
-        "    Enter     Save annotation",
-        "    Ctrl+j    Add newline",
-        "    Ctrl+d/u  Scroll diff",
-        "    PgUp/PgDn Scroll diff",
-        "    Ctrl+t    Toggle annotation type",
-        "    Arrows    Move cursor",
+    "  In annotation mode:",
+    "    Enter     Save annotation",
+    "    Ctrl+j    Add newline",
+    "    Ctrl+d/u  Scroll diff",
+    "    PgUp/PgDn Scroll diff",
+    "    Ctrl+t    Toggle annotation type",
+    "    Arrows    Move cursor",
     "    Home/End  Line start/end",
     "    Del/BS    Delete",
     "    Esc       Cancel",
@@ -132,10 +137,7 @@ pub enum DisplayLine {
         highlights: Vec<HighlightRange>,
     },
     /// End of hunk marker for spacing
-    HunkEnd {
-        file_idx: usize,
-        hunk_idx: usize,
-    },
+    HunkEnd { file_idx: usize, hunk_idx: usize },
     /// A diff line (addition, deletion, or context)
     Diff {
         line: DiffLine,
@@ -308,8 +310,14 @@ struct CommandMatch {
 
 #[derive(Debug)]
 enum DiffStreamEvent {
-    File { generation: u64, file: DiffFile },
-    Done { generation: u64, error: Option<String> },
+    File {
+        generation: u64,
+        file: DiffFile,
+    },
+    Done {
+        generation: u64,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -353,8 +361,8 @@ enum AiEvent {
 #[derive(Debug, Clone)]
 struct SearchState {
     query: String,
-    matches: Vec<usize>,      // indices into display_lines
-    current_match: usize,     // index into matches
+    matches: Vec<usize>,  // indices into display_lines
+    current_match: usize, // index into matches
     search_type: SearchType,
 }
 
@@ -629,8 +637,7 @@ impl App {
                 .unwrap_or_else(|| "<unknown>".to_string());
 
             let include_spacer = has_any && expanded_file.is_none();
-            let file_lines =
-                self.build_file_lines(file_idx, &file, &file_path, include_spacer);
+            let file_lines = self.build_file_lines(file_idx, &file, &file_path, include_spacer);
             let start = self.display_lines.len();
             self.display_lines.extend(file_lines);
             let len = self.display_lines.len().saturating_sub(start);
@@ -743,9 +750,9 @@ impl App {
             return (vec![Vec::new(); lines.len()], false);
         }
         let line_refs: Vec<&str> = lines.iter().map(|line| line.content.as_str()).collect();
-        let (per_line, ends_in_string) =
-            self.syntax_highlighter
-                .highlight_lines_with_string_state(&line_refs, file_path);
+        let (per_line, ends_in_string) = self
+            .syntax_highlighter
+            .highlight_lines_with_string_state(&line_refs, file_path);
         let converted = per_line
             .into_iter()
             .map(|line_hl| {
@@ -772,16 +779,12 @@ impl App {
         if self.expanded_highlight_files.contains(file_path) {
             return;
         }
-        if !self
-            .full_highlight_pending
-            .insert(file_path.to_string())
-        {
+        if !self.full_highlight_pending.insert(file_path.to_string()) {
             return;
         }
         if let Some((current_path, _)) = self.current_file_info() {
             if current_path == file_path {
-                self.full_highlight_queue
-                    .push_front(file_path.to_string());
+                self.full_highlight_queue.push_front(file_path.to_string());
             } else {
                 self.full_highlight_queue.push_back(file_path.to_string());
             }
@@ -821,8 +824,12 @@ impl App {
                     Ok(h) => h,
                     Err(_) => return,
                 };
-                let content =
-                    load_new_file_content_for_highlight(&repo_path, &diff_mode, &file, &file_key_clone);
+                let content = load_new_file_content_for_highlight(
+                    &repo_path,
+                    &diff_mode,
+                    &file,
+                    &file_key_clone,
+                );
                 let map = content
                     .as_ref()
                     .map(|c| build_highlight_map_with(&mut highlighter, c, &file_key_clone))
@@ -851,7 +858,8 @@ impl App {
         let mut need_new = matches!(file.status, FileStatus::Added);
         if full_file {
             need_old = !matches!(file.status, FileStatus::Added) && old_path.is_some();
-            need_new = !matches!(file.status, FileStatus::Deleted) && new_path.or(old_path).is_some();
+            need_new =
+                !matches!(file.status, FileStatus::Deleted) && new_path.or(old_path).is_some();
         } else if !need_old || !need_new {
             for hunk in &file.hunks {
                 for line in &hunk.lines {
@@ -977,13 +985,22 @@ impl App {
             } else {
                 compute_intraline_ranges(&hunk.lines)
             };
-            let (hunk_highlights, hunk_needs_full) = self.highlight_hunk_lines(file_path, &hunk.lines);
+            let (hunk_highlights, hunk_needs_full) =
+                self.highlight_hunk_lines(file_path, &hunk.lines);
             if hunk_needs_full {
                 needs_full_highlight = true;
             }
             // Count additions and deletions in this hunk
-            let additions = hunk.lines.iter().filter(|l| l.kind == LineKind::Addition).count();
-            let deletions = hunk.lines.iter().filter(|l| l.kind == LineKind::Deletion).count();
+            let additions = hunk
+                .lines
+                .iter()
+                .filter(|l| l.kind == LineKind::Addition)
+                .count();
+            let deletions = hunk
+                .lines
+                .iter()
+                .filter(|l| l.kind == LineKind::Deletion)
+                .count();
 
             // Add spacing before hunk
             out.push(DisplayLine::Spacer);
@@ -991,10 +1008,9 @@ impl App {
             if let Some(text) = hunk.header.as_ref().filter(|t| !t.trim().is_empty()) {
                 let clean = text.trim().trim_start_matches("@@").trim().to_string();
                 let highlights = if self.config.syntax_highlighting {
-                    let mut lines = self.syntax_highlighter.highlight_file(
-                        &format!("{}\n", clean),
-                        file_path,
-                    );
+                    let mut lines = self
+                        .syntax_highlighter
+                        .highlight_file(&format!("{}\n", clean), file_path);
                     let line_hls = lines.pop().unwrap_or_default();
                     line_hls
                         .into_iter()
@@ -1030,7 +1046,8 @@ impl App {
                     highlighted_line.inline_ranges = ranges.clone();
                 }
                 let mut applied = false;
-                if let (Some(map), Some(line_no)) = (full_map.as_ref(), highlighted_line.new_line_no)
+                if let (Some(map), Some(line_no)) =
+                    (full_map.as_ref(), highlighted_line.new_line_no)
                 {
                     if let Some(line_hl) = map.get(line_no.saturating_sub(1) as usize) {
                         highlighted_line.highlights = line_hl.clone();
@@ -1086,8 +1103,14 @@ impl App {
             } else {
                 compute_intraline_ranges(&hunk.lines)
             };
-            let old_range = hunk.old_start..=hunk.old_start.saturating_add(hunk.old_lines.saturating_sub(1));
-            let new_range = hunk.new_start..=hunk.new_start.saturating_add(hunk.new_lines.saturating_sub(1));
+            let old_range = hunk.old_start
+                ..=hunk
+                    .old_start
+                    .saturating_add(hunk.old_lines.saturating_sub(1));
+            let new_range = hunk.new_start
+                ..=hunk
+                    .new_start
+                    .saturating_add(hunk.new_lines.saturating_sub(1));
             hunk_ranges.push((old_range, new_range));
             let mut last_new_line: u32 = hunk.new_start.saturating_sub(1);
             for (line_idx, line) in hunk.lines.iter().enumerate() {
@@ -1122,8 +1145,14 @@ impl App {
         let file_content = std::fs::read_to_string(&full_path).unwrap_or_default();
         let file_lines: Vec<&str> = file_content.lines().collect();
         let (file_key, old_key, _new_key) = Self::file_highlight_keys(file);
-        let old_path = file.old_path.as_ref().map(|p| p.to_string_lossy().to_string());
-        let new_path = file.new_path.as_ref().map(|p| p.to_string_lossy().to_string());
+        let old_path = file
+            .old_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
+        let new_path = file
+            .new_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string());
 
         let new_map = if self.config.syntax_highlighting {
             if !self.expanded_highlight_files.contains(&file_key) {
@@ -1148,7 +1177,8 @@ impl App {
             } else {
                 let (computed_old, _computed_new) =
                     self.load_highlight_maps(file, old_path.as_deref(), new_path.as_deref(), true);
-                self.syntax_cache_old.insert(old_key.clone(), computed_old.clone());
+                self.syntax_cache_old
+                    .insert(old_key.clone(), computed_old.clone());
                 old_map = computed_old;
             }
         }
@@ -1171,9 +1201,9 @@ impl App {
                             inline_ranges: Vec::new(),
                         };
                         self.highlight_from_maps(&mut del_line, &old_map, &[]);
-                        let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
-                            old_range.contains(old_no)
-                        });
+                        let hunk_idx = hunk_ranges
+                            .iter()
+                            .position(|(old_range, _)| old_range.contains(old_no));
                         out.push(DisplayLine::Diff {
                             line: del_line,
                             file_idx,
@@ -1213,9 +1243,9 @@ impl App {
                     .collect();
             }
 
-            let hunk_idx = hunk_ranges.iter().position(|(_, new_range)| {
-                new_range.contains(&line_no)
-            });
+            let hunk_idx = hunk_ranges
+                .iter()
+                .position(|(_, new_range)| new_range.contains(&line_no));
             out.push(DisplayLine::Diff {
                 line: diff_line.clone(),
                 file_idx,
@@ -1241,9 +1271,9 @@ impl App {
                         inline_ranges: Vec::new(),
                     };
                     self.highlight_from_maps(&mut del_line, &old_map, &[]);
-                    let hunk_idx = hunk_ranges.iter().position(|(old_range, _)| {
-                        old_range.contains(old_no)
-                    });
+                    let hunk_idx = hunk_ranges
+                        .iter()
+                        .position(|(old_range, _)| old_range.contains(old_no));
                     out.push(DisplayLine::Diff {
                         line: del_line,
                         file_idx,
@@ -1278,7 +1308,9 @@ impl App {
             if annotation.file_path == file_path
                 && annotation.side == side
                 && annotation.start_line <= line_no
-                && annotation.end_line.map_or(annotation.start_line == line_no, |e| e >= line_no)
+                && annotation
+                    .end_line
+                    .map_or(annotation.start_line == line_no, |e| e >= line_no)
             {
                 if annotation.start_line != line_no {
                     continue;
@@ -1306,7 +1338,9 @@ impl App {
             if a.file_path != file_path || a.side != side {
                 continue;
             }
-            if a.start_line <= line_no && a.end_line.map_or(a.start_line == line_no, |e| e >= line_no) {
+            if a.start_line <= line_no
+                && a.end_line.map_or(a.start_line == line_no, |e| e >= line_no)
+            {
                 if a.start_line == line_no {
                     return Some('●');
                 }
@@ -1427,10 +1461,9 @@ impl App {
         }
 
         let highlights = match line.kind {
-            LineKind::Addition | LineKind::Context => {
-                line.new_line_no
-                    .and_then(|n| new_map.get(n.saturating_sub(1) as usize))
-            }
+            LineKind::Addition | LineKind::Context => line
+                .new_line_no
+                .and_then(|n| new_map.get(n.saturating_sub(1) as usize)),
             LineKind::Deletion => line
                 .old_line_no
                 .and_then(|n| old_map.get(n.saturating_sub(1) as usize)),
@@ -1469,7 +1502,9 @@ impl App {
 
     fn hunk_idx_for_line(&self, idx: usize) -> Option<usize> {
         match self.display_lines.get(idx) {
-            Some(DisplayLine::Diff { hunk_idx: Some(h), .. }) => Some(*h),
+            Some(DisplayLine::Diff {
+                hunk_idx: Some(h), ..
+            }) => Some(*h),
             _ => None,
         }
     }
@@ -1477,7 +1512,10 @@ impl App {
     /// Find the index of the current file's header in display_lines
     fn find_current_file_header_idx(&self) -> Option<usize> {
         for i in (0..=self.current_line_idx).rev() {
-            if matches!(self.display_lines.get(i), Some(DisplayLine::FileHeader { .. })) {
+            if matches!(
+                self.display_lines.get(i),
+                Some(DisplayLine::FileHeader { .. })
+            ) {
                 return Some(i);
             }
         }
@@ -1497,7 +1535,9 @@ impl App {
 
         // Check if any match corresponds to this file's header
         for &match_idx in &search.matches {
-            if let Some(DisplayLine::FileHeader { file_idx: idx, .. }) = self.display_lines.get(match_idx) {
+            if let Some(DisplayLine::FileHeader { file_idx: idx, .. }) =
+                self.display_lines.get(match_idx)
+            {
                 if *idx == file_idx {
                     return true;
                 }
@@ -1508,19 +1548,26 @@ impl App {
 
     /// Check if a display line index is a search match
     fn is_search_match(&self, idx: usize) -> bool {
-        self.search.as_ref().map(|s| s.matches.contains(&idx)).unwrap_or(false)
+        self.search
+            .as_ref()
+            .map(|s| s.matches.contains(&idx))
+            .unwrap_or(false)
     }
 
     /// Check if a display line index is the current search match
     fn is_current_search_match(&self, idx: usize) -> bool {
-        self.search.as_ref().map(|s| {
-            s.matches.get(s.current_match) == Some(&idx)
-        }).unwrap_or(false)
+        self.search
+            .as_ref()
+            .map(|s| s.matches.get(s.current_match) == Some(&idx))
+            .unwrap_or(false)
     }
 
     /// Get annotation for the current diff line
     fn get_annotation_for_current_line(&self) -> Option<&Annotation> {
-        if let Some(DisplayLine::Diff { line, file_path, .. }) = self.current_display_line() {
+        if let Some(DisplayLine::Diff {
+            line, file_path, ..
+        }) = self.current_display_line()
+        {
             let line_no = line.new_line_no.or(line.old_line_no).unwrap_or(0);
             let side = if line.new_line_no.is_some() {
                 Side::New
@@ -1539,7 +1586,10 @@ impl App {
     }
 
     fn add_annotation(&mut self) -> Result<()> {
-        if let Some(DisplayLine::Diff { line, file_path, .. }) = self.current_display_line().cloned() {
+        if let Some(DisplayLine::Diff {
+            line, file_path, ..
+        }) = self.current_display_line().cloned()
+        {
             let (start_line, end_line) = self.annotation_range.unwrap_or_else(|| {
                 let line_no = line.new_line_no.or(line.old_line_no).unwrap_or(1);
                 (line_no, line_no)
@@ -1556,10 +1606,20 @@ impl App {
                 if let Some(lines) = self.read_file_lines(&file_path) {
                     Self::build_anchor(&lines, start_line)
                 } else {
-                    (start_line, line.content.clone(), String::new(), String::new())
+                    (
+                        start_line,
+                        line.content.clone(),
+                        String::new(),
+                        String::new(),
+                    )
                 }
             } else {
-                (start_line, line.content.clone(), String::new(), String::new())
+                (
+                    start_line,
+                    line.content.clone(),
+                    String::new(),
+                    String::new(),
+                )
             };
 
             let content = self.annotation_text();
@@ -1569,7 +1629,11 @@ impl App {
                 None, // commit_sha
                 side.clone(),
                 start_line,
-                if start_line == end_line { None } else { Some(end_line) },
+                if start_line == end_line {
+                    None
+                } else {
+                    Some(end_line)
+                },
                 self.annotation_type.clone(),
                 &content,
                 anchor_line,
@@ -1587,7 +1651,11 @@ impl App {
                 commit_sha: None,
                 side,
                 start_line,
-                end_line: if start_line == end_line { None } else { Some(end_line) },
+                end_line: if start_line == end_line {
+                    None
+                } else {
+                    Some(end_line)
+                },
                 annotation_type: self.annotation_type.clone(),
                 content,
                 anchor_line,
@@ -1663,10 +1731,10 @@ impl App {
         match self.display_lines.get(idx) {
             Some(DisplayLine::FileHeader { path, .. }) => !self.collapsed_files.contains(path),
             Some(DisplayLine::Annotation { .. })
-                | Some(DisplayLine::HunkHeader { .. })
-                | Some(DisplayLine::HunkContext { .. })
-                | Some(DisplayLine::HunkEnd { .. })
-                | Some(DisplayLine::Spacer) => true,
+            | Some(DisplayLine::HunkHeader { .. })
+            | Some(DisplayLine::HunkContext { .. })
+            | Some(DisplayLine::HunkEnd { .. })
+            | Some(DisplayLine::Spacer) => true,
             _ => false,
         }
     }
@@ -1800,7 +1868,9 @@ impl App {
     }
 
     fn max_help_scroll(&self) -> usize {
-        HELP_TEXT.len().saturating_sub(self.help_visible_height.max(1))
+        HELP_TEXT
+            .len()
+            .saturating_sub(self.help_visible_height.max(1))
     }
 
     /// Jump to next file header
@@ -2020,7 +2090,6 @@ impl App {
                 self.open_command_palette();
             }
 
-
             // Toggle views
             KeyCode::Char('c') => {
                 self.toggle_collapse_current_file();
@@ -2069,7 +2138,11 @@ impl App {
                 self.side_by_side = !self.side_by_side;
                 self.message = Some(format!(
                     "View: {}",
-                    if self.side_by_side { "side-by-side" } else { "unified" }
+                    if self.side_by_side {
+                        "side-by-side"
+                    } else {
+                        "unified"
+                    }
                 ));
             }
             KeyCode::Char('x') => {
@@ -2079,7 +2152,11 @@ impl App {
                 if let Some(text) = self.selected_text_for_copy() {
                     self.copy_to_clipboard(&text)?;
                     let lines = text.lines().count().max(1);
-                    self.message = Some(format!("Copied {} line{}", lines, if lines == 1 { "" } else { "s" }));
+                    self.message = Some(format!(
+                        "Copied {} line{}",
+                        lines,
+                        if lines == 1 { "" } else { "s" }
+                    ));
                 } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line() {
                     self.copy_to_clipboard(&line.content)?;
                     self.message = Some("Copied line".to_string());
@@ -2099,7 +2176,9 @@ impl App {
                     } else {
                         self.message = Some("Selection has no new/context lines".to_string());
                     }
-                } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line().cloned() {
+                } else if let Some(DisplayLine::Diff { line, .. }) =
+                    self.current_display_line().cloned()
+                {
                     let side = if line.new_line_no.is_some() {
                         Side::New
                     } else {
@@ -2134,7 +2213,8 @@ impl App {
                         AnnotationType::Comment => AnnotationType::Todo,
                         AnnotationType::Todo => AnnotationType::Comment,
                     };
-                    self.storage.update_annotation(id, &content, new_type.clone())?;
+                    self.storage
+                        .update_annotation(id, &content, new_type.clone())?;
                     self.message = Some(format!("Annotation type: {}", new_type.as_str()));
                     self.load_all_annotations()?;
                     self.build_display_lines();
@@ -2367,12 +2447,14 @@ impl App {
                         if self.expanded_file.is_some() {
                             self.message = Some(format!("Line {} not found", line_no));
                         } else {
-                            self.message = Some("Line jump is available in expanded view (x)".to_string());
+                            self.message =
+                                Some("Line jump is available in expanded view (x)".to_string());
                         }
                     }
                 } else {
                     if self.expanded_file.is_none() {
-                        self.message = Some("Line jump is available in expanded view (x)".to_string());
+                        self.message =
+                            Some("Line jump is available in expanded view (x)".to_string());
                     } else {
                         self.message = Some("Enter a line number".to_string());
                     }
@@ -2764,10 +2846,13 @@ impl App {
         match id {
             CommandId::GotoLine | CommandId::ToggleOldDeletions => self.expanded_file.is_some(),
             CommandId::FocusSidebar => self.sidebar_open,
-            CommandId::StageHunk => matches!(self.diff_mode, DiffMode::Unstaged | DiffMode::Staged)
-                && self.current_hunk_ref().is_some(),
-            CommandId::DiscardHunk => matches!(self.diff_mode, DiffMode::Unstaged)
-                && self.current_hunk_ref().is_some(),
+            CommandId::StageHunk => {
+                matches!(self.diff_mode, DiffMode::Unstaged | DiffMode::Staged)
+                    && self.current_hunk_ref().is_some()
+            }
+            CommandId::DiscardHunk => {
+                matches!(self.diff_mode, DiffMode::Unstaged) && self.current_hunk_ref().is_some()
+            }
             CommandId::AddAnnotation => self.can_add_annotation(),
             CommandId::EditAnnotation
             | CommandId::DeleteAnnotation
@@ -2818,9 +2903,8 @@ impl App {
                             if self.expanded_file.is_some() {
                                 self.message = Some(format!("Line {} not found", line_no));
                             } else {
-                                self.message = Some(
-                                    "Line jump is available in expanded view (x)".to_string(),
-                                );
+                                self.message =
+                                    Some("Line jump is available in expanded view (x)".to_string());
                             }
                         }
                     }
@@ -2833,7 +2917,9 @@ impl App {
                     self.mode = Mode::Normal;
                     return Ok(false);
                 }
-                let idx = self.command_selected_idx.min(matches.len().saturating_sub(1));
+                let idx = self
+                    .command_selected_idx
+                    .min(matches.len().saturating_sub(1));
                 let cmd = matches[idx].clone();
                 let quit = self.execute_command(cmd.entry, cmd.enabled)?;
                 return Ok(quit);
@@ -2898,16 +2984,14 @@ impl App {
                 self.commit_input = TextArea::default();
                 self.mode = Mode::CommitMessage;
             }
-            CommandId::Push => {
-                match self.run_git_push() {
-                    Ok(()) => {
-                        self.message = Some("Pushed".to_string());
-                    }
-                    Err(err) => {
-                        self.message = Some(format!("Push failed: {}", err));
-                    }
+            CommandId::Push => match self.run_git_push() {
+                Ok(()) => {
+                    self.message = Some("Pushed".to_string());
                 }
-            }
+                Err(err) => {
+                    self.message = Some(format!("Push failed: {}", err));
+                }
+            },
             CommandId::GotoLine => {
                 self.goto_line_input.clear();
                 self.mode = Mode::GotoLine;
@@ -2934,7 +3018,11 @@ impl App {
                 self.side_by_side = !self.side_by_side;
                 self.message = Some(format!(
                     "View: {}",
-                    if self.side_by_side { "side-by-side" } else { "unified" }
+                    if self.side_by_side {
+                        "side-by-side"
+                    } else {
+                        "unified"
+                    }
                 ));
             }
             CommandId::ToggleDiffView => {
@@ -3019,7 +3107,8 @@ impl App {
                         AnnotationType::Comment => AnnotationType::Todo,
                         AnnotationType::Todo => AnnotationType::Comment,
                     };
-                    self.storage.update_annotation(id, &content, new_type.clone())?;
+                    self.storage
+                        .update_annotation(id, &content, new_type.clone())?;
                     self.message = Some(format!("Annotation type: {}", new_type.as_str()));
                     self.load_all_annotations()?;
                     self.build_display_lines();
@@ -3041,8 +3130,11 @@ impl App {
                 if let Some(text) = self.selected_text_for_copy() {
                     self.copy_to_clipboard(&text)?;
                     let lines = text.lines().count().max(1);
-                    self.message =
-                        Some(format!("Copied {} line{}", lines, if lines == 1 { "" } else { "s" }));
+                    self.message = Some(format!(
+                        "Copied {} line{}",
+                        lines,
+                        if lines == 1 { "" } else { "s" }
+                    ));
                 } else if let Some(DisplayLine::Diff { line, .. }) = self.current_display_line() {
                     self.copy_to_clipboard(&line.content)?;
                     self.message = Some("Copied line".to_string());
@@ -3226,8 +3318,9 @@ impl App {
                     self.storage.delete_annotation(entry.id)?;
                     self.load_all_annotations()?;
                     self.build_display_lines();
-                    self.annotation_list_idx =
-                        self.annotation_list_idx.min(self.annotation_list_entries().len().saturating_sub(1));
+                    self.annotation_list_idx = self
+                        .annotation_list_idx
+                        .min(self.annotation_list_entries().len().saturating_sub(1));
                 }
             }
             KeyCode::Enter => {
@@ -3311,7 +3404,6 @@ impl App {
         Ok(())
     }
 
-
     fn execute_search(&mut self) {
         let Some(ref mut search) = self.search else {
             return;
@@ -3347,7 +3439,10 @@ impl App {
                 }
                 SearchType::Content => {
                     // Match on diff line content
-                    if let DisplayLine::Diff { line: diff_line, .. } = line {
+                    if let DisplayLine::Diff {
+                        line: diff_line, ..
+                    } = line
+                    {
                         pattern.is_match(&diff_line.content)
                     } else if let DisplayLine::FileHeader { path, .. } = line {
                         // Also match file headers in content search
@@ -3381,7 +3476,11 @@ impl App {
             }
 
             search.current_match = (search.current_match + 1) % search.matches.len();
-            (search.matches[search.current_match], search.current_match + 1, search.matches.len())
+            (
+                search.matches[search.current_match],
+                search.current_match + 1,
+                search.matches.len(),
+            )
         };
 
         self.jump_to_line(new_idx);
@@ -3403,7 +3502,11 @@ impl App {
             } else {
                 search.current_match - 1
             };
-            (search.matches[search.current_match], search.current_match + 1, search.matches.len())
+            (
+                search.matches[search.current_match],
+                search.current_match + 1,
+                search.matches.len(),
+            )
         };
 
         self.jump_to_line(new_idx);
@@ -3509,7 +3612,10 @@ impl App {
 
         let mut idx = self.current_line_idx + 1;
         while idx < total {
-            if let Some(DisplayLine::Diff { hunk_idx: Some(h), .. }) = self.display_lines.get(idx) {
+            if let Some(DisplayLine::Diff {
+                hunk_idx: Some(h), ..
+            }) = self.display_lines.get(idx)
+            {
                 if current_hunk.map_or(true, |ch| ch != *h) {
                     self.jump_to_line(idx);
                     return;
@@ -3521,7 +3627,10 @@ impl App {
         // Wrap to first hunk
         idx = 0;
         while idx < total {
-            if let Some(DisplayLine::Diff { hunk_idx: Some(_), .. }) = self.display_lines.get(idx) {
+            if let Some(DisplayLine::Diff {
+                hunk_idx: Some(_), ..
+            }) = self.display_lines.get(idx)
+            {
                 self.jump_to_line(idx);
                 return;
             }
@@ -3538,13 +3647,18 @@ impl App {
 
         while idx > 0 {
             idx -= 1;
-            if let Some(DisplayLine::Diff { hunk_idx: Some(h), .. }) = self.display_lines.get(idx) {
+            if let Some(DisplayLine::Diff {
+                hunk_idx: Some(h), ..
+            }) = self.display_lines.get(idx)
+            {
                 if current_hunk.map_or(true, |ch| ch != *h) {
                     // Move to the first line of this hunk
                     let mut start = idx;
                     while start > 0 {
-                        if let Some(DisplayLine::Diff { hunk_idx: Some(prev_h), .. }) =
-                            self.display_lines.get(start - 1)
+                        if let Some(DisplayLine::Diff {
+                            hunk_idx: Some(prev_h),
+                            ..
+                        }) = self.display_lines.get(start - 1)
                         {
                             if prev_h == h {
                                 start -= 1;
@@ -3562,11 +3676,16 @@ impl App {
         // Wrap to last hunk
         idx = self.display_lines.len().saturating_sub(1);
         while idx > 0 {
-            if let Some(DisplayLine::Diff { hunk_idx: Some(h), .. }) = self.display_lines.get(idx) {
+            if let Some(DisplayLine::Diff {
+                hunk_idx: Some(h), ..
+            }) = self.display_lines.get(idx)
+            {
                 let mut start = idx;
                 while start > 0 {
-                    if let Some(DisplayLine::Diff { hunk_idx: Some(prev_h), .. }) =
-                        self.display_lines.get(start - 1)
+                    if let Some(DisplayLine::Diff {
+                        hunk_idx: Some(prev_h),
+                        ..
+                    }) = self.display_lines.get(start - 1)
                     {
                         if prev_h == h {
                             start -= 1;
@@ -3584,15 +3703,17 @@ impl App {
 
     fn current_hunk_ref(&self) -> Option<(usize, usize)> {
         match self.current_display_line() {
-            Some(DisplayLine::Diff { file_idx, hunk_idx: Some(hunk_idx), .. }) => {
-                Some((*file_idx, *hunk_idx))
-            }
-            Some(DisplayLine::HunkHeader { file_idx, hunk_idx, .. }) => {
-                Some((*file_idx, *hunk_idx))
-            }
-            Some(DisplayLine::HunkEnd { file_idx, hunk_idx, .. }) => {
-                Some((*file_idx, *hunk_idx))
-            }
+            Some(DisplayLine::Diff {
+                file_idx,
+                hunk_idx: Some(hunk_idx),
+                ..
+            }) => Some((*file_idx, *hunk_idx)),
+            Some(DisplayLine::HunkHeader {
+                file_idx, hunk_idx, ..
+            }) => Some((*file_idx, *hunk_idx)),
+            Some(DisplayLine::HunkEnd {
+                file_idx, hunk_idx, ..
+            }) => Some((*file_idx, *hunk_idx)),
             _ => None,
         }
     }
@@ -3706,11 +3827,14 @@ impl App {
                 file.hunks.remove(hunk_idx);
             }
         }
-        let empty = self.files.get(file_idx).map(|f| f.hunks.is_empty()).unwrap_or(true);
+        let empty = self
+            .files
+            .get(file_idx)
+            .map(|f| f.hunks.is_empty())
+            .unwrap_or(true);
         if empty {
             self.files.remove(file_idx);
-            self.diff_file_index
-                .retain(|_, idx| *idx != file_idx);
+            self.diff_file_index.retain(|_, idx| *idx != file_idx);
             for idx in self.diff_file_index.values_mut() {
                 if *idx > file_idx {
                     *idx -= 1;
@@ -3740,11 +3864,14 @@ impl App {
             }
         }
 
-        let empty = self.files.get(file_idx).map(|f| f.hunks.is_empty()).unwrap_or(true);
+        let empty = self
+            .files
+            .get(file_idx)
+            .map(|f| f.hunks.is_empty())
+            .unwrap_or(true);
         if empty {
             self.files.remove(file_idx);
-            self.diff_file_index
-                .retain(|_, idx| *idx != file_idx);
+            self.diff_file_index.retain(|_, idx| *idx != file_idx);
             for idx in self.diff_file_index.values_mut() {
                 if *idx > file_idx {
                     *idx -= 1;
@@ -3815,27 +3942,26 @@ impl App {
     }
 
     fn spawn_ai_for_current_annotation(&mut self) -> Result<()> {
-        let annotation = if let Some(DisplayLine::Annotation { annotation, .. }) =
-            self.current_display_line()
-        {
-            annotation.clone()
-        } else if matches!(self.mode, Mode::AnnotationList) {
-            let entries = self.annotation_list_entries();
-            let entry = entries
-                .get(self.annotation_list_idx)
-                .ok_or_else(|| anyhow!("Annotation not found"))?;
-            let entry_id = entry.id;
-            self.all_annotations
-                .iter()
-                .find(|a| a.id == entry_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("Annotation not found"))?
-        } else if let Some(annotation) = self.get_annotation_for_current_line().cloned() {
-            annotation
-        } else {
-            self.message = Some("Move to an annotation to send to AI".to_string());
-            return Ok(());
-        };
+        let annotation =
+            if let Some(DisplayLine::Annotation { annotation, .. }) = self.current_display_line() {
+                annotation.clone()
+            } else if matches!(self.mode, Mode::AnnotationList) {
+                let entries = self.annotation_list_entries();
+                let entry = entries
+                    .get(self.annotation_list_idx)
+                    .ok_or_else(|| anyhow!("Annotation not found"))?;
+                let entry_id = entry.id;
+                self.all_annotations
+                    .iter()
+                    .find(|a| a.id == entry_id)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Annotation not found"))?
+            } else if let Some(annotation) = self.get_annotation_for_current_line().cloned() {
+                annotation
+            } else {
+                self.message = Some("Move to an annotation to send to AI".to_string());
+                return Ok(());
+            };
 
         let prompt = self.build_ai_prompt(&annotation);
         let job_id = self.ai_next_id;
@@ -3989,7 +4115,9 @@ impl App {
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(patch.as_bytes()).map_err(|e| e.to_string())?;
+            stdin
+                .write_all(patch.as_bytes())
+                .map_err(|e| e.to_string())?;
         }
         let output = child.wait_with_output().map_err(|e| e.to_string())?;
 
@@ -3997,7 +4125,11 @@ impl App {
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(if stderr.is_empty() { "git apply failed".to_string() } else { stderr })
+            Err(if stderr.is_empty() {
+                "git apply failed".to_string()
+            } else {
+                stderr
+            })
         }
     }
 
@@ -4014,7 +4146,9 @@ impl App {
 
         let mut child = cmd.spawn().map_err(|e| e.to_string())?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(patch.as_bytes()).map_err(|e| e.to_string())?;
+            stdin
+                .write_all(patch.as_bytes())
+                .map_err(|e| e.to_string())?;
         }
         let output = child.wait_with_output().map_err(|e| e.to_string())?;
 
@@ -4022,7 +4156,11 @@ impl App {
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            Err(if stderr.is_empty() { "git apply failed".to_string() } else { stderr })
+            Err(if stderr.is_empty() {
+                "git apply failed".to_string()
+            } else {
+                stderr
+            })
         }
     }
 
@@ -4267,8 +4405,7 @@ impl App {
             return;
         }
         if self.file_line_ranges.len() < self.files.len() {
-            self.file_line_ranges
-                .resize(self.files.len(), None);
+            self.file_line_ranges.resize(self.files.len(), None);
         }
 
         if let Some(expanded_idx) = self.expanded_file {
@@ -4299,7 +4436,11 @@ impl App {
             .or(file.old_path.as_ref())
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
-        let include_spacer = self.file_line_ranges.iter().take(file_idx).any(|r| r.is_some());
+        let include_spacer = self
+            .file_line_ranges
+            .iter()
+            .take(file_idx)
+            .any(|r| r.is_some());
         let new_lines = self.build_file_lines(file_idx, &file, &file_path, include_spacer);
         let new_len = new_lines.len();
 
@@ -4359,7 +4500,9 @@ impl App {
 
     fn current_target_position(&self) -> Option<(String, u32)> {
         match self.current_display_line() {
-            Some(DisplayLine::Diff { line, file_path, .. }) => {
+            Some(DisplayLine::Diff {
+                line, file_path, ..
+            }) => {
                 let line_no = line.new_line_no.or(line.old_line_no)?;
                 Some((file_path.clone(), line_no))
             }
@@ -4392,7 +4535,11 @@ impl App {
 
     fn find_file_header_idx(&self, file_idx: usize) -> Option<usize> {
         for (idx, line) in self.display_lines.iter().enumerate() {
-            if let DisplayLine::FileHeader { file_idx: header_idx, .. } = line {
+            if let DisplayLine::FileHeader {
+                file_idx: header_idx,
+                ..
+            } = line
+            {
                 if *header_idx == file_idx {
                     return Some(idx);
                 }
@@ -4404,7 +4551,12 @@ impl App {
     fn find_best_line_match(&self, file_path: &str, line_no: u32) -> Option<usize> {
         let mut best: Option<(usize, u32)> = None;
         for (idx, line) in self.display_lines.iter().enumerate() {
-            if let DisplayLine::Diff { line, file_path: fp, .. } = line {
+            if let DisplayLine::Diff {
+                line,
+                file_path: fp,
+                ..
+            } = line
+            {
                 if fp != file_path {
                     continue;
                 }
@@ -4437,23 +4589,36 @@ impl App {
 
         self.build_display_lines();
 
-        let header_idx = current_header_idx.and_then(|idx| {
-            if let Some(DisplayLine::FileHeader { file_idx: header_file_idx, .. }) = self.display_lines.get(idx) {
-                if *header_file_idx == file_idx {
-                    return Some(idx);
-                }
-            }
-            None
-        }).or_else(|| {
-            self.display_lines.iter().enumerate().find_map(|(idx, line)| {
-                if let DisplayLine::FileHeader { file_idx: header_file_idx, .. } = line {
+        let header_idx = current_header_idx
+            .and_then(|idx| {
+                if let Some(DisplayLine::FileHeader {
+                    file_idx: header_file_idx,
+                    ..
+                }) = self.display_lines.get(idx)
+                {
                     if *header_file_idx == file_idx {
                         return Some(idx);
                     }
                 }
                 None
             })
-        });
+            .or_else(|| {
+                self.display_lines
+                    .iter()
+                    .enumerate()
+                    .find_map(|(idx, line)| {
+                        if let DisplayLine::FileHeader {
+                            file_idx: header_file_idx,
+                            ..
+                        } = line
+                        {
+                            if *header_file_idx == file_idx {
+                                return Some(idx);
+                            }
+                        }
+                        None
+                    })
+            });
 
         if let Some(idx) = header_idx {
             if was_collapsed {
@@ -4503,7 +4668,12 @@ impl App {
     fn annotation_list_entries(&self) -> Vec<AnnotationListEntry> {
         let mut visible: HashMap<i64, (usize, bool)> = HashMap::new();
         for (idx, line) in self.display_lines.iter().enumerate() {
-            if let DisplayLine::Annotation { annotation, orphaned, .. } = line {
+            if let DisplayLine::Annotation {
+                annotation,
+                orphaned,
+                ..
+            } = line
+            {
                 visible.insert(annotation.id, (idx, *orphaned));
             }
         }
@@ -4511,16 +4681,34 @@ impl App {
         let mut entries: Vec<AnnotationListEntry> = self
             .all_annotations
             .iter()
-            .map(|a| AnnotationListEntry {
-                id: a.id,
-                file_path: a.file_path.clone(),
-                line: a.start_line,
-                side: a.side.clone(),
-                annotation_type: a.annotation_type.clone(),
-                content: a.content.clone(),
-                display_idx: visible.get(&a.id).map(|(idx, _)| *idx),
-                orphaned: visible.get(&a.id).map(|(_, o)| *o).unwrap_or(true),
-                resolved: a.resolved_at.is_some(),
+            .map(|a| {
+                let display_idx = visible.get(&a.id).map(|(idx, _)| *idx);
+                let orphaned = if let Some((_, o)) = visible.get(&a.id) {
+                    *o
+                } else {
+                    let collapsed = self.collapsed_files.contains(&a.file_path);
+                    let hidden_by_expanded = if let Some(expanded_idx) = self.expanded_file {
+                        self.diff_file_index
+                            .get(&a.file_path)
+                            .copied()
+                            .map(|idx| idx != expanded_idx)
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    !(collapsed || hidden_by_expanded)
+                };
+                AnnotationListEntry {
+                    id: a.id,
+                    file_path: a.file_path.clone(),
+                    line: a.start_line,
+                    side: a.side.clone(),
+                    annotation_type: a.annotation_type.clone(),
+                    content: a.content.clone(),
+                    display_idx,
+                    orphaned,
+                    resolved: a.resolved_at.is_some(),
+                }
             })
             .collect();
 
@@ -4674,7 +4862,11 @@ impl App {
             | DisplayLine::HunkHeader { .. }
             | DisplayLine::HunkEnd { .. } => 1,
             DisplayLine::HunkContext { .. } => {
-                if content_width < 4 { 1 } else { 3 }
+                if content_width < 4 {
+                    1
+                } else {
+                    3
+                }
             }
             DisplayLine::Diff { line, .. } => {
                 let prefix_width = if self.side_by_side { 7 } else { 8 };
@@ -4686,14 +4878,26 @@ impl App {
                     (width + content_width - 1) / content_width
                 }
             }
-            DisplayLine::Annotation { annotation, orphaned, .. } => {
+            DisplayLine::Annotation {
+                annotation,
+                orphaned,
+                ..
+            } => {
                 let resolved = annotation.resolved_at.is_some();
                 let prefix = match annotation.annotation_type {
                     AnnotationType::Comment => {
                         if resolved {
-                            if self.side_by_side { "   ✓ RESOLVED " } else { "    ✓ RESOLVED " }
+                            if self.side_by_side {
+                                "   ✓ RESOLVED "
+                            } else {
+                                "    ✓ RESOLVED "
+                            }
                         } else if *orphaned {
-                            if self.side_by_side { "   ⚠ ORPHANED " } else { "    ⚠ ORPHANED " }
+                            if self.side_by_side {
+                                "   ⚠ ORPHANED "
+                            } else {
+                                "    ⚠ ORPHANED "
+                            }
                         } else if self.side_by_side {
                             "   💬 "
                         } else {
@@ -4702,9 +4906,17 @@ impl App {
                     }
                     AnnotationType::Todo => {
                         if resolved {
-                            if self.side_by_side { "   ✓ RESOLVED " } else { "    ✓ RESOLVED " }
+                            if self.side_by_side {
+                                "   ✓ RESOLVED "
+                            } else {
+                                "    ✓ RESOLVED "
+                            }
                         } else if *orphaned {
-                            if self.side_by_side { "   ⚠ ORPHANED " } else { "    ⚠ ORPHANED " }
+                            if self.side_by_side {
+                                "   ⚠ ORPHANED "
+                            } else {
+                                "    ⚠ ORPHANED "
+                            }
                         } else if self.side_by_side {
                             "   📌 "
                         } else {
@@ -4729,7 +4941,11 @@ impl App {
                     };
                     total = total.saturating_add(lines);
                 }
-                if total == 0 { 1 } else { total }
+                if total == 0 {
+                    1
+                } else {
+                    total
+                }
             }
         }
     }
@@ -5032,8 +5248,7 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
     // If the header is visible on screen, don't show the sticky header
     if header_is_visible {
         // Render an empty line or minimal separator
-        let paragraph = Paragraph::new("")
-            .style(Style::default().bg(theme.status_bg));
+        let paragraph = Paragraph::new("").style(Style::default().bg(theme.status_bg));
         f.render_widget(paragraph, area);
         return;
     }
@@ -5043,11 +5258,23 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
 
     // Calculate file stats
     let file = app.files.get(file_idx);
-    let (additions, deletions) = file.map(|f| {
-        let adds: usize = f.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind == LineKind::Addition).count();
-        let dels: usize = f.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind == LineKind::Deletion).count();
-        (adds, dels)
-    }).unwrap_or((0, 0));
+    let (additions, deletions) = file
+        .map(|f| {
+            let adds: usize = f
+                .hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .filter(|l| l.kind == LineKind::Addition)
+                .count();
+            let dels: usize = f
+                .hunks
+                .iter()
+                .flat_map(|h| &h.lines)
+                .filter(|l| l.kind == LineKind::Deletion)
+                .count();
+            (adds, dels)
+        })
+        .unwrap_or((0, 0));
 
     // Check if this file is a search match and if it's the current match
     let is_current_match = current_file_header_idx
@@ -5062,7 +5289,7 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
                 .fg(theme.expanded_fg)
                 .bg(theme.expanded_bg)
                 .add_modifier(Modifier::BOLD),
-            " [FULL FILE - x to collapse]"
+            " [FULL FILE - x to collapse]",
         )
     } else if is_current_match {
         (
@@ -5070,7 +5297,7 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
                 .fg(theme.header_match_fg)
                 .bg(theme.header_match_bg)
                 .add_modifier(Modifier::BOLD),
-            ""
+            "",
         )
     } else if is_search_match {
         (
@@ -5078,7 +5305,7 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
                 .fg(theme.header_dim_fg)
                 .bg(theme.header_dim_bg)
                 .add_modifier(Modifier::BOLD),
-            ""
+            "",
         )
     } else {
         (
@@ -5086,7 +5313,7 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
                 .fg(theme.header_fg)
                 .bg(theme.header_bg)
                 .add_modifier(Modifier::BOLD),
-            ""
+            "",
         )
     };
 
@@ -5107,7 +5334,6 @@ fn render_sticky_file_header(f: &mut Frame, app: &App, area: Rect, theme: Theme)
     f.render_widget(paragraph, area);
 }
 
-
 fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     let visible_height = area.height as usize;
     app.content_width = area.width as usize;
@@ -5124,17 +5350,27 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
 
             let selection_range = app.selection_range();
             match display_line {
-                DisplayLine::Spacer => {
-                    ListItem::new(Line::from(""))
-                }
+                DisplayLine::Spacer => ListItem::new(Line::from("")),
                 DisplayLine::FileHeader { path, file_idx } => {
                     // Show file header prominently in content
                     let file = app.files.get(*file_idx);
-                    let (adds, dels) = file.map(|f| {
-                        let a: usize = f.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind == LineKind::Addition).count();
-                        let d: usize = f.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind == LineKind::Deletion).count();
-                        (a, d)
-                    }).unwrap_or((0, 0));
+                    let (adds, dels) = file
+                        .map(|f| {
+                            let a: usize = f
+                                .hunks
+                                .iter()
+                                .flat_map(|h| &h.lines)
+                                .filter(|l| l.kind == LineKind::Addition)
+                                .count();
+                            let d: usize = f
+                                .hunks
+                                .iter()
+                                .flat_map(|h| &h.lines)
+                                .filter(|l| l.kind == LineKind::Deletion)
+                                .count();
+                            (a, d)
+                        })
+                        .unwrap_or((0, 0));
 
                     // Check if this is the current search match or just a match
                     let is_current_match = app.is_current_search_match(idx);
@@ -5147,7 +5383,7 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                                 .fg(theme.header_match_fg)
                                 .bg(theme.header_match_bg)
                                 .add_modifier(Modifier::BOLD),
-                            theme.header_match_bg
+                            theme.header_match_bg,
                         )
                     } else if is_match {
                         // Other matches: dimmer highlight
@@ -5156,7 +5392,7 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                                 .fg(theme.header_dim_fg)
                                 .bg(theme.header_dim_bg)
                                 .add_modifier(Modifier::BOLD),
-                            theme.header_dim_bg
+                            theme.header_dim_bg,
                         )
                     } else {
                         (
@@ -5164,7 +5400,7 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                                 .fg(theme.header_fg)
                                 .bg(theme.header_bg)
                                 .add_modifier(Modifier::BOLD),
-                            theme.header_bg
+                            theme.header_bg,
                         )
                     };
 
@@ -5174,18 +5410,30 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                             .add_modifier(Modifier::UNDERLINED);
                     }
 
-                    let collapse_indicator = if app.collapsed_files.contains(path) { " ▶" } else { "" };
+                    let collapse_indicator = if app.collapsed_files.contains(path) {
+                        " ▶"
+                    } else {
+                        ""
+                    };
 
                     ListItem::new(Line::from(vec![
                         Span::styled(format!(" Δ {}{}  ", path, collapse_indicator), style),
-                        Span::styled(format!("+{} ", adds), Style::default().fg(theme.added_fg).bg(stats_bg)),
-                        Span::styled(format!("-{} ", dels), Style::default().fg(theme.deleted_fg).bg(stats_bg)),
+                        Span::styled(
+                            format!("+{} ", adds),
+                            Style::default().fg(theme.added_fg).bg(stats_bg),
+                        ),
+                        Span::styled(
+                            format!("-{} ", dels),
+                            Style::default().fg(theme.deleted_fg).bg(stats_bg),
+                        ),
                     ]))
                 }
-                DisplayLine::HunkContext { text, line_no, highlights } => {
-                    let style = Style::default()
-                        .fg(theme.hunk_ctx_fg)
-                        .bg(theme.hunk_ctx_bg);
+                DisplayLine::HunkContext {
+                    text,
+                    line_no,
+                    highlights,
+                } => {
+                    let style = Style::default().fg(theme.hunk_ctx_fg).bg(theme.hunk_ctx_bg);
                     let content_spans = build_highlighted_spans(
                         text,
                         highlights,
@@ -5207,11 +5455,14 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                         style,
                     ))
                 }
-                DisplayLine::HunkHeader { line_no, additions, deletions, .. } => {
+                DisplayLine::HunkHeader {
+                    line_no,
+                    additions,
+                    deletions,
+                    ..
+                } => {
                     // Hunk header - prominent with stats
-                    let style = Style::default()
-                        .fg(theme.hunk_fg)
-                        .bg(theme.hunk_bg);
+                    let style = Style::default().fg(theme.hunk_fg).bg(theme.hunk_bg);
                     let stats_style = Style::default()
                         .fg(theme.hunk_fg)
                         .bg(theme.hunk_bg)
@@ -5225,9 +5476,14 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                 DisplayLine::HunkEnd { .. } => {
                     // End of hunk - subtle bottom border
                     let style = Style::default().fg(theme.hunk_border);
-                    ListItem::new(Line::from(Span::styled("╰".to_string() + &"─".repeat(30), style)))
+                    ListItem::new(Line::from(Span::styled(
+                        "╰".to_string() + &"─".repeat(30),
+                        style,
+                    )))
                 }
-                DisplayLine::Diff { line, file_path, .. } => {
+                DisplayLine::Diff {
+                    line, file_path, ..
+                } => {
                     let line_no = line.new_line_no.or(line.old_line_no).unwrap_or(0);
                     let side = if line.new_line_no.is_some() {
                         Side::New
@@ -5309,7 +5565,11 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                         &line.inline_ranges,
                         content_style,
                         is_current,
-                        if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                        if is_selected {
+                            theme.selection_bg
+                        } else {
+                            theme.current_line_bg
+                        },
                         inline_bg,
                     );
 
@@ -5322,7 +5582,11 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
 
                     ListItem::new(lines)
                 }
-                DisplayLine::Annotation { annotation, orphaned, .. } => {
+                DisplayLine::Annotation {
+                    annotation,
+                    orphaned,
+                    ..
+                } => {
                     // Annotation in a prominent box - handle multiple lines
                     let resolved = annotation.resolved_at.is_some();
                     let (prefix, style) = match annotation.annotation_type {
@@ -5345,7 +5609,9 @@ fn render_diff_unified(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                                     .bg(theme.annotation_bg)
                                     .add_modifier(Modifier::ITALIC)
                             } else {
-                                Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg)
+                                Style::default()
+                                    .fg(theme.annotation_fg)
+                                    .bg(theme.annotation_bg)
                             },
                         ),
                         AnnotationType::Todo => (
@@ -5437,8 +5703,9 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
     let mut left_items: Vec<ListItem> = Vec::new();
     let mut right_items: Vec<ListItem> = Vec::new();
     let mut divider_items: Vec<ListItem> = Vec::new();
-    let mut push_pair =
-        |mut left: Vec<Line<'static>>, mut right: Vec<Line<'static>>, divider_style: Option<Style>| {
+    let mut push_pair = |mut left: Vec<Line<'static>>,
+                         mut right: Vec<Line<'static>>,
+                         divider_style: Option<Style>| {
         let max_len = left.len().max(right.len()).max(1);
         while left.len() < max_len {
             left.push(Line::from(""));
@@ -5465,7 +5732,13 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
     };
 
     let selection_range = app.selection_range();
-    for (idx, display_line) in app.display_lines.iter().enumerate().skip(scroll_offset).take(visible_height) {
+    for (idx, display_line) in app
+        .display_lines
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height)
+    {
         let is_current = idx == app.current_line_idx;
 
         match display_line {
@@ -5475,11 +5748,23 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
             DisplayLine::FileHeader { path, file_idx } => {
                 // Show file header prominently
                 let file = app.files.get(*file_idx);
-                let (adds, dels) = file.map(|f| {
-                    let a: usize = f.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind == LineKind::Addition).count();
-                    let d: usize = f.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.kind == LineKind::Deletion).count();
-                    (a, d)
-                }).unwrap_or((0, 0));
+                let (adds, dels) = file
+                    .map(|f| {
+                        let a: usize = f
+                            .hunks
+                            .iter()
+                            .flat_map(|h| &h.lines)
+                            .filter(|l| l.kind == LineKind::Addition)
+                            .count();
+                        let d: usize = f
+                            .hunks
+                            .iter()
+                            .flat_map(|h| &h.lines)
+                            .filter(|l| l.kind == LineKind::Deletion)
+                            .count();
+                        (a, d)
+                    })
+                    .unwrap_or((0, 0));
 
                 // Check if this is the current search match or just a match
                 let is_current_match = app.is_current_search_match(idx);
@@ -5492,7 +5777,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             .fg(theme.header_match_fg)
                             .bg(theme.header_match_bg)
                             .add_modifier(Modifier::BOLD),
-                        theme.header_match_bg
+                        theme.header_match_bg,
                     )
                 } else if is_match {
                     // Other matches: dimmer highlight
@@ -5501,7 +5786,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             .fg(theme.header_dim_fg)
                             .bg(theme.header_dim_bg)
                             .add_modifier(Modifier::BOLD),
-                        theme.header_dim_bg
+                        theme.header_dim_bg,
                     )
                 } else {
                     (
@@ -5509,7 +5794,7 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             .fg(theme.header_fg)
                             .bg(theme.header_bg)
                             .add_modifier(Modifier::BOLD),
-                        theme.header_bg
+                        theme.header_bg,
                     )
                 };
 
@@ -5519,21 +5804,40 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                         .add_modifier(Modifier::UNDERLINED);
                 }
 
-                let collapse_indicator = if app.collapsed_files.contains(path) { " ▶" } else { "" };
+                let collapse_indicator = if app.collapsed_files.contains(path) {
+                    " ▶"
+                } else {
+                    ""
+                };
 
                 let header = Line::from(vec![
                     Span::styled(format!(" Δ {}{} ", path, collapse_indicator), style),
-                    Span::styled(format!("+{} ", adds), Style::default().fg(theme.added_fg).bg(stats_bg)),
-                    Span::styled(format!("-{} ", dels), Style::default().fg(theme.deleted_fg).bg(stats_bg)),
+                    Span::styled(
+                        format!("+{} ", adds),
+                        Style::default().fg(theme.added_fg).bg(stats_bg),
+                    ),
+                    Span::styled(
+                        format!("-{} ", dels),
+                        Style::default().fg(theme.deleted_fg).bg(stats_bg),
+                    ),
                 ]);
                 push_pair(vec![header], blank_lines(1), None);
             }
-            DisplayLine::HunkContext { text, line_no, highlights } => {
-                let style = Style::default()
-                    .fg(theme.hunk_ctx_fg)
-                    .bg(theme.hunk_ctx_bg);
-                let content_spans =
-                    build_highlighted_spans(text, highlights, &[], style, false, theme.hunk_ctx_bg, None);
+            DisplayLine::HunkContext {
+                text,
+                line_no,
+                highlights,
+            } => {
+                let style = Style::default().fg(theme.hunk_ctx_fg).bg(theme.hunk_ctx_bg);
+                let content_spans = build_highlighted_spans(
+                    text,
+                    highlights,
+                    &[],
+                    style,
+                    false,
+                    theme.hunk_ctx_bg,
+                    None,
+                );
                 let line_num = format!("{:>4}", line_no);
                 let line_num_style = Style::default()
                     .fg(theme.hunk_ctx_fg)
@@ -5548,11 +5852,14 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                 let right_fill = blank_lines(lines.len());
                 push_pair(lines, right_fill, None);
             }
-            DisplayLine::HunkHeader { line_no, additions, deletions, .. } => {
+            DisplayLine::HunkHeader {
+                line_no,
+                additions,
+                deletions,
+                ..
+            } => {
                 // Hunk header - prominent with stats
-                let style = Style::default()
-                    .fg(theme.hunk_fg)
-                    .bg(theme.hunk_bg);
+                let style = Style::default().fg(theme.hunk_fg).bg(theme.hunk_bg);
                 let stats_style = Style::default()
                     .fg(theme.hunk_fg)
                     .bg(theme.hunk_bg)
@@ -5570,7 +5877,9 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                 let line = Line::from(Span::styled("╰".to_string() + &"─".repeat(20), style));
                 push_pair(vec![line], vec![Line::from("")], None);
             }
-            DisplayLine::Diff { line, file_path, .. } => {
+            DisplayLine::Diff {
+                line, file_path, ..
+            } => {
                 let is_selected = selection_range
                     .map(|(s, e)| idx >= s && idx <= e)
                     .unwrap_or(false);
@@ -5602,10 +5911,14 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                         let old_no = line
                             .old_line_no
                             .map_or("    ".to_string(), |n| format!("{:>4}", n));
-                        let content_style = Style::default().fg(theme.context_fg).bg(theme.deleted_bg);
-                        let prefix_style = Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg);
+                        let content_style =
+                            Style::default().fg(theme.context_fg).bg(theme.deleted_bg);
+                        let prefix_style =
+                            Style::default().fg(theme.deleted_fg).bg(theme.deleted_bg);
                         let line_num_style = if is_current {
-                            Style::default().fg(theme.deleted_fg).bg(theme.current_line_bg)
+                            Style::default()
+                                .fg(theme.deleted_fg)
+                                .bg(theme.current_line_bg)
                         } else if is_selected {
                             Style::default().fg(theme.deleted_fg).bg(theme.selection_bg)
                         } else {
@@ -5627,20 +5940,32 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             &line.inline_ranges,
                             content_style,
                             is_current,
-                            if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                            if is_selected {
+                                theme.selection_bg
+                            } else {
+                                theme.current_line_bg
+                            },
                             Some(theme.intraline_deleted_bg),
                         );
-                        let lines = wrap_spans_with_prefix(left_spans, content_spans, content_width, content_style);
+                        let lines = wrap_spans_with_prefix(
+                            left_spans,
+                            content_spans,
+                            content_width,
+                            content_style,
+                        );
                         push_pair(lines, Vec::new(), None);
                     }
                     LineKind::Addition => {
                         let new_no = line
                             .new_line_no
                             .map_or("    ".to_string(), |n| format!("{:>4}", n));
-                        let content_style = Style::default().fg(theme.context_fg).bg(theme.added_bg);
+                        let content_style =
+                            Style::default().fg(theme.context_fg).bg(theme.added_bg);
                         let prefix_style = Style::default().fg(theme.added_fg).bg(theme.added_bg);
                         let line_num_style = if is_current {
-                            Style::default().fg(theme.added_fg).bg(theme.current_line_bg)
+                            Style::default()
+                                .fg(theme.added_fg)
+                                .bg(theme.current_line_bg)
                         } else if is_selected {
                             Style::default().fg(theme.added_fg).bg(theme.selection_bg)
                         } else {
@@ -5662,10 +5987,19 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             &line.inline_ranges,
                             content_style,
                             is_current,
-                            if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                            if is_selected {
+                                theme.selection_bg
+                            } else {
+                                theme.current_line_bg
+                            },
                             Some(theme.intraline_added_bg),
                         );
-                        let lines = wrap_spans_with_prefix(right_spans, content_spans, content_width, content_style);
+                        let lines = wrap_spans_with_prefix(
+                            right_spans,
+                            content_spans,
+                            content_width,
+                            content_style,
+                        );
                         push_pair(Vec::new(), lines, None);
                     }
                     LineKind::Context => {
@@ -5677,7 +6011,9 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             .map_or("    ".to_string(), |n| format!("{:>4}", n));
                         let content_style = Style::default().fg(theme.context_fg);
                         let line_num_style = if is_current {
-                            Style::default().fg(theme.line_num).bg(theme.current_line_bg)
+                            Style::default()
+                                .fg(theme.line_num)
+                                .bg(theme.current_line_bg)
                         } else if is_selected {
                             Style::default().fg(theme.line_num).bg(theme.selection_bg)
                         } else {
@@ -5699,11 +6035,19 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             &line.inline_ranges,
                             content_style,
                             is_current,
-                            if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                            if is_selected {
+                                theme.selection_bg
+                            } else {
+                                theme.current_line_bg
+                            },
                             None,
                         );
-                        let left_lines =
-                            wrap_spans_with_prefix(left_spans, content_spans, content_width, content_style);
+                        let left_lines = wrap_spans_with_prefix(
+                            left_spans,
+                            content_spans,
+                            content_width,
+                            content_style,
+                        );
 
                         let right_spans = vec![
                             Span::styled(marker.clone(), marker_style),
@@ -5716,16 +6060,28 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             &line.inline_ranges,
                             content_style,
                             is_current,
-                            if is_selected { theme.selection_bg } else { theme.current_line_bg },
+                            if is_selected {
+                                theme.selection_bg
+                            } else {
+                                theme.current_line_bg
+                            },
                             None,
                         );
-                        let right_lines =
-                            wrap_spans_with_prefix(right_spans, content_spans, content_width, content_style);
+                        let right_lines = wrap_spans_with_prefix(
+                            right_spans,
+                            content_spans,
+                            content_width,
+                            content_style,
+                        );
                         push_pair(left_lines, right_lines, None);
                     }
                 }
             }
-            DisplayLine::Annotation { annotation, orphaned, .. } => {
+            DisplayLine::Annotation {
+                annotation,
+                orphaned,
+                ..
+            } => {
                 // Annotation in a prominent box - handle multiple lines
                 let resolved = annotation.resolved_at.is_some();
                 let (prefix, style) = match annotation.annotation_type {
@@ -5748,7 +6104,9 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                                 .bg(theme.annotation_bg)
                                 .add_modifier(Modifier::ITALIC)
                         } else {
-                            Style::default().fg(theme.annotation_fg).bg(theme.annotation_bg)
+                            Style::default()
+                                .fg(theme.annotation_fg)
+                                .bg(theme.annotation_bg)
                         },
                     ),
                     AnnotationType::Todo => (
@@ -5795,8 +6153,12 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             };
                             let prefix_spans = vec![Span::styled(line_prefix, style)];
                             let content_spans = vec![Span::styled(line.to_string(), style)];
-                            let wrapped =
-                                wrap_spans_with_prefix(prefix_spans, content_spans, content_width, style);
+                            let wrapped = wrap_spans_with_prefix(
+                                prefix_spans,
+                                content_spans,
+                                content_width,
+                                style,
+                            );
                             lines.extend(wrapped);
                         }
                         push_pair(lines, Vec::new(), None);
@@ -5816,8 +6178,12 @@ fn render_diff_side_by_side(f: &mut Frame, app: &mut App, area: Rect, theme: The
                             };
                             let prefix_spans = vec![Span::styled(line_prefix, style)];
                             let content_spans = vec![Span::styled(line.to_string(), style)];
-                            let wrapped =
-                                wrap_spans_with_prefix(prefix_spans, content_spans, content_width, style);
+                            let wrapped = wrap_spans_with_prefix(
+                                prefix_spans,
+                                content_spans,
+                                content_width,
+                                style,
+                            );
                             right_lines.extend(wrapped);
                         }
                         push_pair(Vec::new(), right_lines, None);
@@ -5851,7 +6217,11 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                 DiffMode::Staged => "[staged] ",
                 _ => "",
             };
-            let ai_running = app.ai_jobs.iter().filter(|j| matches!(j.status, AiStatus::Running)).count();
+            let ai_running = app
+                .ai_jobs
+                .iter()
+                .filter(|j| matches!(j.status, AiStatus::Running))
+                .count();
             let ai_suffix = if ai_running > 0 {
                 format!("  AI: running ({})", ai_running)
             } else {
@@ -5890,10 +6260,12 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
 
             let input = Paragraph::new(input_with_cursor)
                 .style(Style::default().fg(theme.header_fg).bg(theme.surface_alt))
-                .block(Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme.border))
-                    .title(title))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme.border))
+                        .title(title),
+                )
                 .wrap(Wrap { trim: false });
 
             f.render_widget(input, area);
@@ -5913,14 +6285,21 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
                         " (no matches)".to_string()
                     }
                 } else {
-                    format!(" ({} match{})", search.matches.len(), if search.matches.len() == 1 { "" } else { "es" })
+                    format!(
+                        " ({} match{})",
+                        search.matches.len(),
+                        if search.matches.len() == 1 { "" } else { "es" }
+                    )
                 }
             } else {
                 String::new()
             };
 
             let query = app.search.as_ref().map(|s| s.query.as_str()).unwrap_or("");
-            let content = format!(" Search {}: {}_{}  (Enter: confirm, Esc: cancel)", search_type, query, match_info);
+            let content = format!(
+                " Search {}: {}_{}  (Enter: confirm, Esc: cancel)",
+                search_type, query, match_info
+            );
 
             let status = Paragraph::new(content)
                 .style(Style::default().fg(theme.search_fg).bg(theme.search_bg));
@@ -5941,14 +6320,16 @@ fn render_status(f: &mut Frame, app: &App, area: Rect, theme: Theme) {
             f.render_widget(status, area);
         }
         Mode::CommitMessage => {
-            let content = " Commit message (Enter: commit, Esc: cancel, Ctrl+j: newline) ".to_string();
+            let content =
+                " Commit message (Enter: commit, Esc: cancel, Ctrl+j: newline) ".to_string();
             let status = Paragraph::new(content)
                 .style(Style::default().fg(theme.search_fg).bg(theme.search_bg));
             f.render_widget(status, area);
         }
         Mode::AnnotationList => {
-            let status = Paragraph::new(" Annotations: j/k, Enter: jump, e: edit, d: delete, Esc: close")
-                .style(Style::default().fg(theme.status_fg).bg(theme.status_bg));
+            let status =
+                Paragraph::new(" Annotations: j/k, Enter: jump, e: edit, d: delete, Esc: close")
+                    .style(Style::default().fg(theme.status_fg).bg(theme.status_bg));
             f.render_widget(status, area);
         }
     }
@@ -5959,7 +6340,11 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     if entries.is_empty() {
         let empty = Paragraph::new(" No changes")
             .style(Style::default().fg(theme.status_fg).bg(theme.status_bg))
-            .block(Block::default().borders(Borders::RIGHT).border_style(Style::default().fg(theme.border)));
+            .block(
+                Block::default()
+                    .borders(Borders::RIGHT)
+                    .border_style(Style::default().fg(theme.border)),
+            );
         f.render_widget(empty, area);
         return;
     }
@@ -5972,7 +6357,9 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
     if app.sidebar_index < app.sidebar_scroll {
         app.sidebar_scroll = app.sidebar_index;
     } else if app.sidebar_index >= app.sidebar_scroll + visible_height {
-        app.sidebar_scroll = app.sidebar_index.saturating_sub(visible_height.saturating_sub(1));
+        app.sidebar_scroll = app
+            .sidebar_index
+            .saturating_sub(visible_height.saturating_sub(1));
     }
 
     let items: Vec<ListItem> = entries
@@ -6006,14 +6393,21 @@ fn render_sidebar(f: &mut Frame, app: &mut App, area: Rect, theme: Theme) {
                 style = style.add_modifier(Modifier::DIM);
             }
             let line = Line::from(vec![
-                Span::styled(format!(" {} ", status_char), Style::default().fg(status_color)),
+                Span::styled(
+                    format!(" {} ", status_char),
+                    Style::default().fg(status_color),
+                ),
                 Span::styled(entry.path.clone(), style),
             ]);
             ListItem::new(line)
         })
         .collect();
 
-    let title = if app.sidebar_focused { " Files • focused " } else { " Files (b to focus) " };
+    let title = if app.sidebar_focused {
+        " Files • focused "
+    } else {
+        " Files (b to focus) "
+    };
     let mut border_style = Style::default().fg(theme.border);
     if app.sidebar_focused {
         border_style = border_style.add_modifier(Modifier::BOLD);
@@ -6340,9 +6734,7 @@ fn render_annotation_list(f: &mut Frame, app: &mut App, theme: Theme) {
     }
 
     let visible_height = area.height.saturating_sub(2) as usize;
-    let start = app
-        .annotation_list_idx
-        .saturating_sub(visible_height / 2);
+    let start = app.annotation_list_idx.saturating_sub(visible_height / 2);
     let end = (start + visible_height).min(entries.len());
 
     let lines: Vec<Line> = entries[start..end]
@@ -6490,10 +6882,23 @@ fn render_ai_pane(f: &mut Frame, app: &mut App, theme: Theme) {
             let status = match job.status {
                 AiStatus::Running => "…",
                 AiStatus::Done { ok } => {
-                    if ok { "✓" } else { "!" }
+                    if ok {
+                        "✓"
+                    } else {
+                        "!"
+                    }
                 }
             };
-            let label = format!(" {}#{}{} ", status, job.annotation_id, if job.annotation_type == AnnotationType::Todo { "T" } else { "C" });
+            let label = format!(
+                " {}#{}{} ",
+                status,
+                job.annotation_id,
+                if job.annotation_type == AnnotationType::Todo {
+                    "T"
+                } else {
+                    "C"
+                }
+            );
             let style = if idx == app.ai_selected_idx {
                 Style::default()
                     .fg(theme.header_match_fg)
@@ -6511,15 +6916,27 @@ fn render_ai_pane(f: &mut Frame, app: &mut App, theme: Theme) {
         let job = &app.ai_jobs[idx];
         let status = match job.status {
             AiStatus::Running => "running",
-            AiStatus::Done { ok } => if ok { "done" } else { "error" },
+            AiStatus::Done { ok } => {
+                if ok {
+                    "done"
+                } else {
+                    "error"
+                }
+            }
         };
         let header = format!(
             "[{}] #{} {}:{} ({})",
-            status, job.annotation_id, job.file_path, job.line, job.annotation_type.as_str()
+            status,
+            job.annotation_id,
+            job.file_path,
+            job.line,
+            job.annotation_type.as_str()
         );
         lines.push(Line::from(Span::styled(
             header,
-            Style::default().fg(theme.header_fg).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.header_fg)
+                .add_modifier(Modifier::BOLD),
         )));
 
         let mut output = job.output.replace('\t', " ");
@@ -6580,9 +6997,7 @@ fn build_highlighted_spans(
     inline_bg: Option<Color>,
 ) -> Vec<Span<'static>> {
     let base_style = if is_current {
-        base_style
-            .bg(current_line_bg)
-            .add_modifier(Modifier::BOLD)
+        base_style.bg(current_line_bg).add_modifier(Modifier::BOLD)
     } else {
         base_style
     };
@@ -6706,7 +7121,10 @@ fn compute_inline_ranges(old: &str, new: &str) -> (Vec<InlineRange>, Vec<InlineR
         }
     }
 
-    (merge_inline_ranges(old_ranges), merge_inline_ranges(new_ranges))
+    (
+        merge_inline_ranges(old_ranges),
+        merge_inline_ranges(new_ranges),
+    )
 }
 
 fn line_similarity(old: &str, new: &str) -> f32 {
@@ -6915,5 +7333,9 @@ fn wrapped_line_count(text: &str, max_width: usize) -> usize {
         };
         count += lines;
     }
-    if count == 0 { 1 } else { count }
+    if count == 0 {
+        1
+    } else {
+        count
+    }
 }

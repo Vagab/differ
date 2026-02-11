@@ -118,8 +118,7 @@ impl Storage {
             .context("Could not determine config directory")?
             .join("differ");
 
-        std::fs::create_dir_all(&config_dir)
-            .context("Failed to create config directory")?;
+        std::fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
 
         let db_path = config_dir.join("annotations.db");
         Self::open(&db_path)
@@ -127,8 +126,7 @@ impl Storage {
 
     /// Opens or creates the database at the specified path
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)
-            .context("Failed to open database")?;
+        let conn = Connection::open(path).context("Failed to open database")?;
 
         // Enable WAL mode for concurrent access
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
@@ -158,16 +156,28 @@ impl Storage {
         let has_context_after = cols.iter().any(|c| c == "context_after");
 
         if !has_anchor_line {
-            conn.execute("ALTER TABLE annotations ADD COLUMN anchor_line INTEGER DEFAULT 0", [])?;
+            conn.execute(
+                "ALTER TABLE annotations ADD COLUMN anchor_line INTEGER DEFAULT 0",
+                [],
+            )?;
         }
         if !has_anchor_text {
-            conn.execute("ALTER TABLE annotations ADD COLUMN anchor_text TEXT DEFAULT ''", [])?;
+            conn.execute(
+                "ALTER TABLE annotations ADD COLUMN anchor_text TEXT DEFAULT ''",
+                [],
+            )?;
         }
         if !has_context_before {
-            conn.execute("ALTER TABLE annotations ADD COLUMN context_before TEXT DEFAULT ''", [])?;
+            conn.execute(
+                "ALTER TABLE annotations ADD COLUMN context_before TEXT DEFAULT ''",
+                [],
+            )?;
         }
         if !has_context_after {
-            conn.execute("ALTER TABLE annotations ADD COLUMN context_after TEXT DEFAULT ''", [])?;
+            conn.execute(
+                "ALTER TABLE annotations ADD COLUMN context_after TEXT DEFAULT ''",
+                [],
+            )?;
         }
 
         Ok(())
@@ -186,7 +196,8 @@ impl Storage {
         let repo_hash = Self::hash_repo_path(repo_path);
 
         // Try to find existing repo
-        let existing: Option<i64> = self.conn
+        let existing: Option<i64> = self
+            .conn
             .query_row(
                 "SELECT id FROM repos WHERE repo_hash = ?1",
                 params![repo_hash],
@@ -257,7 +268,12 @@ impl Storage {
     }
 
     /// Updates an existing annotation's content and type
-    pub fn update_annotation(&self, id: i64, content: &str, annotation_type: AnnotationType) -> Result<()> {
+    pub fn update_annotation(
+        &self,
+        id: i64,
+        content: &str,
+        annotation_type: AnnotationType,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE annotations SET content = ?1, annotation_type = ?2 WHERE id = ?3",
             params![content, annotation_type.as_str(), id],
@@ -267,10 +283,8 @@ impl Storage {
 
     /// Deletes an annotation
     pub fn delete_annotation(&self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM annotations WHERE id = ?1",
-            params![id],
-        )?;
+        self.conn
+            .execute("DELETE FROM annotations WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -393,7 +407,11 @@ impl Storage {
 // Need hex encoding for the hash
 mod hex {
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+        bytes
+            .as_ref()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
     }
 }
 

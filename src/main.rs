@@ -51,7 +51,8 @@ fn parse_diff_args(args: &[String], staged: bool) -> DiffArgs {
     }
 
     // Find -- separator for path filtering
-    let (rev_args, paths): (Vec<_>, Vec<_>) = if let Some(pos) = args.iter().position(|a| a == "--") {
+    let (rev_args, paths): (Vec<_>, Vec<_>) = if let Some(pos) = args.iter().position(|a| a == "--")
+    {
         (args[..pos].to_vec(), args[pos + 1..].to_vec())
     } else {
         (args.to_vec(), Vec::new())
@@ -101,11 +102,13 @@ fn parse_diff_args(args: &[String], staged: bool) -> DiffArgs {
 #[derive(Parser)]
 #[command(name = "differ")]
 #[command(about = "TUI diff viewer with persistent annotations")]
-#[command(long_about = "A drop-in replacement for git diff with an interactive TUI and \
+#[command(
+    long_about = "A drop-in replacement for git diff with an interactive TUI and \
     the ability to add persistent annotations to code changes.\n\n\
     Use 'git d' as an alias by adding to ~/.gitconfig:\n\
     [alias]\n    \
-    d = ! /path/to/differ diff")]
+    d = ! /path/to/differ diff"
+)]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
@@ -213,10 +216,8 @@ fn main() -> Result<()> {
             context_lines,
             args,
         } => {
-            let config = config.with_overrides(
-                if side_by_side { Some(true) } else { None },
-                context_lines,
-            );
+            let config =
+                config.with_overrides(if side_by_side { Some(true) } else { None }, context_lines);
 
             // Parse git diff-style arguments
             let diff_args = parse_diff_args(&args, staged);
@@ -281,11 +282,7 @@ fn cmd_diff(
     )
 }
 
-fn cmd_list(
-    storage: &Storage,
-    repo_id: i64,
-    file: Option<&str>,
-) -> Result<()> {
+fn cmd_list(storage: &Storage, repo_id: i64, file: Option<&str>) -> Result<()> {
     let annotations = storage.list_annotations(repo_id, file)?;
 
     if annotations.is_empty() {
@@ -322,11 +319,7 @@ fn cmd_list(
 
         println!(
             "  #{} {} {}{}: {}",
-            annotation.id,
-            type_marker,
-            line_info,
-            side,
-            annotation.content
+            annotation.id, type_marker, line_info, side, annotation.content
         );
     }
 
@@ -404,8 +397,8 @@ fn cmd_export(
     format: &str,
     output: Option<PathBuf>,
 ) -> Result<()> {
-    let export_format = ExportFormat::from_str(format)
-        .context("Invalid format. Use: markdown (md) or json")?;
+    let export_format =
+        ExportFormat::from_str(format).context("Invalid format. Use: markdown (md) or json")?;
 
     let content = export(storage, repo_id, export_format)?;
 

@@ -81,7 +81,11 @@ impl Config {
     }
 
     /// Merge CLI overrides into config
-    pub fn with_overrides(mut self, side_by_side: Option<bool>, context_lines: Option<u32>) -> Self {
+    pub fn with_overrides(
+        mut self,
+        side_by_side: Option<bool>,
+        context_lines: Option<u32>,
+    ) -> Self {
         if let Some(sbs) = side_by_side {
             self.side_by_side = sbs;
         }
@@ -98,12 +102,12 @@ impl Config {
 
         // Create parent directory if needed
         if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
         }
 
-        let contents = toml::to_string_pretty(&config)
-            .context("Failed to serialize config")?;
+        let contents = toml::to_string_pretty(&config).context("Failed to serialize config")?;
 
         std::fs::write(&config_path, contents)
             .with_context(|| format!("Failed to write config file: {}", config_path.display()))?;
@@ -130,8 +134,14 @@ impl Config {
         };
 
         insert_if_missing("side_by_side", Value::Boolean(defaults.side_by_side));
-        insert_if_missing("context_lines", Value::Integer(defaults.context_lines as i64));
-        insert_if_missing("show_annotations", Value::Boolean(defaults.show_annotations));
+        insert_if_missing(
+            "context_lines",
+            Value::Integer(defaults.context_lines as i64),
+        );
+        insert_if_missing(
+            "show_annotations",
+            Value::Boolean(defaults.show_annotations),
+        );
         insert_if_missing(
             "syntax_highlighting",
             Value::Boolean(defaults.syntax_highlighting),
